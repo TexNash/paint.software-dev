@@ -23,7 +23,7 @@ void RecolorTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, 
         // right-click the roles reverse: target becomes the primary.
         m_targetColor = rightButton ? doc->primaryColor() : doc->secondaryColor();
     } else {
-        QPoint c = toPixelPos(canvasPos);
+        QPoint c = toPixelPos(imagePoint(canvasPos, doc));
         QImage &img = layer->image();
         m_targetColor = img.rect().contains(c) ? img.pixelColor(c)
                                                : (rightButton ? doc->primaryColor() : doc->secondaryColor());
@@ -55,7 +55,7 @@ void RecolorTool::recolorAt(const QPointF &pos, CanvasWidget &canvas) {
     // the blend strength. A mouse reports full pressure, so its tip is full size.
     int radius = int((m_brushSize / 2.0) * (m_pressureSensitivity ? m_pressure : 1.0));
     int tol = toleranceDistance();
-    QPoint center = toPixelPos(pos);
+    QPoint center = toPixelPos(imagePoint(pos, doc));
     // Soft-edge falloff, like the paintbrush: full strength out to hardRatio of
     // the radius, then fading to zero at the rim. Hardness 100 = a hard tip.
     const double hardRatio = m_hardness / 100.0;
@@ -66,7 +66,7 @@ void RecolorTool::recolorAt(const QPointF &pos, CanvasWidget &canvas) {
             if (dist2 > radius * radius) continue;
             int px = center.x() + dx, py = center.y() + dy;
             if (px < 0 || px >= img.width() || py < 0 || py >= img.height()) continue;
-            if (!selectionAllows(doc, px, py)) continue;
+            if (!imageSelectionAllows(doc, px, py)) continue;
 
             QColor pixel = img.pixelColor(px, py);  // straight-alpha, correct
             int diff = std::abs(pixel.red() - target.red()) +

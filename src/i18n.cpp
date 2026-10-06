@@ -37,6 +37,15 @@ const QHash<QString, QString> &table() {
         {"&Fermer l'image", "&Close image"},
         {"&Quitter", "E&xit"},
 
+        // ---- Oversized clipboard paste ----
+        {"Coller", "Paste"},
+        {"L'image à coller est plus grande que le canevas. Que voulez-vous faire ?", "The image being pasted is larger than the canvas size. What do you want to do?"},
+        {"Agrandir le canevas", "Expand canvas"},
+        {"Agrandit automatiquement le canevas pour contenir l'image à coller.", "Automatically expands the canvas to fit the image being pasted."},
+        {"Conserver la taille du canevas", "Keep canvas size"},
+        {"N'agrandit pas le canevas. Vous devrez déplacer l'image collée pour que la partie souhaitée se trouve dans les limites du canevas.", "Does not expand the canvas. You will have to move the pasted image around to make sure that the part you want is within the canvas boundaries."},
+        {"Annule l'action de collage.", "Cancels the paste action."},
+
         // ---- Edit menu ----
         {"&Annuler", "&Undo"},
         {"&Rétablir", "&Redo"},

@@ -67,7 +67,8 @@ void CloneStampTool::cloneDab(const QPointF &pos, QImage &target, const QImage &
     const double scaledRadius = (m_brushSize / 2.0) * p;
     if (scaledRadius < 0.4) return;   // effectively no pressure = no mark
     int r = std::max(1, static_cast<int>(scaledRadius));   // size 1 must not give r=0 (÷0 → NaN)
-    QPointF srcPos = pos + m_offset;
+    const QPoint layerOffset = m_doc->activeLayer()->offset();
+    QPointF srcPos = pos + m_offset - layerOffset;
     const double hard = m_hardness / 100.0;
     const double strength = (m_opacity / 100.0);
 
@@ -76,12 +77,12 @@ void CloneStampTool::cloneDab(const QPointF &pos, QImage &target, const QImage &
             if (dx * dx + dy * dy > r * r) continue;
             int sx = static_cast<int>(srcPos.x() + dx);
             int sy = static_cast<int>(srcPos.y() + dy);
-            int tx = static_cast<int>(pos.x() + dx);
-            int ty = static_cast<int>(pos.y() + dy);
+            int tx = static_cast<int>(pos.x() + dx - layerOffset.x());
+            int ty = static_cast<int>(pos.y() + dy - layerOffset.y());
 
             if (sx >= 0 && sx < source.width() && sy >= 0 && sy < source.height()
                 && tx >= 0 && tx < target.width() && ty >= 0 && ty < target.height()) {
-                if (!selectionAllows(m_doc, tx, ty)) continue;
+                if (!imageSelectionAllows(m_doc, tx, ty)) continue;
                 double dist = std::sqrt(double(dx * dx + dy * dy)) / r;
                 double falloff = (m_hardness >= 95) ? 1.0
                     : std::max(0.0, 1.0 - (dist - hard) / (1.0 - hard));

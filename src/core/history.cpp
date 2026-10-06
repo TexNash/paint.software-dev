@@ -21,6 +21,18 @@ void ImageEditCommand::redo() {
     }
 }
 
+LayerOffsetCommand::LayerOffsetCommand(Document *doc, int index, QPoint before, QPoint after)
+    : m_doc(doc), m_index(index), m_before(before), m_after(after) {}
+void LayerOffsetCommand::apply(QPoint offset) {
+    if (auto *layer = m_doc->layerAt(m_index)) {
+        layer->setOffset(offset);
+        m_doc->setModified(true);
+        m_doc->notifyContentChanged();
+    }
+}
+void LayerOffsetCommand::undo() { apply(m_before); }
+void LayerOffsetCommand::redo() { apply(m_after); }
+
 // LayerAddCommand
 LayerAddCommand::LayerAddCommand(Document *doc, int index, const QString &desc)
     : m_doc(doc), m_index(index), m_description(desc) {}
@@ -78,6 +90,7 @@ DocumentSnapshotCommand::State DocumentSnapshotCommand::capture(Document *doc) {
     s.height = doc->height();
     s.activeLayer = doc->activeLayerIndex();
     s.layers = doc->snapshotLayers();
+    s.selection = doc->selection();
     return s;
 }
 
@@ -87,6 +100,8 @@ void DocumentSnapshotCommand::restore(Document *doc, const State &state) {
     for (const auto &l : state.layers)
         copy.push_back(std::make_shared<Layer>(*l));
     doc->restoreFromSnapshot(std::move(copy), state.width, state.height, state.activeLayer);
+    doc->selection() = state.selection;
+    emit doc->selectionChanged();
 }
 
 void DocumentSnapshotCommand::undo() {

@@ -128,7 +128,10 @@ protected:
     // Selection-awareness helpers shared by all painting tools.
     // Clips a painter (drawing into a layer image, image space) to the active
     // selection so strokes never spill outside it. No-op if nothing is selected.
+    // Painter geometry is document-space; its target is the active layer buffer.
     static void clipToSelection(QPainter &painter, Document *doc);
+    static QPointF imagePoint(const QPointF &documentPoint, Document *doc);
+    static bool imageSelectionAllows(Document *doc, int x, int y);
     // For pixel-level tools: true if (x,y) may be edited given the selection.
     static bool selectionAllows(Document *doc, int x, int y);
     // Masks a freshly produced full-layer image so only selected pixels differ

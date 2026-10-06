@@ -118,6 +118,7 @@ set(ADJUSTMENTS_SOURCES
 )
 
 set(DIALOGS_SOURCES
+    src/dialogs/pastedialog.cpp
     src/dialogs/resizedialog.cpp
     src/dialogs/canvassizedialog.cpp
     src/dialogs/newdocumentdialog.cpp
@@ -206,7 +207,14 @@ add_executable(paintdotnet_brush_tests EXCLUDE_FROM_ALL
     ${CORE_SOURCES} ${CANVAS_SOURCES} src/tools/tool.cpp src/tools/brushtool.cpp)
 target_include_directories(paintdotnet_brush_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
 target_link_libraries(paintdotnet_brush_tests PRIVATE Qt6::Widgets Qt6::Core Qt6::Gui)
+add_executable(paintdotnet_paste_tests EXCLUDE_FROM_ALL
+    tests/test_paste.cpp src/mainwindow.cpp src/dockdropoverlay.cpp ${NONMAIN_SOURCES})
+target_include_directories(paintdotnet_paste_tests PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+target_link_libraries(paintdotnet_paste_tests PRIVATE Qt6::Widgets Qt6::PrintSupport Qt6::Core Qt6::Gui)
+
 enable_testing()
+add_test(NAME paste_regression COMMAND paintdotnet_paste_tests)
+set_tests_properties(paste_regression PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")
 add_test(NAME functional COMMAND paintdotnet_tests)
 add_test(NAME brush_regression COMMAND paintdotnet_brush_tests)
 set_tests_properties(functional brush_regression PROPERTIES ENVIRONMENT "QT_QPA_PLATFORM=offscreen")

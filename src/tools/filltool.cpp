@@ -15,9 +15,11 @@ void FillTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, Can
     auto *layer = doc->activeLayer();
     if (!layer || layer->isLocked()) return;
 
-    QPoint pos = toPixelPos(canvasPos);
-    if (pos.x() < 0 || pos.y() < 0 || pos.x() >= layer->width() || pos.y() >= layer->height()) return;
-    if (!selectionAllows(doc, pos.x(), pos.y())) return;
+    const QPoint documentPos = toPixelPos(canvasPos);
+    if (!QRect(QPoint(), doc->size()).contains(documentPos)
+        || !selectionAllows(doc, documentPos.x(), documentPos.y())) return;
+    const QPoint pos = documentPos - layer->offset();
+    if (!layer->image().valid(pos)) return;
 
     QImage before = layer->image().copy();
     QColor fillColor = (event->button() == Qt::LeftButton) ? doc->primaryColor() : doc->secondaryColor();
@@ -26,7 +28,13 @@ void FillTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, Can
     // The region (which pixels to fill) is decided from the sampled source:
     // the composite of visible layers (Sampling=Image) or the active layer only
     // (Sampling=Layer). The paint is always written to the active layer.
-    QImage sampleSrc = m_sampleImage ? doc->flattenVisible() : layer->image();
+    QImage sampleSrc = layer->image();
+    if (m_sampleImage) {
+        sampleSrc = QImage(layer->image().size(), QImage::Format_ARGB32_Premultiplied);
+        sampleSrc.fill(Qt::transparent);
+        QPainter painter(&sampleSrc);
+        painter.drawImage(-layer->offset(), doc->flattenVisible());
+    }
 
     // Shift temporarily forces Global mode for this click (Paint.NET behaviour).
     const bool global = m_global || (event->modifiers() & Qt::ShiftModifier);
@@ -40,6 +48,11 @@ void FillTool::mouseReleaseEvent(const QPointF &, QMouseEvent *, CanvasWidget &)
 void FillTool::floodFill(QImage &target, const QImage &sampleSrc, const QPoint &pos,
                          const QColor &fillColor, Document *doc, bool global) {
     const int w = target.width(), h = target.height();
+    const QPoint offset = doc->activeLayer()->offset();
+    const QRect visible = QRect(QPoint(), doc->size()).translated(-offset);
+    const auto allowed = [&](int x, int y) {
+        return visible.contains(x, y) && selectionAllows(doc, x + offset.x(), y + offset.y());
+    };
 
     // Region test reads the sampled source in straight-alpha space. The source
     // is normally the same size as the layer (both are document-sized), but clamp
@@ -65,7 +78,7 @@ void FillTool::floodFill(QImage &target, const QImage &sampleSrc, const QPoint &
     if (global) {
         for (int y = 0; y < h; ++y)
             for (int x = 0; x < w; ++x)
-                if (selectionAllows(doc, x, y) && within(srcAt(x, y)))
+                if (allowed(x, y) && within(srcAt(x, y)))
                     mask[y][x] = true;
     } else {
         QVector<QVector<bool>> visited(h, QVector<bool>(w, false));
@@ -74,12 +87,12 @@ void FillTool::floodFill(QImage &target, const QImage &sampleSrc, const QPoint &
         visited[pos.y()][pos.x()] = true;
         while (!queue.isEmpty()) {
             QPoint p = queue.dequeue();
-            if (selectionAllows(doc, p.x(), p.y()))
+            if (allowed(p.x(), p.y()))
                 mask[p.y()][p.x()] = true;
             const QPoint neighbors[] = {{p.x()-1,p.y()},{p.x()+1,p.y()},{p.x(),p.y()-1},{p.x(),p.y()+1}};
             for (const QPoint &n : neighbors) {
                 if (n.x() >= 0 && n.x() < w && n.y() >= 0 && n.y() < h && !visited[n.y()][n.x()]
-                    && selectionAllows(doc, n.x(), n.y())) {
+                    && allowed(n.x(), n.y())) {
                     if (within(srcAt(n.x(), n.y()))) {
                         visited[n.y()][n.x()] = true;
                         queue.enqueue(n);

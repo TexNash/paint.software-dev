@@ -282,7 +282,7 @@ void ShapeTool::commit(CanvasWidget &canvas) {
     if (m_antialiased) painter.setRenderHint(QPainter::Antialiasing);
     clipToSelection(painter, doc);
     painter.setOpacity(m_opacity / 100.0);
-    painter.setWorldTransform(rotationTransform(m_rect, m_angle));
+    painter.setWorldTransform(rotationTransform(m_rect, m_angle), true);
 
     const QColor primary = m_useRight ? doc->secondaryColor() : doc->primaryColor();
     const QColor secondary = m_useRight ? doc->primaryColor() : doc->secondaryColor();

@@ -1,4 +1,5 @@
 #include "mainwindow.h"
+#include "dialogs/pastedialog.h"
 #include "toolicons.h"
 #include "i18n.h"
 #include "theme.h"
@@ -1969,6 +1970,39 @@ void MainWindow::copyMerged() {
     QApplication::clipboard()->setImage(img);
 }
 
+// Clipboard image data wins over file references. Only absolute local files are
+// decoded: clipboard text is never executed and non-file URLs are never fetched.
+static QImage clipboardImage() {
+    auto *clipboard = QApplication::clipboard();
+    QImage image = clipboard->image();
+    if (!image.isNull()) return image;
+    const QMimeData *mime = clipboard->mimeData();
+    if (!mime) return {};
+    const auto load = [](const QString &path) {
+        const QFileInfo file(path);
+        if (!file.isAbsolute() || !file.isFile()) return QImage();
+        return QImage(path);
+    };
+    for (const QUrl &url : mime->urls()) {
+        if (!url.isLocalFile() || (!url.host().isEmpty() && url.host() != "localhost")) continue;
+        image = load(url.toLocalFile());
+        if (!image.isNull()) return image;
+    }
+    for (const QString &line : mime->text().split('\n')) {
+        // Do not trim filesystem paths: leading/trailing spaces can be filenames.
+        QString path = line;
+        if (path.endsWith('\r')) path.chop(1);
+        if (!QFileInfo(path).isAbsolute()) {
+            const QUrl url(path);
+            if (!url.isLocalFile() || (!url.host().isEmpty() && url.host() != "localhost")) continue;
+            path = url.toLocalFile();
+        }
+        image = load(path);
+        if (!image.isNull()) return image;
+    }
+    return {};
+}
+
 void MainWindow::paste() {
     // While the Text tool is typing, Ctrl+V inserts clipboard *text* at the caret
     // rather than dropping a clipboard image onto a new layer.
@@ -1979,9 +2013,19 @@ void MainWindow::paste() {
             return;
         }
     }
-    QImage img = QApplication::clipboard()->image();
+    QImage img = clipboardImage();
     if (img.isNull()) return;
-    m_document->addLayer(img, TR("Calque collé"));
+    bool expand = false;
+    if (img.width() > m_document->width() || img.height() > m_document->height()) {
+        PasteDialog dialog(img, this);
+        const int choice = dialog.exec();
+        if (choice == PasteDialog::Cancel) return;
+        expand = choice == PasteDialog::Expand;
+    }
+    // Finish any pending Line/Shape edit on its original layer, not the newly
+    // pasted layer. This must remain after the dialog's cancellation boundary.
+    selectTool(ToolType::Move);
+    m_document->pasteImage(img, TR("Calque collé"), expand);
     m_canvas->updateCanvas();
 }
 
@@ -1994,7 +2038,7 @@ void MainWindow::pasteIntoNewLayer() {
 void MainWindow::pasteIntoNewImage() {
     // Paint.NET's "Paste into New Image": open the clipboard image as its own
     // document, sized to the image, rather than dropping it on the current one.
-    const QImage img = QApplication::clipboard()->image();
+    const QImage img = clipboardImage();
     if (img.isNull()) return;
     auto *doc = new Document(img.width(), img.height(), this);
     doc->activeLayer()->setImage(img.convertToFormat(QImage::Format_ARGB32_Premultiplied));

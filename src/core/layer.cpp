@@ -25,6 +25,7 @@ Layer::Layer(const Layer &other)
     , m_locked(other.m_locked)
     , m_blendMode(other.m_blendMode)
     , m_offset(other.m_offset)
+    , m_retainsOffCanvasPixels(other.m_retainsOffCanvasPixels)
 {
 }
 
@@ -37,6 +38,7 @@ Layer &Layer::operator=(const Layer &other) {
         m_locked = other.m_locked;
         m_blendMode = other.m_blendMode;
         m_offset = other.m_offset;
+        m_retainsOffCanvasPixels = other.m_retainsOffCanvasPixels;
     }
     return *this;
 }

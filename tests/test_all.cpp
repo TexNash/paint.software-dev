@@ -43,6 +43,7 @@
 #include <QImageWriter>
 #include <QImageReader>
 #include <QTemporaryFile>
+#include <QDataStream>
 #include <QTemporaryDir>
 #include <QFileInfo>
 #include "dialogs/resizedialog.h"
@@ -165,9 +166,514 @@ static void strokeTool(Tool *tool, CanvasWidget &canvas, QPointF a, QPointF b) {
     QMouseEvent e4 = releaseEv(b);  tool->mouseReleaseEvent(b, &e4, canvas);
 }
 
+// An asymmetric retained bitmap with visible and off-canvas markers.
+static QImage retainedPattern() {
+    QImage image = makeImage(840, 630, Qt::transparent);
+    QPainter p(&image);
+    p.fillRect(25, 25, 15, 15, Qt::yellow);
+    p.fillRect(345, 290, 15, 15, Qt::cyan);
+    p.fillRect(80, 90, 35, 45, Qt::red);
+    p.fillRect(200, 220, 40, 20, Qt::green);
+    p.fillRect(805, 595, 25, 25, Qt::blue);
+    return image;
+}
+
+// Characterization: setImage already normalizes both resize branches, even
+// when a caller bypasses it through the mutable bitmap accessor.
+static void resizeStraightAlphaCharacterization() {
+    SECTION("Resize normalizes straight-alpha input in ordinary and retained layers");
+    for (bool retained : {false, true}) {
+        Document doc(8,6);
+        QImage straight(retained ? QSize(12,10) : doc.size(), QImage::Format_ARGB32);
+        straight.fill(Qt::transparent);
+        straight.setPixelColor(3,3,QColor(220,80,30,117));
+        straight.setPixelColor(5,4,QColor(20,140,230,201));
+        auto *layer = doc.activeLayer();
+        layer->image() = straight;
+        layer->setRetainsOffCanvasPixels(retained);
+        layer->setOffset(retained ? QPoint(-2,-1) : QPoint());
+        // Scale the finite straight-alpha source independently; comparing a
+        // pre-composited image would introduce a different rounding order.
+        const QImage expected = straight.copy(QRect(-layer->offset(),doc.size())).scaled(
+            13,11,Qt::IgnoreAspectRatio,Qt::SmoothTransformation)
+            .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        doc.resize(13,11);
+        CHECK(doc.activeLayer()->image().format() == QImage::Format_ARGB32_Premultiplied,
+              "resize normalizes even directly injected straight-alpha storage");
+        CHECK(doc.flatten() == expected, "straight-alpha resize preserves visible alpha and colours");
+    }
+}
+
+static void retainedCropRegression() {
+    SECTION("Retained crop uses document coordinates including selection edges");
+    for (QPoint offset : {QPoint(50, 40), QPoint(-50, -40)}) {
+        for (QRect requested : {QRect(70, 60, 240, 270), QRect(-10, -20, 160, 180),
+                                QRect(730, 530, 100, 100)}) {
+            Document doc(800, 600);
+            doc.activeLayer()->clear(Qt::transparent);
+            const QImage image = retainedPattern();
+            doc.pasteImage(image, "retained", false);
+            doc.activeLayer()->setOffset(offset);
+            doc.selection().selectRect(requested);
+            const QImage mask = doc.selection().mask();
+            const QImage before = doc.flatten();
+            const QRect crop = requested.intersected(before.rect());
+            doc.cropTo(requested);
+            const QImage after = doc.flatten();
+            CHECK(after == before.copy(crop), "crop preserves exactly the visible document-space pixels");
+            CHECK(doc.activeLayer()->offset().isNull(), "destructive crop rebases the layer origin");
+            CHECK(doc.activeLayer()->image().size() == crop.size(), "crop discards pixels outside its bounds");
+            CHECK(!doc.activeLayer()->retainsOffCanvasPixels(), "destructive crop clears retained movement state");
+            CHECK(!doc.selection().hasSelection(), "crop clears selection");
+            doc.history().undo();
+            CHECK(doc.size() == QSize(800,600) && doc.activeLayerIndex() == 1,
+                  "crop undo restores size and active layer");
+            CHECK(doc.activeLayer()->image() == image && doc.activeLayer()->offset() == offset,
+                  "crop undo restores the entire original retained bitmap and offset");
+            CHECK(doc.selection().mask() == mask, "crop undo restores selection edges");
+            CHECK(doc.activeLayer()->retainsOffCanvasPixels(), "crop undo restores retained state");
+            doc.history().redo();
+            CHECK(doc.flatten() == after && doc.activeLayer()->offset().isNull(), "crop redo restores pixels and origin");
+            CHECK(!doc.activeLayer()->retainsOffCanvasPixels(), "crop redo clears retained state again");
+            QTemporaryDir directory;
+            const QString path = directory.path()+"/cropped.psw";
+            CHECK(doc.saveNative(path), "save destructively cropped document");
+            QFile file(path);
+            CHECK(file.open(QIODevice::ReadOnly), "open cropped native file");
+            QDataStream stream(&file);
+            stream.setVersion(QDataStream::Qt_6_0);
+            quint32 magic; qint32 version;
+            stream >> magic >> version;
+            CHECK(version == 1, "crop with no retained layers writes legacy v1");
+            for (bool keepArtwork : {false,true}) {
+                doc.mergeLayerDown(1,keepArtwork);
+                CHECK(!doc.activeLayer()->retainsOffCanvasPixels(), "merge does not inherit stale crop state");
+                doc.history().undo();
+            }
+            const QImage cropped = doc.activeLayer()->image();
+            QImage moved(cropped.size(),QImage::Format_ARGB32_Premultiplied);
+            moved.fill(Qt::transparent);
+            { QPainter painter(&moved); painter.drawImage(3,2,cropped); }
+            CanvasWidget canvas;
+            canvas.setDocument(&doc);
+            MoveTool move;
+            strokeTool(&move,canvas,QPointF(20,20),QPointF(23,22));
+            CHECK(doc.activeLayer()->offset().isNull() && doc.activeLayer()->image() == moved,
+                  "cropped layer returns to ordinary pixel-baked Move");
+        }
+    }
+}
+
+static void retainedExpansionRegression() {
+    SECTION("Expansion makes negatively positioned retained layers editable at new edges");
+    for (QPoint origin : {QPoint(-50,-40),QPoint(-50,20),QPoint(20,-40),QPoint(20,30),QPoint()}) {
+        for (QSize target : {QSize(900,600),QSize(800,700),QSize(900,700)}) {
+            Document doc(800,600);
+            doc.activeLayer()->clear(Qt::transparent);
+            const QImage original = retainedPattern();
+            doc.pasteImage(original,"Keep",false);
+            doc.activeLayer()->setOffset(origin);
+            doc.selection().selectRect(QRect(3,4,10,12));
+            const QImage mask = doc.selection().mask();
+            const QImage before = doc.flatten();
+            QImage pasted = makeImage(target.width(),target.height(),Qt::transparent);
+            doc.pasteImage(pasted,"Expand",true);
+            doc.setActiveLayer(1);
+            CHECK(doc.size() == target, "Expand uses componentwise maximum canvas dimensions");
+            CHECK(doc.activeLayer()->offset() == origin, "Expand preserves exact retained origin");
+            CHECK(doc.activeLayer()->image().copy(original.rect()) == original, "Expand never resamples or loses existing bitmap");
+            CHECK(doc.flatten().copy(before.rect()) == before, "Expand preserves old visible artwork");
+            const QImage padded = doc.activeLayer()->image();
+            doc.history().undo();
+            CHECK(doc.size() == QSize(800,600) && doc.activeLayer()->image() == original &&
+                  doc.activeLayer()->offset() == origin && doc.selection().mask() == mask,
+                  "Expand undo restores bitmap, origin, selection and dimensions atomically");
+            doc.history().redo();
+            doc.setActiveLayer(1);
+            CHECK(doc.activeLayer()->image() == padded && doc.activeLayer()->offset() == origin &&
+                  !doc.selection().hasSelection(), "Expand redo restores geometry and cleared selection");
+            CanvasWidget canvas;
+            canvas.setDocument(&doc);
+            doc.setPrimaryColor(Qt::magenta);
+            PencilTool pencil;
+            pencil.setBrushSize(1);
+            const QPoint edge(target.width()-1,target.height()-1);
+            strokeTool(&pencil,canvas,edge,edge);
+            CHECK(doc.flatten().pixelColor(edge) == QColor(Qt::magenta),
+                  "actual Pencil edit reaches the freshly expanded right/bottom canvas edge");
+        }
+    }
+}
+
+static void retainedOrthogonalRegression() {
+    SECTION("Retained rotations and flips transform document-space origins");
+    for (QPoint offset : {QPoint(50, 40), QPoint(-50, -40)}) {
+        for (int operation = 0; operation < 5; ++operation) {
+            Document doc(800, 600);
+            doc.activeLayer()->clear(Qt::transparent);
+            const QImage image = retainedPattern();
+            doc.pasteImage(image, "retained", false);
+            doc.activeLayer()->setOffset(offset);
+            doc.selection().selectRect(QRect(10,20,50,60));
+            const QImage mask = doc.selection().mask();
+            const QImage before = doc.flatten();
+            QImage expected, expectedBuffer;
+            QPoint expectedOffset;
+            if (operation < 3) {
+                const int turns = operation + 1;
+                QTransform transform;
+                transform.rotate(turns * 90);
+                expected = before.transformed(transform);
+                expectedBuffer = image.transformed(transform);
+                if (turns == 1) expectedOffset = QPoint(600-offset.y()-image.height(), offset.x());
+                if (turns == 2) expectedOffset = QPoint(800-offset.x()-image.width(), 600-offset.y()-image.height());
+                if (turns == 3) expectedOffset = QPoint(offset.y(), 800-offset.x()-image.width());
+                doc.rotate(turns == 3 ? -1 : turns, "rotate");
+            } else {
+                const bool horizontal = operation == 3;
+                const QTransform reflection = QTransform::fromScale(horizontal ? -1 : 1, horizontal ? 1 : -1);
+                expected = before.transformed(reflection);
+                expectedBuffer = image.transformed(reflection);
+                expectedOffset = horizontal ? QPoint(800-offset.x()-image.width(), offset.y())
+                                            : QPoint(offset.x(), 600-offset.y()-image.height());
+                doc.flip(horizontal, "flip");
+            }
+            CHECK(doc.flatten() == expected, "orthogonal operation preserves exact visible composition");
+            CHECK(doc.activeLayer()->image() == expectedBuffer, "orthogonal operation retains all off-canvas pixels");
+            CHECK(doc.activeLayer()->offset() == expectedOffset, "orthogonal origin uses canvas rather than bitmap bounds");
+            CHECK(!doc.selection().hasSelection(), "orthogonal operation clears selection");
+            doc.history().undo();
+            CHECK(doc.activeLayer()->image() == image && doc.activeLayer()->offset() == offset,
+                  "orthogonal undo restores original buffer and origin");
+            CHECK(doc.size() == before.size() && doc.selection().mask() == mask, "orthogonal undo restores canvas and selection");
+            doc.history().redo();
+            CHECK(doc.flatten() == expected && doc.activeLayer()->image() == expectedBuffer &&
+                  doc.activeLayer()->offset() == expectedOffset, "orthogonal redo restores complete transformed state");
+        }
+    }
+}
+
+static void retainedResizeRegression() {
+    SECTION("Retained image resize uses the document scale and sampling grid");
+    for (QPoint offset : {QPoint(50, 40), QPoint(-50, -40), QPoint(51, -39)}) {
+        for (QSize target : {QSize(400,300), QSize(1200,900), QSize(413,307)}) {
+            Document doc(800,600);
+            doc.activeLayer()->clear(Qt::transparent);
+            QImage image = retainedPattern();
+            // Semi-transparent detail and a marker crossing the visible canvas edge
+            // distinguish resampling phase from mere bounding-box correctness.
+            { QPainter p(&image); p.fillRect(795-offset.x(), 575-offset.y(), 15,20, QColor(90,130,210,123)); }
+            doc.pasteImage(image, "retained", false);
+            doc.activeLayer()->setOffset(offset);
+            doc.selection().selectRect(QRect(30,40,50,60));
+            const QImage mask = doc.selection().mask();
+            const QImage expected = doc.flatten().scaled(target, Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+            doc.resize(target.width(), target.height());
+            const QImage after = doc.activeLayer()->image();
+            const QPoint afterOffset = doc.activeLayer()->offset();
+            CHECK(doc.flatten() == expected, "resize preserves exact visible canvas resampling, including edge alpha");
+            CHECK(doc.activeLayer()->image().format() == QImage::Format_ARGB32_Premultiplied,
+                  "resize keeps premultiplied storage");
+            const QPoint hidden(qRound((offset.x()+817)*target.width()/800.0),
+                                qRound((offset.y()+607)*target.height()/600.0));
+            CHECK(doc.activeLayer()->image().rect().contains(hidden-afterOffset) &&
+                  doc.activeLayer()->image().pixelColor(hidden-afterOffset) == QColor(Qt::blue),
+                  "resize retains scaled off-canvas artwork rather than squeezing it into the canvas");
+            doc.history().undo();
+            CHECK(doc.activeLayer()->image() == image && doc.activeLayer()->offset() == offset &&
+                  doc.size() == QSize(800,600), "resize undo restores original geometry and all pixels");
+            CHECK(doc.selection().mask() == mask, "resize undo restores selection");
+            doc.history().redo();
+            CHECK(doc.flatten() == expected && doc.activeLayer()->image() == after &&
+                  doc.activeLayer()->offset() == afterOffset, "resize redo restores sampled retained geometry");
+        }
+    }
+}
+
+static void pasteExpansionBoundsRegression() {
+    SECTION("Expansion rejects unrepresentable local bitmap extents before mutation");
+    for (QPoint origin : {QPoint(INT_MIN,0),QPoint(0,INT_MIN),QPoint(INT_MIN,INT_MIN)}) {
+        Document doc(4,3);
+        const QImage image = makeImage(6,5,Qt::red);
+        doc.pasteImage(image,"Keep",false);
+        doc.activeLayer()->setOffset(origin);
+        doc.setModified(false);
+        const QSize size = doc.size();
+        const int count = doc.layerCount(), active = doc.activeLayerIndex();
+        const int history = doc.history().currentIndex();
+        const QImage mask = doc.selection().mask();
+        const QImage pasted = makeImage(7,6,Qt::transparent);
+        CHECK(doc.pasteImage(pasted,"Expand",true) == -1, "unrepresentable expansion is rejected");
+        CHECK(doc.size() == size && doc.layerCount() == count && doc.activeLayerIndex() == active,
+              "rejected expansion leaves document geometry and layer stack unchanged");
+        CHECK(doc.history().currentIndex() == history && !doc.isModified() && doc.selection().mask() == mask,
+              "rejected expansion leaves history, modified state and selection unchanged");
+        CHECK(doc.layerAt(active)->image() == image && doc.layerAt(active)->offset() == origin,
+              "rejected expansion preserves original bitmap and origin");
+    }
+}
+
+static void resizeStampCharacterization() {
+    SECTION("Resize Source stamp replaces only the finite canvas, never off-canvas pixels");
+    for (QPoint origin : {QPoint(-2,-1),QPoint(2,1),QPoint(1,-2)}) {
+        for (QSize target : {QSize(13,11),QSize(4,3)}) {
+            Document doc(8,6);
+            QImage image = makeImage(12,10,Qt::transparent);
+            for (int y=0;y<image.height();++y)
+                for (int x=0;x<image.width();++x)
+                    image.setPixelColor(x,y,QColor((x*41)%256,(y*53)%256,170,(x+y)%3 ? 117 : 0));
+            doc.activeLayer()->setImage(image);
+            doc.activeLayer()->setOffset(origin);
+            doc.activeLayer()->setRetainsOffCanvasPixels(true);
+            const QPoint scaledOrigin(qRound(origin.x()*target.width()/8.0),qRound(origin.y()*target.height()/6.0));
+            const QImage scaled = image.scaled(qMax(1,qRound(image.width()*target.width()/8.0)),
+                qMax(1,qRound(image.height()*target.height()/6.0)),Qt::IgnoreAspectRatio,Qt::SmoothTransformation);
+            const QRect bounds = QRect(scaledOrigin,scaled.size()).united(QRect(QPoint(),target));
+            QImage outside(bounds.size(),QImage::Format_ARGB32_Premultiplied);
+            outside.fill(Qt::transparent);
+            { QPainter painter(&outside); painter.drawImage(scaledOrigin-bounds.topLeft(),scaled); }
+            const QImage finite = image.copy(QRect(-origin,doc.size())).scaled(target,Qt::IgnoreAspectRatio,Qt::SmoothTransformation);
+            doc.resize(target.width(),target.height());
+            CHECK(doc.activeLayer()->offset() == bounds.topLeft() && doc.activeLayer()->image().size() == bounds.size(),
+                  "resize keeps the full scaled bitmap/canvas union");
+            CHECK(doc.flatten() == finite, "Source preserves exact finite-canvas alpha instead of double-compositing");
+            bool untouched = true;
+            for (int y=0;y<outside.height();++y)
+                for (int x=0;x<outside.width();++x)
+                    if (!QRect(QPoint(),target).contains(QPoint(x,y)+bounds.topLeft()) &&
+                        doc.activeLayer()->image().pixel(x,y) != outside.pixel(x,y)) untouched = false;
+            CHECK(untouched, "all outside-canvas pixels equal independently document-scaled bitmap");
+        }
+    }
+}
+
+static void ordinaryMoveAuthorityRegression() {
+    SECTION("Only explicit retained state makes whole-layer Move nondestructive");
+    for (QPoint origin : {QPoint(),QPoint(2,1),QPoint(-2,-1)}) {
+        for (QSize buffer : {QSize(16,12),QSize(20,16),QSize(10,8)}) {
+            Document doc(16,12);
+            QImage before = makeImage(buffer.width(),buffer.height(),Qt::transparent);
+            before.setPixelColor(4,3,QColor(200,60,120,137));
+            doc.activeLayer()->setImage(before);
+            doc.activeLayer()->setOffset(origin);
+            CHECK(!doc.activeLayer()->retainsOffCanvasPixels(), "ordinary fixture has no retention provenance");
+            QImage expected(buffer,QImage::Format_ARGB32_Premultiplied);
+            expected.fill(Qt::transparent);
+            { QPainter painter(&expected); painter.drawImage(3,2,before); }
+            CanvasWidget canvas;
+            canvas.setDocument(&doc);
+            MoveTool move;
+            strokeTool(&move,canvas,QPointF(5,5),QPointF(8,7));
+            CHECK(doc.activeLayer()->image() == expected && doc.activeLayer()->offset() == origin,
+                  "ordinary layer bakes only movement delta even with a positioned/mismatched bitmap");
+            const QImage visible = doc.flatten();
+            doc.history().undo();
+            CHECK(doc.activeLayer()->image() == before && doc.activeLayer()->offset() == origin &&
+                  !doc.activeLayer()->retainsOffCanvasPixels(), "ordinary Move undo restores pixels and original origin");
+            doc.history().redo();
+            CHECK(doc.activeLayer()->image() == expected && doc.flatten() == visible &&
+                  doc.activeLayer()->offset() == origin, "ordinary Move redo preserves alignment");
+        }
+    }
+}
+
+static void nativeRetentionCompatibility() {
+    SECTION("Native retained state has a versioned format and reads PSW v1");
+    QTemporaryDir directory;
+    auto writeV1 = [&](const QString &path, const QImage &image, QPoint offset, int version) {
+        QFile file(path);
+        if (!file.open(QIODevice::WriteOnly)) return false;
+        QDataStream out(&file);
+        out.setVersion(QDataStream::Qt_6_0);
+        out << quint32(0x50535731) << qint32(version) << qint32(800) << qint32(600)
+            << qint32(0) << qint32(1);
+        out << QString("v1 fixture") << float(0.75) << bool(true) << bool(false)
+            << qint32(0) << offset << image;
+        return out.status() == QDataStream::Ok;
+    };
+    for (bool retained : {false, true}) {
+        const QImage image = retained ? retainedPattern() : makeImage(800,600,Qt::red);
+        const QPoint offset = retained ? QPoint(-50,-40) : QPoint();
+        const QString path = directory.path() + (retained ? "/retained-v1.psw" : "/ordinary-v1.psw");
+        CHECK(writeV1(path, image, offset, 1), "write an independent old-format fixture");
+        Document loaded;
+        CHECK(loaded.loadNative(path), "v1 files remain readable");
+        CHECK(loaded.activeLayer()->retainsOffCanvasPixels() == retained,
+              "v1 geometry inference distinguishes ordinary and oversized/positioned fixtures");
+        CHECK(loaded.activeLayer()->image() == image && loaded.activeLayer()->offset() == offset &&
+              loaded.activeLayer()->name() == "v1 fixture" && loaded.activeLayer()->opacity() == 0.75f,
+              "v1 layer metadata and full bitmap preserved");
+        // Expansion to equal dimensions must not erase the inferred retained
+        // semantics of an old file with a positioned/oversized bitmap.
+        if (retained) {
+            loaded.pasteImage(image,"expand",true);
+            loaded.setActiveLayer(0);
+        }
+        CanvasWidget canvas;
+        canvas.setDocument(&loaded);
+        MoveTool move;
+        const QImage expanded = loaded.activeLayer()->image();
+        strokeTool(&move,canvas,QPointF(300,200),QPointF(350,240));
+        if (retained)
+            CHECK(loaded.activeLayer()->image() == expanded && expanded.copy(image.rect()) == image &&
+                  loaded.activeLayer()->offset().isNull(),
+                  "v1 retained layer keeps full padded bitmap after canvas expansion and Move");
+        else
+            CHECK(loaded.activeLayer()->offset().isNull() && loaded.activeLayer()->image() != image &&
+                  loaded.activeLayer()->image().pixelColor(0,0).alpha() == 0,
+                  "v1 ordinary layer still uses the established baked move");
+    }
+    for (const auto &geometry : {std::make_pair(QSize(800,600),QPoint(3,-2)),
+                                 std::make_pair(QSize(840,630),QPoint()),
+                                 std::make_pair(QSize(840,630),QPoint(-3,2))}) {
+        Document ordinary(800,600);
+        const QImage before = makeImage(geometry.first.width(),geometry.first.height(),QColor(210,70,30,117));
+        ordinary.activeLayer()->setImage(before);
+        ordinary.activeLayer()->setOffset(geometry.second);
+        CHECK(!ordinary.activeLayer()->retainsOffCanvasPixels(), "positioned ordinary fixture has explicit false retention");
+        const QString path = directory.path()+"/positioned-ordinary.psw";
+        CHECK(ordinary.saveNative(path), "save ordinary state that legacy geometry would infer as retained");
+        Document restored;
+        CHECK(restored.loadNative(path), "reload positioned ordinary document");
+        CHECK(!restored.activeLayer()->retainsOffCanvasPixels(), "native roundtrip preserves explicit ordinary movement state");
+        CHECK(restored.activeLayer()->image() == before && restored.activeLayer()->offset() == geometry.second,
+              "native roundtrip preserves positioned ordinary bitmap and origin");
+        QImage expected(before.size(),QImage::Format_ARGB32_Premultiplied);
+        expected.fill(Qt::transparent);
+        { QPainter painter(&expected); painter.drawImage(4,3,before); }
+        CanvasWidget canvas;
+        canvas.setDocument(&restored);
+        MoveTool move;
+        strokeTool(&move,canvas,QPointF(20,20),QPointF(24,23));
+        CHECK(restored.activeLayer()->image() == expected && restored.activeLayer()->offset() == geometry.second,
+              "ordinary Move remains pixel-baked after native roundtrip");
+        restored.history().undo();
+        CHECK(restored.activeLayer()->image() == before && !restored.activeLayer()->retainsOffCanvasPixels(),
+              "native ordinary Move undo preserves explicit state");
+    }
+    const QString unknown = directory.path()+"/unknown.psw";
+    CHECK(writeV1(unknown, retainedPattern(), QPoint(), 42), "write unknown-version fixture");
+    Document untouched(23,17);
+    const QImage before = untouched.flatten();
+    CHECK(!untouched.loadNative(unknown), "reject unsupported native versions");
+    CHECK(untouched.size() == QSize(23,17) && untouched.flatten() == before,
+          "unknown format does not replace the live document");
+    Document current(800,600);
+    current.pasteImage(retainedPattern(),"Keep",false);
+    const QString path = directory.path()+"/current.psw";
+    CHECK(current.saveNative(path), "write current native format");
+    QFile file(path);
+    CHECK(file.open(QIODevice::ReadOnly), "open current native file");
+    QDataStream in(&file);
+    in.setVersion(QDataStream::Qt_6_0);
+    quint32 magic = 0;
+    qint32 version = 0;
+    in >> magic >> version;
+    CHECK(magic == quint32(0x50535731) && version == 2, "retained-state layout is explicitly version 2");
+    file.close();
+    Document ordinary(23,17);
+    const QString ordinaryPath = directory.path()+"/ordinary-current.psw";
+    CHECK(ordinary.saveNative(ordinaryPath), "save an ordinary document without retained state");
+    QFile ordinaryFile(ordinaryPath);
+    CHECK(ordinaryFile.open(QIODevice::ReadOnly), "open ordinary native output");
+    QDataStream ordinaryStream(&ordinaryFile);
+    ordinaryStream.setVersion(QDataStream::Qt_6_0);
+    ordinaryStream >> magic >> version;
+    CHECK(magic == quint32(0x50535731) && version == 1,
+          "ordinary documents retain the legacy v1 output layout");
+    for (bool retained : {false,true}) {
+        // Both fixtures have identical dimensions and zero origin: only v2's
+        // explicit flag can distinguish their movement provenance.
+        const QString matchedPath = directory.path() + (retained ? "/matched-retained.psw" : "/matched-ordinary.psw");
+        QFile matchedFile(matchedPath);
+        CHECK(matchedFile.open(QIODevice::WriteOnly), "open independent matched-size v2 fixture");
+        QDataStream out(&matchedFile);
+        out.setVersion(QDataStream::Qt_6_0);
+        const QImage image = makeImage(800,600,QColor(210,70,30,117));
+        out << quint32(0x50535731) << qint32(2) << qint32(800) << qint32(600) << qint32(0) << qint32(1);
+        out << QString("matched v2") << float(1) << true << false << qint32(0) << QPoint() << retained << image;
+        CHECK(out.status() == QDataStream::Ok, "write independent v2 flag and bitmap");
+        matchedFile.close();
+        Document loaded;
+        CHECK(loaded.loadNative(matchedPath), "read matched-size v2 fixture");
+        CHECK(loaded.activeLayer()->retainsOffCanvasPixels() == retained && loaded.activeLayer()->image() == image &&
+              loaded.activeLayer()->offset().isNull(), "v2 honours explicit provenance, never legacy geometry inference");
+        CHECK(loaded.saveNative(matchedPath), "save matched-size native state again");
+        Document reread;
+        CHECK(reread.loadNative(matchedPath) && reread.activeLayer()->retainsOffCanvasPixels() == retained,
+              "matched-size native save/load preserves retained or ordinary state");
+    }
+}
+
+static void retainedMergeRegression() {
+    SECTION("Merge Down composes retained bitmaps in a common document-space domain");
+    for (bool keepArtwork : {false,true}) {
+        for (const auto &offsets : {std::make_pair(QPoint(50,40),QPoint(-20,-10)),
+                                   std::make_pair(QPoint(-50,-40),QPoint(20,10)),
+                                   std::make_pair(QPoint(50,40),QPoint(950,-10))}) {
+            Document doc(800,600);
+            doc.activeLayer()->clear(Qt::transparent);
+            const QImage lower = retainedPattern();
+            QImage top = makeImage(870,650,Qt::transparent);
+            { QPainter p(&top); p.fillRect(300,300,20,20,Qt::magenta);
+              p.fillRect(840,610,20,20,Qt::red); }
+            const QImage artwork = top;
+            if (keepArtwork) {
+                top.fill(Qt::white);
+                QPainter p(&top); p.drawImage(0,0,artwork);
+            }
+            doc.pasteImage(lower,"lower",false);
+            doc.activeLayer()->setOffset(offsets.first);
+            doc.pasteImage(top,"upper",false);
+            doc.activeLayer()->setOffset(offsets.second);
+            doc.activeLayer()->setOpacity(0.75f);
+            doc.selection().selectRect(QRect(10,20,30,40));
+            const QImage mask = doc.selection().mask();
+            const QImage before = doc.flatten();
+            const QRect bounds = QRect(offsets.first,lower.size()).united(QRect(offsets.second,top.size()));
+            QImage expected = makeImage(bounds.width(),bounds.height(),Qt::transparent);
+            { QPainter p(&expected);
+              p.drawImage(offsets.first-bounds.topLeft(),lower);
+              p.setOpacity(0.75f);
+              p.drawImage(offsets.second-bounds.topLeft(),artwork); }
+            QImage expectedVisible = makeImage(800,600,Qt::transparent);
+            { QPainter p(&expectedVisible); p.drawImage(bounds.topLeft(),expected); }
+            doc.mergeLayerDown(2,keepArtwork);
+            CHECK(doc.flatten() == expectedVisible, "both merge branches preserve artwork document positions");
+            if (!keepArtwork)
+                CHECK(doc.flatten() == before, "ordinary merge preserves exact visible composition");
+            CHECK(doc.activeLayer()->image() == expected && doc.activeLayer()->offset() == bounds.topLeft(),
+                  "merged buffer retains both complete domains, including artwork outside canvas");
+            CHECK(doc.activeLayer()->retainsOffCanvasPixels(), "merged Keep layers retain nondestructive movement");
+            CHECK(doc.layerCount() == 2 && doc.activeLayerIndex() == 1, "merge updates stack and active layer");
+            doc.history().undo();
+            CHECK(doc.layerCount() == 3 && doc.activeLayerIndex() == 2 && doc.flatten() == before,
+                  "merge undo restores visible layer stack");
+            CHECK(doc.layerAt(1)->image() == lower && doc.layerAt(1)->offset() == offsets.first &&
+                  doc.layerAt(2)->image() == top && doc.layerAt(2)->offset() == offsets.second,
+                  "merge undo restores full retained buffers and distinct origins");
+            CHECK(doc.layerAt(1)->retainsOffCanvasPixels() && doc.layerAt(2)->retainsOffCanvasPixels() &&
+                  doc.selection().mask() == mask, "merge undo restores retained semantics and selection");
+            doc.history().redo();
+            CHECK(doc.activeLayer()->image() == expected && doc.activeLayer()->offset() == bounds.topLeft() &&
+                  doc.flatten() == expectedVisible, "merge redo restores the common domain exactly");
+        }
+    }
+}
+
 // =====================================================================
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
+    resizeStraightAlphaCharacterization();
+    retainedCropRegression();
+    retainedExpansionRegression();
+    pasteExpansionBoundsRegression();
+    retainedOrthogonalRegression();
+    retainedResizeRegression();
+    resizeStampCharacterization();
+    ordinaryMoveAuthorityRegression();
+    nativeRetentionCompatibility();
+    retainedMergeRegression();
 
     // ---------- TOOLS ----------
     SECTION("Tools draw into the active layer");
@@ -1612,6 +2118,42 @@ int main(int argc, char **argv) {
             CHECK(after.pixelColor(10, 20).alpha() == 0,
                   "Move tool: the block really moved (old position now empty)");
         }
+    }
+
+    SECTION("Clipboard paste preserves oversized content and is one undoable operation");
+    {
+        Document doc(200, 100);
+        QImage image(240, 120, QImage::Format_ARGB32);
+        image.fill(QColor(20, 80, 160, 128));
+        image.setPixelColor(239, 119, Qt::red);
+        doc.selection().selectRect(QRect(5, 7, 10, 11));
+        const QImage mask = doc.selection().mask();
+        const QImage original = doc.activeLayer()->image();
+        doc.pasteImage(image, "paste", false);
+        CHECK(doc.size() == QSize(200, 100), "Keep does not resize the canvas");
+        CHECK(doc.activeLayer()->image().size() == image.size(), "Keep retains all pasted pixels");
+        CHECK(doc.activeLayer()->image().format() == QImage::Format_ARGB32_Premultiplied,
+              "clipboard paste stores premultiplied pixels");
+        CHECK(doc.activeLayer()->image().pixelColor(239,119) == QColor(Qt::red),
+              "the off-canvas corner survives paste");
+        CHECK(!doc.selection().hasSelection(), "accepted paste clears a stale selection");
+        CHECK(doc.history().currentIndex() == 1, "paste is a single history action");
+        doc.history().undo();
+        CHECK(doc.layerCount() == 1 && doc.activeLayerIndex() == 0, "undo restores stack and active layer");
+        CHECK(doc.selection().mask() == mask, "undo restores the pre-paste selection");
+        doc.history().redo();
+        CHECK(doc.activeLayer()->image().pixelColor(239,119) == QColor(Qt::red), "redo retains hidden pixels");
+        doc.activeLayer()->setOffset(QPoint(-40,-20));
+        QImage next(260, 80, QImage::Format_ARGB32_Premultiplied);
+        next.fill(Qt::transparent);
+        doc.pasteImage(next, "expanded", true);
+        CHECK(doc.size() == QSize(260, 100), "Expand grows only dimensions that need it");
+        CHECK(doc.layerAt(0)->image().copy(original.rect()) == original, "Expand does not resample old artwork");
+        CHECK(doc.layerAt(1)->offset() == QPoint(-40,-20), "Expand preserves existing layer positions");
+        CHECK(doc.layerAt(1)->image().pixelColor(239,119) == QColor(Qt::red), "Expand retains pre-existing hidden content");
+        doc.history().undo();
+        CHECK(doc.size() == QSize(200,100) && doc.layerCount() == 2 && doc.activeLayerIndex() == 1,
+              "one undo reverses expansion and paste together");
     }
 
     // ---------- LAYER MOVE / FLIP / IMPORT ----------

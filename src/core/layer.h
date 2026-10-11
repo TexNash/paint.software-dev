@@ -57,6 +57,11 @@ public:
     QPoint offset() const { return m_offset; }
     void setOffset(const QPoint &offset) { m_offset = offset; }
 
+    // Keep-paste layers retain nondestructive movement even if a later canvas
+    // expansion matches their bitmap dimensions, or their origin returns to zero.
+    bool retainsOffCanvasPixels() const { return m_retainsOffCanvasPixels; }
+    void setRetainsOffCanvasPixels(bool retain) { m_retainsOffCanvasPixels = retain; }
+
     int width() const { return m_image.width(); }
     int height() const { return m_image.height(); }
 
@@ -75,4 +80,5 @@ private:
     bool m_locked = false;
     BlendMode m_blendMode = BlendMode::Normal;
     QPoint m_offset{0, 0};
+    bool m_retainsOffCanvasPixels = false;
 };

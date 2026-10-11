@@ -19,7 +19,13 @@ void MagicWandTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event
     if (m_sampleImage) {
         image = doc->flattenVisible();
     } else if (auto *layer = doc->activeLayer()) {
-        image = layer->image().convertToFormat(QImage::Format_ARGB32);
+        // Selection masks are document-sized. Sample the visible document-space
+        // portion, never the retained oversized buffer (which could overrun a
+        // contiguous selection's mask), and account for the layer's position.
+        image = QImage(doc->size(), QImage::Format_ARGB32_Premultiplied);
+        image.fill(Qt::transparent);
+        { QPainter painter(&image); painter.drawImage(layer->offset(), layer->image()); }
+        image = image.convertToFormat(QImage::Format_ARGB32);
     } else {
         image = doc->flattenVisible();
     }

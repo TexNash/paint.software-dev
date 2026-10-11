@@ -3,6 +3,7 @@
 #include <QImageReader>
 #include <QImageWriter>
 #include <cstdlib>
+#include <limits>
 #include <QFileInfo>
 #include <QFile>
 #include <QDataStream>
@@ -27,13 +28,44 @@ Document::Document(const QString &filePath, QObject *parent)
 void Document::resize(int width, int height) {
     if (width <= 0 || height <= 0 || (width == m_width && height == m_height)) return;
     auto cmd = std::make_unique<DocumentSnapshotCommand>(this, "Resize Image");
+    const QSize oldSize = size();
+    const double scaleX = double(width) / m_width;
+    const double scaleY = double(height) / m_height;
     m_width = width;
     m_height = height;
-    // Scale layer content (this is "Image > Resize", i.e. resample).
+    // Resample every bitmap and origin by the document scale, not buffer size.
     for (auto &layer : m_layers) {
-        QImage scaled = layer->image().scaled(width, height, Qt::IgnoreAspectRatio,
-                                               Qt::SmoothTransformation);
-        layer->setImage(scaled.convertToFormat(QImage::Format_ARGB32_Premultiplied));
+        const QPoint origin = layer->offset();
+        QImage scaled = layer->image().scaled(
+            qMax(1, qRound(layer->width() * scaleX)),
+            qMax(1, qRound(layer->height() * scaleY)),
+            Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+            .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        if (origin.isNull() && layer->image().size() == oldSize) {
+            layer->setImage(scaled); // Preserve ordinary canvas-sized resampling.
+            continue;
+        }
+        const QPoint scaledOrigin(qRound(origin.x() * scaleX), qRound(origin.y() * scaleY));
+        const QRect bounds = QRect(scaledOrigin, scaled.size()).united(QRect(QPoint(), size()));
+        QImage result(bounds.size(), QImage::Format_ARGB32_Premultiplied);
+        result.fill(Qt::transparent);
+        QPainter painter(&result);
+        painter.drawImage(scaledOrigin - bounds.topLeft(), scaled);
+        // Rounded bitmap sizes/origins change the sampling phase, and hidden
+        // pixels must not bleed into the visible canvas at its edges. Sample
+        // that finite domain exactly as an ordinary layer, while keeping the
+        // rounded, document-scaled off-canvas bitmap outside it.
+        const QImage visible = layer->image().copy(QRect(-origin, oldSize)).scaled(
+            size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+            .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        // Source replaces only the new canvas rectangle, not the off-canvas
+        // bitmap. SourceOver would blend the same partial-alpha pixels twice.
+        painter.setClipRect(QRect(-bounds.topLeft(), size()));
+        painter.setCompositionMode(QPainter::CompositionMode_Source);
+        painter.drawImage(-bounds.topLeft(), visible);
+        painter.end();
+        layer->setOffset(bounds.topLeft());
+        layer->setImage(result);
     }
     m_selection.resize(width, height);
     cmd->captureAfter();
@@ -145,6 +177,59 @@ int Document::addLayer(const QImage &image, const QString &name) {
     return index;
 }
 
+int Document::pasteImage(const QImage &image, const QString &name, bool expandCanvas) {
+    if (image.isNull()) return -1;
+    if (expandCanvas) {
+        const int width = qMax(m_width, image.width()), height = qMax(m_height, image.height());
+        // Check local extents before changing any document state. Offsets read
+        // from native files can require a bitmap too wide/tall for QImage.
+        for (const auto &layer : m_layers) {
+            if (qint64(width) - qMin(layer->offset().x(), 0) > std::numeric_limits<int>::max()
+                || qint64(height) - qMin(layer->offset().y(), 0) > std::numeric_limits<int>::max())
+                return -1;
+        }
+    }
+    auto cmd = std::make_unique<DocumentSnapshotCommand>(this, "Paste");
+    const QSize oldSize = size();
+    if (expandCanvas) {
+        m_width = qMax(m_width, image.width());
+        m_height = qMax(m_height, image.height());
+        for (auto &layer : m_layers) {
+            // Preserve any already-retained content and its document-space offset.
+            // A negative origin needs extra local storage to reach the new
+            // right/bottom canvas edges. Keep the origin and all existing pixels.
+            const QPoint origin = layer->offset();
+            const QSize canvasExtent(m_width - qMin(origin.x(), 0),
+                                     m_height - qMin(origin.y(), 0));
+            const QSize buffer = layer->image().size().expandedTo(canvasExtent);
+            if (buffer == layer->image().size()) continue;
+            QImage padded(buffer, QImage::Format_ARGB32_Premultiplied);
+            padded.fill(Qt::transparent);
+            { QPainter painter(&padded); painter.drawImage(0, 0, layer->image()); }
+            layer->setImage(padded);
+        }
+    }
+    QImage pasted(size().expandedTo(image.size()), QImage::Format_ARGB32_Premultiplied);
+    pasted.fill(Qt::transparent);
+    { QPainter painter(&pasted); painter.drawImage(0, 0, image); }
+    const int index = m_activeLayer + 1;
+    auto layer = std::make_shared<Layer>(pasted, name);
+    layer->setRetainsOffCanvasPixels(!expandCanvas && image.size().expandedTo(oldSize) != oldSize);
+    m_layers.insert(m_layers.begin() + index, layer);
+    m_activeLayer = index;
+    m_selection.resize(m_width, m_height);
+    m_selection.clear();
+    cmd->captureAfter();
+    m_history.push(std::move(cmd));
+    m_modified = true;
+    if (oldSize != size()) emit sizeChanged(m_width, m_height);
+    emit selectionChanged();
+    emit layersChanged();
+    emit activeLayerChanged(m_activeLayer);
+    emit documentChanged();
+    return index;
+}
+
 void Document::removeLayer(int index) {
     if (m_layers.size() <= 1 || index < 0 || index >= static_cast<int>(m_layers.size())) return;
 
@@ -227,20 +312,32 @@ void Document::mergeLayerDown(int index, bool keepArtwork) {
     Layer *upper = m_layers[index].get();
     Layer *lower = m_layers[index - 1].get();
 
+    // Both bitmaps live in document space. Retain their union rather than
+    // clipping the upper to the lower buffer or applying the lower offset twice.
+    const QRect bounds = QRect(lower->offset(), lower->image().size()).united(
+        QRect(upper->offset(), upper->image().size()));
+    QImage base(bounds.size(), QImage::Format_ARGB32_Premultiplied);
+    base.fill(Qt::transparent);
+    { QPainter p(&base); p.drawImage(lower->offset() - bounds.topLeft(), lower->image()); }
+    const QPoint upperOrigin = upper->offset() - bounds.topLeft();
     QImage merged;
     if (keepArtwork) {
         // Knock out the upper layer's flat background so the lower layer's
         // artwork isn't hidden by an opaque (e.g. white) fill.
         QImage top = knockOutBackground(upper->image()).convertToFormat(QImage::Format_ARGB32_Premultiplied);
-        merged = lower->image().convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        merged = base;
         QPainter p(&merged);
         p.setOpacity(upper->opacity());
-        p.drawImage(upper->offset(), top);
+        p.drawImage(upperOrigin, top);
         p.end();
     } else {
-        merged = upper->composited(lower->image());
+        Layer positionedUpper(*upper);
+        positionedUpper.setOffset(upperOrigin);
+        merged = positionedUpper.composited(base);
     }
     lower->setImage(merged);
+    lower->setOffset(bounds.topLeft());
+    lower->setRetainsOffCanvasPixels(lower->retainsOffCanvasPixels() || upper->retainsOffCanvasPixels());
     lower->setOpacity(1.0f);
     lower->setBlendMode(BlendMode::Normal);
     m_layers.erase(m_layers.begin() + index);
@@ -356,7 +453,15 @@ bool Document::saveNative(const QString &filePath) {
     QDataStream out(&file);
     out.setVersion(QDataStream::Qt_6_0);
     out << kPswMagic;
-    out << qint32(1);                         // format version
+    // Preserve legacy output only when it preserves the explicit movement state.
+    qint32 version = 1;
+    for (const auto &layer : m_layers) {
+        // v1 infers retention from geometry. Positioned or differently sized
+        // ordinary layers also need v2 to keep their explicit false flag.
+        if (layer->retainsOffCanvasPixels() || layer->image().size() != size()
+            || !layer->offset().isNull()) { version = 2; break; }
+    }
+    out << version;
     out << qint32(m_width) << qint32(m_height);
     out << qint32(m_activeLayer);
     out << qint32(static_cast<int>(m_layers.size()));
@@ -367,6 +472,7 @@ bool Document::saveNative(const QString &filePath) {
         out << bool(l->isLocked());
         out << qint32(static_cast<int>(l->blendMode()));
         out << l->offset();
+        if (version == 2) out << l->retainsOffCanvasPixels();
         out << l->image();
     }
     if (out.status() != QDataStream::Ok) return false;
@@ -387,6 +493,7 @@ bool Document::loadNative(const QString &filePath) {
     if (magic != kPswMagic) return false;
     qint32 version = 0, w = 0, h = 0, active = 0, count = 0;
     in >> version >> w >> h >> active >> count;
+    if (version != 1 && version != 2) return false;
     if (w <= 0 || h <= 0 || count <= 0 || count > 4096) return false;
 
     std::vector<std::shared_ptr<Layer>> layers;
@@ -397,8 +504,11 @@ bool Document::loadNative(const QString &filePath) {
         bool visible = true, locked = false;
         qint32 blend = 0;
         QPoint offset;
+        bool retained = false;
         QImage img;
-        in >> name >> opacity >> visible >> locked >> blend >> offset >> img;
+        in >> name >> opacity >> visible >> locked >> blend >> offset;
+        if (version == 2) in >> retained;
+        in >> img;
         if (in.status() != QDataStream::Ok || img.isNull()) return false;
         auto layer = std::make_shared<Layer>(img, name);
         layer->setOpacity(opacity);
@@ -406,6 +516,11 @@ bool Document::loadNative(const QString &filePath) {
         layer->setLocked(locked);
         layer->setBlendMode(static_cast<BlendMode>(blend));
         layer->setOffset(offset);
+        // v2 always uses its explicit flag, even for canvas-sized zero-origin
+        // retained layers. Legacy v1 has no movement provenance: geometry is
+        // the only available inference and cannot identify that matched case.
+        layer->setRetainsOffCanvasPixels(version == 2 ? retained
+                                                     : img.size() != QSize(w,h) || !offset.isNull());
         layers.push_back(layer);
     }
 
@@ -515,8 +630,13 @@ void Document::cropTo(const QRect &rect) {
     if (r.isEmpty()) return;
     auto cmd = std::make_unique<DocumentSnapshotCommand>(this, "Crop to Selection");
 
-    for (auto &layer : m_layers)
-        layer->setImage(layer->image().copy(r));
+    for (auto &layer : m_layers) {
+        // The crop is in document space, not the retained bitmap's local space.
+        layer->setImage(layer->image().copy(r.translated(-layer->offset())));
+        layer->setOffset(QPoint());
+        // Crop deliberately discards the outside bitmap, including its retention state.
+        layer->setRetainsOffCanvasPixels(false);
+    }
     m_width = r.width();
     m_height = r.height();
     m_selection.clear();
@@ -537,8 +657,20 @@ void Document::rotate(int quarterTurns, const QString &description) {
 
     QTransform t;
     t.rotate(90.0 * quarterTurns);
-    for (auto &layer : m_layers)
+    for (auto &layer : m_layers) {
+        const QPoint origin = layer->offset();
+        const QSize buffer = layer->image().size();
+        QPoint rotatedOrigin;
+        if (quarterTurns == 1)
+            rotatedOrigin = QPoint(m_height - origin.y() - buffer.height(), origin.x());
+        else if (quarterTurns == 2)
+            rotatedOrigin = QPoint(m_width - origin.x() - buffer.width(),
+                                   m_height - origin.y() - buffer.height());
+        else
+            rotatedOrigin = QPoint(origin.y(), m_width - origin.x() - buffer.width());
         layer->setImage(layer->image().transformed(t));
+        layer->setOffset(rotatedOrigin);
+    }
 
     // 90° / 270° swap width and height; 180° keeps them.
     if (quarterTurns == 1 || quarterTurns == 3)
@@ -556,8 +688,12 @@ void Document::rotate(int quarterTurns, const QString &description) {
 
 void Document::flip(bool horizontal, const QString &description) {
     auto cmd = std::make_unique<DocumentSnapshotCommand>(this, description);
-    for (auto &layer : m_layers)
+    for (auto &layer : m_layers) {
+        const QPoint origin = layer->offset();
+        layer->setOffset(horizontal ? QPoint(m_width - origin.x() - layer->width(), origin.y())
+                                    : QPoint(origin.x(), m_height - origin.y() - layer->height()));
         layer->setImage(layer->image().mirrored(horizontal, !horizontal));
+    }
     // Flipping keeps the dimensions; drop the selection so its mask can't go stale.
     m_selection.clear();
     m_selection.resize(m_width, m_height);

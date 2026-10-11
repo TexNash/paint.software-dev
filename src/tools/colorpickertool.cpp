@@ -22,7 +22,7 @@ void ColorPickerTool::pickColor(const QPointF &canvasPos, QMouseEvent *event, Ca
     auto *layer = doc->activeLayer();
     const bool sampleImage = (event->modifiers() & Qt::ControlModifier) || !layer;
     QImage src = sampleImage ? doc->flattenVisible() : layer->image();
-    QPoint pos = toPixelPos(canvasPos);
+    QPoint pos = toPixelPos(sampleImage ? canvasPos : canvasPos - layer->offset());
     if (pos.x() < 0 || pos.y() < 0 || pos.x() >= src.width() || pos.y() >= src.height()) return;
 
     QColor color = src.pixelColor(pos);

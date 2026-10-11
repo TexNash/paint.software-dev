@@ -4,6 +4,7 @@
 #include <QImage>
 #include <QString>
 #include <QStringList>
+#include "selection.h"
 #include <memory>
 #include <vector>
 
@@ -29,6 +30,20 @@ private:
     QImage m_before;
     QImage m_after;
     QString m_description;
+};
+
+// Nondestructive positioning for layers with retained off-canvas pixels.
+class LayerOffsetCommand : public HistoryCommand {
+public:
+    LayerOffsetCommand(Document *doc, int index, QPoint before, QPoint after);
+    void undo() override;
+    void redo() override;
+    QString description() const override { return "Move Layer"; }
+private:
+    void apply(QPoint offset);
+    Document *m_doc;
+    int m_index;
+    QPoint m_before, m_after;
 };
 
 class LayerAddCommand : public HistoryCommand {
@@ -86,6 +101,7 @@ private:
         int width = 0;
         int height = 0;
         int activeLayer = 0;
+        Selection selection;
         std::vector<std::shared_ptr<class Layer>> layers;
     };
     static State capture(Document *doc);

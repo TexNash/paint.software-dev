@@ -29,9 +29,9 @@ jobs:
         run: cmake --build build -j
 
       - name: Build tests
-        run: cmake --build build --target paintdotnet_tests -j
+        run: cmake --build build --target paintdotnet_tests paintdotnet_brush_tests paintdotnet_paste_tests -j4
 
       - name: Run tests (headless)
         env:
           QT_QPA_PLATFORM: offscreen
-        run: ./build/paintdotnet_tests
+        run: ctest --test-dir build --output-on-failure

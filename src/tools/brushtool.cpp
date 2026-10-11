@@ -38,7 +38,7 @@ void BrushTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, Ca
     m_compositedOpacity = -1;
     m_selectionKey = -1;
     m_strokeColor = col;
-    drawBrushDab(canvasPos, m_strokeColor);
+    drawBrushDab(canvasPos - layer->offset(), m_strokeColor);
     canvas.updateCanvasRegion(compositeStroke(doc, layer, m_strokeColor).translated(layer->offset()));
 }
 
@@ -61,7 +61,7 @@ void BrushTool::mouseMoveEvent(const QPointF &canvasPos, QMouseEvent *event, Can
     if (!layer) return;
 
     Q_UNUSED(event);
-    drawBrushStroke(m_lastPos, canvasPos, m_strokeColor);
+    drawBrushStroke(m_lastPos - layer->offset(), canvasPos - layer->offset(), m_strokeColor);
     m_lastPos = canvasPos;
     canvas.updateCanvasRegion(compositeStroke(doc, layer, m_strokeColor).translated(layer->offset()));
 }
@@ -149,7 +149,11 @@ QRect BrushTool::compositeStroke(Document *doc, Layer *layer, const QColor &colo
     m_segmentBounds = m_segmentBounds.united(m_dirtyRect);
     const qint64 selectionKey = doc->selection().mask().cacheKey();
     if (selectionKey != m_selectionKey) {
-        m_selectionRegion = doc->selection().region();
+        m_selectionRegion = doc->selection().region().translated(-layer->offset());
+        if (layer->image().size() != doc->size() || !layer->offset().isNull()) {
+            const QRegion visible(QRect(QPoint(), doc->size()).translated(-layer->offset()));
+            m_selectionRegion = doc->selection().hasSelection() ? m_selectionRegion.intersected(visible) : visible;
+        }
     }
     // Option/selection changes used to recomposite the whole colour segment.
     // Preserve that behaviour, but ordinary pointer moves only touch new damage.
@@ -190,7 +194,7 @@ void BrushTool::compositeOverwrite(Document *doc, Layer *layer, const QColor &co
         QRgb *dst = reinterpret_cast<QRgb*>(result.scanLine(y));
         for (int x = 0; x < result.width(); ++x) {
             double cov = (qAlpha(buf[x + dirty.x()]) / 255.0) * strength;
-            if (cov <= 0.0 || !selectionAllows(doc, x + dirty.x(), y + dirty.y())) continue;
+            if (cov <= 0.0 || !imageSelectionAllows(doc, x + dirty.x(), y + dirty.y())) continue;
             const double ic = 1.0 - cov;
             QRgb d = dst[x];
             dst[x] = qRgba(

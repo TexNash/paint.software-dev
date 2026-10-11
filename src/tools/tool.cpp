@@ -6,11 +6,27 @@
 
 void Tool::clipToSelection(QPainter &painter, Document *doc) {
     if (!doc) return;
+    if (auto *layer = doc->activeLayer()) {
+        painter.translate(-layer->offset());
+        if (layer->image().size() != doc->size() || !layer->offset().isNull())
+            painter.setClipRect(QRect(QPoint(), doc->size()));
+    }
     const Selection &sel = doc->selection();
     if (!sel.hasSelection()) return;
     QRegion region = sel.region();
     if (!region.isEmpty())
-        painter.setClipRegion(region);
+        painter.setClipRegion(region, Qt::IntersectClip);
+}
+
+QPointF Tool::imagePoint(const QPointF &documentPoint, Document *doc) {
+    return documentPoint - (doc && doc->activeLayer() ? doc->activeLayer()->offset() : QPoint());
+}
+
+bool Tool::imageSelectionAllows(Document *doc, int x, int y) {
+    if (!doc) return true;
+    const QPoint offset = doc->activeLayer() ? doc->activeLayer()->offset() : QPoint();
+    const QPoint point = QPoint(x, y) + offset;
+    return QRect(QPoint(), doc->size()).contains(point) && selectionAllows(doc, point.x(), point.y());
 }
 
 QPainter::CompositionMode Tool::compositionModeFor(int blendIndex) {

@@ -34,6 +34,8 @@ public:
 
     int addLayer(const QString &name = QString());
     int addLayer(const QImage &image, const QString &name = QString());
+    // One undoable clipboard paste; canvas growth does not resample artwork.
+    int pasteImage(const QImage &image, const QString &name, bool expandCanvas);
     void removeLayer(int index);
     void moveLayer(int fromIndex, int toIndex);
     void duplicateLayer(int index);

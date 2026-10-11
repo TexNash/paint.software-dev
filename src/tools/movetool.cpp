@@ -26,10 +26,10 @@ void MoveTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, Can
         m_movingSelection = true;
         m_copyMode = (event->modifiers() & Qt::ControlModifier);   // Ctrl = move a copy
         m_originalImage = layer->image().copy();
-        m_floating = doc->selection().getMaskedImage(m_originalImage);   // selected pixels only
+        m_floating = doc->selection().getMaskedImage(m_originalImage, layer->offset());   // selected pixels only
         m_hole = m_originalImage.copy();
         // Leaving the hole intact keeps the originals in place, so only the copy moves.
-        if (!m_copyMode) doc->selection().eraseFromImage(m_hole);
+        if (!m_copyMode) doc->selection().eraseFromImage(m_hole, layer->offset());
 
         m_originalRect = doc->selection().boundingRect();
         m_originalMask = doc->selection().mask().copy();
@@ -41,7 +41,7 @@ void MoveTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, Can
         if (m_handle != SelHandles::Handle::None) {
             m_resizing = true;
             m_previewRect = m_originalRect;
-            m_floatingCrop = m_floating.copy(m_originalRect);
+            m_floatingCrop = m_floating.copy(m_originalRect.translated(-layer->offset()));
         } else if (event->button() == Qt::RightButton
                    || SelHandles::inRotationZone(m_originalRect, canvasPos, canvas.zoom())) {
             m_rotating = true;
@@ -49,7 +49,8 @@ void MoveTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, Can
                                          canvasPos.x() - m_rotCenter.x()) * 180.0 / M_PI;
         }
     } else {
-        // No selection: move the whole layer via its offset (baked in on release).
+        // Preview a whole-layer move via its offset; ordinary layers bake the
+        // delta on release, retained layers keep their full bitmap and offset.
         m_movingSelection = false;
         m_copyMode = false;
         m_originalOffset = layer->offset();
@@ -73,7 +74,7 @@ void MoveTool::mouseMoveEvent(const QPointF &canvasPos, QMouseEvent *event, Canv
         QImage result = m_hole.copy();
         {
             QPainter p(&result);
-            p.setTransform(SelHandles::rotationAbout(m_rotCenter, m_angle));
+            p.setTransform(SelHandles::rotationAbout(m_rotCenter - layer->offset(), m_angle));
             p.drawImage(0, 0, m_floating);
         }
         layer->setImage(result);
@@ -95,7 +96,7 @@ void MoveTool::mouseMoveEvent(const QPointF &canvasPos, QMouseEvent *event, Canv
             const QImage scaled = m_floatingCrop.scaled(m_previewRect.size(), Qt::IgnoreAspectRatio,
                                                         Qt::FastTransformation);
             QPainter p(&result);
-            p.drawImage(m_previewRect.topLeft(), scaled);
+            p.drawImage(m_previewRect.topLeft() - layer->offset(), scaled);
             p.end();
         }
         layer->setImage(result);
@@ -149,7 +150,7 @@ void MoveTool::mouseReleaseEvent(const QPointF &, QMouseEvent *, CanvasWidget &c
             {
                 QPainter p(&result);
                 p.setRenderHint(QPainter::SmoothPixmapTransform);
-                p.setTransform(SelHandles::rotationAbout(m_rotCenter, m_angle));
+                p.setTransform(SelHandles::rotationAbout(m_rotCenter - layer->offset(), m_angle));
                 p.drawImage(0, 0, m_floating);
             }
             layer->setImage(result);
@@ -178,7 +179,7 @@ void MoveTool::mouseReleaseEvent(const QPointF &, QMouseEvent *, CanvasWidget &c
                 const QImage scaled = m_floatingCrop.scaled(m_previewRect.size(), Qt::IgnoreAspectRatio,
                                                             Qt::SmoothTransformation);
                 QPainter p(&result);
-                p.drawImage(m_previewRect.topLeft(), scaled);
+                p.drawImage(m_previewRect.topLeft() - layer->offset(), scaled);
                 p.end();
             }
             layer->setImage(result);
@@ -207,11 +208,20 @@ void MoveTool::mouseReleaseEvent(const QPointF &, QMouseEvent *, CanvasWidget &c
         return;
     }
 
-    // Whole-layer move: bake the offset into the pixels and reset it to zero so
-    // every other tool (which works in image space) stays aligned.
+    // Ordinary whole-layer moves bake the delta into the bitmap and restore its
+    // original origin. Explicit retained state is the only nondestructive path.
     const QPoint finalOffset = layer->offset();
     if (finalOffset == m_originalOffset) return;   // no real move
 
+    // Keep the full bitmap when the layer has content outside the canvas. Baking
+    // into a fixed buffer here would permanently discard it on the first drag.
+    if (layer->retainsOffCanvasPixels()) {
+        doc->history().push(std::make_unique<LayerOffsetCommand>(doc, doc->activeLayerIndex(),
+                                                               m_originalOffset, finalOffset));
+        doc->setModified(true);
+        emit doc->documentChanged();
+        return;
+    }
     QImage before = layer->image().copy();
     QImage moved(before.size(), QImage::Format_ARGB32_Premultiplied);
     moved.fill(Qt::transparent);

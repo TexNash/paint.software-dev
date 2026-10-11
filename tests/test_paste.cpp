@@ -9,10 +9,16 @@
 #include <QImageReader>
 #include <QTimer>
 #include <QDialog>
-#include <QCommandLinkButton>
+#include <QPushButton>
 #include <QLabel>
 #include <QKeyEvent>
 #include <QMouseEvent>
+#include <QEnterEvent>
+#include <QStyleFactory>
+#include <QStyle>
+#include <QAccessible>
+#include "dialogs/pastedialog.h"
+#include "theme.h"
 #include <iostream>
 #include "mainwindow.h"
 #include "canvas/canvaswidget.h"
@@ -81,15 +87,15 @@ static void cancelPrompt() {
             if (!dlg) return;
             seen = true;
             CHECK(dlg->windowTitle() == "Paste");
-            const auto rows = dlg->findChildren<QCommandLinkButton *>();
+            const auto rows = dlg->findChildren<QPushButton *>();
             CHECK(rows.size() == 3);
             if (rows.size() == 3) {
                 CHECK(rows[0]->text() == "Expand canvas");
-                CHECK(rows[0]->description() == "Automatically expands the canvas to fit the image being pasted.");
+                CHECK(rows[0]->accessibleDescription() == "Automatically expands the canvas to fit the image being pasted.");
                 CHECK(rows[1]->text() == "Keep canvas size");
-                CHECK(rows[1]->description() == "Does not expand the canvas. You will have to move the pasted image around to make sure that the part you want is within the canvas boundaries.");
+                CHECK(rows[1]->accessibleDescription() == "Does not expand the canvas. You will have to move the pasted image around to make sure that the part you want is within the canvas boundaries.");
                 CHECK(rows[2]->text() == "Cancel");
-                CHECK(rows[2]->description() == "Cancels the paste action.");
+                CHECK(rows[2]->accessibleDescription() == "Cancels the paste action.");
                 CHECK(rows[1]->height() < 100); // wrapped explanation without oversized blank rows
                 CHECK(rows[0]->hasFocus());
                 const QImage focused = rows[0]->grab().toImage().copy(0, 0, rows[0]->width(), 3);
@@ -132,7 +138,7 @@ static void choosePaste(MainWindow &w, const QImage &image, int choice, const ch
         CHECK(dlg != nullptr);
         if (!dlg) return;
         seen = true;
-        const auto rows = dlg->findChildren<QCommandLinkButton *>();
+        const auto rows = dlg->findChildren<QPushButton *>();
         CHECK(rows.size() == 3);
         if (rows.size() == 3) rows[choice]->click(); else dlg->reject();
     });
@@ -577,6 +583,100 @@ static void pendingToolPaste() {
         CHECK(doc->layerAt(0)->image().pixelColor(20,20)!=QColor(Qt::white));
     }
 }
+static void pasteDialogStyles() {
+    const QString originalStyle = QApplication::style()->objectName();
+    const QString originalSheet = qApp->styleSheet();
+    const QPalette originalPalette = qApp->palette();
+    const Theme::Scheme originalScheme = Theme::scheme();
+    for (const QString &key : QStyleFactory::keys()) {
+        std::cout << "Paste dialog style: " << key.toStdString() << '\n';
+        for (Theme::Scheme scheme : {Theme::Scheme::Light,Theme::Scheme::Dark}) {
+            qApp->setStyleSheet(QString());
+            QApplication::setStyle(QStyleFactory::create(key));
+            Theme::setScheme(scheme);
+            qApp->setStyleSheet(Theme::styleSheet());
+            for (I18n::Lang lang : {I18n::Lang::English,I18n::Lang::French}) {
+                I18n::setLanguage(lang);
+                PasteDialog dialog(fixture(840,630));
+                dialog.show();
+                dialog.activateWindow();
+                QApplication::processEvents();
+                const auto rows = dialog.findChildren<QPushButton *>();
+                CHECK(rows.size() == 3);
+                if (rows.size() != 3) continue;
+                CHECK(rows[0]->text() == (lang == I18n::Lang::English ? "Expand canvas" : "Agrandir le canevas"));
+                CHECK(rows[1]->text() == (lang == I18n::Lang::English ? "Keep canvas size" : "Conserver la taille du canevas"));
+                CHECK(rows[2]->text() == (lang == I18n::Lang::English ? "Cancel" : "Annuler"));
+                CHECK(rows[0]->isDefault() && rows[0]->hasFocus());
+                const QStringList descriptions = lang == I18n::Lang::English
+                    ? QStringList{"Automatically expands the canvas to fit the image being pasted.",
+                        "Does not expand the canvas. You will have to move the pasted image around to make sure that the part you want is within the canvas boundaries.",
+                        "Cancels the paste action."}
+                    : QStringList{"Agrandit automatiquement le canevas pour contenir l'image à coller.",
+                        "N'agrandit pas le canevas. Vous devrez déplacer l'image collée pour que la partie souhaitée se trouve dans les limites du canevas.",
+                        "Annule l'action de collage."};
+                for (int index=0;index<rows.size();++index) {
+                    CHECK(rows[index]->accessibleDescription() == descriptions[index]);
+                    bool heading = false, explanation = false;
+                    for (auto *label : rows[index]->findChildren<QLabel *>()) {
+                        heading |= label->text() == rows[index]->text();
+                        explanation |= label->text() == descriptions[index];
+                    }
+                    CHECK(heading && explanation);
+                }
+                for (auto *row : rows) {
+                    auto *accessible = QAccessible::queryAccessibleInterface(row);
+                    CHECK(accessible && accessible->text(QAccessible::Name) == row->text());
+                    CHECK(accessible && accessible->text(QAccessible::Description) == row->accessibleDescription());
+                    CHECK(row->heightForWidth(300) >= row->heightForWidth(480));
+                    row->clearFocus();
+                    QEvent leave(QEvent::Leave);
+                    QApplication::sendEvent(row,&leave);
+                    const QImage idle = row->grab().toImage().copy(0,0,row->width(),3);
+                    row->setFocus();
+                    const QImage focused = row->grab().toImage().copy(0,0,row->width(),3);
+                    CHECK(focused != idle);
+                    row->clearFocus();
+                    QEnterEvent enter(QPointF(2,2),QPointF(2,2),QPointF(row->mapToGlobal(QPoint(2,2))));
+                    QApplication::sendEvent(row,&enter);
+                    const QImage hovered = row->grab().toImage().copy(0,0,row->width(),3);
+                    CHECK(hovered != idle);
+                    QApplication::sendEvent(row,&leave);
+                }
+                rows[0]->setFocus();
+                QKeyEvent tab(QEvent::KeyPress,Qt::Key_Tab,Qt::NoModifier);
+                QApplication::sendEvent(&dialog,&tab);
+                CHECK(rows[1]->hasFocus());
+                QKeyEvent press(QEvent::KeyPress,Qt::Key_Space,Qt::NoModifier);
+                QKeyEvent release(QEvent::KeyRelease,Qt::Key_Space,Qt::NoModifier);
+                QApplication::sendEvent(rows[1],&press);
+                QApplication::sendEvent(rows[1],&release);
+                CHECK(dialog.result() == PasteDialog::Keep && !dialog.isVisible());
+                dialog.show();
+                QApplication::processEvents();
+                rows[0]->setFocus();
+                QKeyEvent enter(QEvent::KeyPress,Qt::Key_Return,Qt::NoModifier);
+                QApplication::sendEvent(&dialog,&enter);
+                CHECK(dialog.result() == PasteDialog::Expand && !dialog.isVisible());
+                dialog.show();
+                QApplication::processEvents();
+                const QPointF hit(rows[2]->width()-5,rows[2]->height()/2);
+                QMouseEvent down(QEvent::MouseButtonPress,hit,hit,Qt::LeftButton,Qt::LeftButton,Qt::NoModifier);
+                QMouseEvent up(QEvent::MouseButtonRelease,hit,hit,Qt::LeftButton,Qt::NoButton,Qt::NoModifier);
+                QApplication::sendEvent(rows[2],&down);
+                QApplication::sendEvent(rows[2],&up);
+                CHECK(dialog.result() == PasteDialog::Cancel && !dialog.isVisible());
+            }
+        }
+    }
+    qApp->setStyleSheet(QString());
+    QApplication::setStyle(QStyleFactory::create(originalStyle));
+    qApp->setPalette(originalPalette);
+    Theme::setScheme(originalScheme);
+    qApp->setStyleSheet(originalSheet);
+    I18n::setLanguage(I18n::Lang::English);
+}
+
 int main(int argc, char **argv) {
     // Real MainWindow integration must never read/write a developer's UI state
     // or autosave recovery files, including when this executable is run alone.
@@ -591,6 +691,7 @@ int main(int argc, char **argv) {
     QApplication app(argc, argv);
     QSettings("PaintDali", "PaintDali").setValue("ui/language", "en");
     I18n::setLanguage(I18n::Lang::English);
+    pasteDialogStyles();
     paths();
     cancelPrompt();
     expandPaste();

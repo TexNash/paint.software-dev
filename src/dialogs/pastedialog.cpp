@@ -1,6 +1,6 @@
 #include "pastedialog.h"
 #include "i18n.h"
-#include <QCommandLinkButton>
+#include <QPushButton>
 #include <QImage>
 #include <QLabel>
 #include <QPixmap>
@@ -11,14 +11,15 @@
 #include <QStylePainter>
 
 namespace {
-// QCommandLinkButton uses the same small font for both texts on non-Vista
-// styles, and its sizeHint does not honour our app's stylesheet metrics. Keep
-// its native interaction/accessibility, but lay out the two labels explicitly.
-class PasteChoiceButton : public QCommandLinkButton {
+// Lay out the two labels explicitly, retaining native push-button interaction.
+// Some styles (Breeze) intercept QCommandLinkButton's entire paint event, which
+// bypasses our frame and paints duplicate text underneath the child labels.
+class PasteChoiceButton : public QPushButton {
 public:
     PasteChoiceButton(const QString &title, const QString &description,
                       const QIcon &icon, QWidget *parent)
-        : QCommandLinkButton(title, description, parent) {
+        : QPushButton(title, parent) {
+        setAccessibleDescription(description);
         setIcon(icon);
         auto *layout = new QHBoxLayout(this);
         layout->setContentsMargins(8, 8, 8, 8);
@@ -53,7 +54,17 @@ protected:
         option.text.clear();
         option.icon = QIcon();
         QStylePainter painter(this);
+        // CE_PushButton is also Qt's native command-link frame primitive.
+        painter.save();
         painter.drawControl(QStyle::CE_PushButton, option);
+        painter.restore();
+        // Do not depend on a style's command-link or stylesheet focus/hover
+        // frame: keep feedback visible around the whole clickable row.
+        if (isEnabled() && (hasFocus() || underMouse())) {
+            painter.setPen(QPen(palette().color(QPalette::Highlight), 2));
+            painter.setBrush(Qt::NoBrush);
+            painter.drawRect(rect().adjusted(1, 1, -2, -2));
+        }
     }
 };
 }
@@ -79,13 +90,12 @@ PasteDialog::PasteDialog(const QImage &image, QWidget *parent) : QDialog(parent)
                          QStyle::StandardPixmap icon, Choice choice) {
         auto *button = new PasteChoiceButton(title, description, style()->standardIcon(icon), this);
         button->setAutoDefault(false);
-        // The application styles QPushButton globally, hiding Qt's native
-        // command-link focus frame. Restore a palette-derived full-row frame.
+        // Reserve stable frame metrics; paintEvent supplies palette-derived
+        // focus/hover feedback independently of the application's stylesheet.
         button->setStyleSheet(QStringLiteral(
-            "QCommandLinkButton { text-align: left; border: 1px solid transparent; padding: 4px; }"
-            "QCommandLinkButton:focus { border: 1px solid palette(highlight); }"));
+            "QPushButton { text-align: left; border: 1px solid transparent; padding: 4px; }"));
 
-        connect(button, &QCommandLinkButton::clicked, this, [this, choice] { done(choice); });
+        connect(button, &QPushButton::clicked, this, [this, choice] { done(choice); });
         layout->addWidget(button);
         return button;
     };

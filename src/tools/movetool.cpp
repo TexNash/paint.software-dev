@@ -49,7 +49,8 @@ void MoveTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, Can
                                          canvasPos.x() - m_rotCenter.x()) * 180.0 / M_PI;
         }
     } else {
-        // No selection: move the whole layer via its offset (baked in on release).
+        // Preview a whole-layer move via its offset; ordinary layers bake the
+        // delta on release, retained layers keep their full bitmap and offset.
         m_movingSelection = false;
         m_copyMode = false;
         m_originalOffset = layer->offset();
@@ -207,14 +208,14 @@ void MoveTool::mouseReleaseEvent(const QPointF &, QMouseEvent *, CanvasWidget &c
         return;
     }
 
-    // Whole-layer move: bake the offset into the pixels and reset it to zero so
-    // every other tool (which works in image space) stays aligned.
+    // Ordinary whole-layer moves bake the delta into the bitmap and restore its
+    // original origin. Explicit retained state is the only nondestructive path.
     const QPoint finalOffset = layer->offset();
     if (finalOffset == m_originalOffset) return;   // no real move
 
     // Keep the full bitmap when the layer has content outside the canvas. Baking
     // into a fixed buffer here would permanently discard it on the first drag.
-    if (layer->retainsOffCanvasPixels() || layer->image().size() != doc->size() || !m_originalOffset.isNull()) {
+    if (layer->retainsOffCanvasPixels()) {
         doc->history().push(std::make_unique<LayerOffsetCommand>(doc, doc->activeLayerIndex(),
                                                                m_originalOffset, finalOffset));
         doc->setModified(true);

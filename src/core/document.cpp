@@ -3,6 +3,7 @@
 #include <QImageReader>
 #include <QImageWriter>
 #include <cstdlib>
+#include <limits>
 #include <QFileInfo>
 #include <QFile>
 #include <QDataStream>
@@ -38,7 +39,8 @@ void Document::resize(int width, int height) {
         QImage scaled = layer->image().scaled(
             qMax(1, qRound(layer->width() * scaleX)),
             qMax(1, qRound(layer->height() * scaleY)),
-            Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+            Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+            .convertToFormat(QImage::Format_ARGB32_Premultiplied);
         if (origin.isNull() && layer->image().size() == oldSize) {
             layer->setImage(scaled); // Preserve ordinary canvas-sized resampling.
             continue;
@@ -54,7 +56,11 @@ void Document::resize(int width, int height) {
         // that finite domain exactly as an ordinary layer, while keeping the
         // rounded, document-scaled off-canvas bitmap outside it.
         const QImage visible = layer->image().copy(QRect(-origin, oldSize)).scaled(
-            size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation);
+            size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+            .convertToFormat(QImage::Format_ARGB32_Premultiplied);
+        // Source replaces only the new canvas rectangle, not the off-canvas
+        // bitmap. SourceOver would blend the same partial-alpha pixels twice.
+        painter.setClipRect(QRect(-bounds.topLeft(), size()));
         painter.setCompositionMode(QPainter::CompositionMode_Source);
         painter.drawImage(-bounds.topLeft(), visible);
         painter.end();
@@ -173,6 +179,16 @@ int Document::addLayer(const QImage &image, const QString &name) {
 
 int Document::pasteImage(const QImage &image, const QString &name, bool expandCanvas) {
     if (image.isNull()) return -1;
+    if (expandCanvas) {
+        const int width = qMax(m_width, image.width()), height = qMax(m_height, image.height());
+        // Check local extents before changing any document state. Offsets read
+        // from native files can require a bitmap too wide/tall for QImage.
+        for (const auto &layer : m_layers) {
+            if (qint64(width) - qMin(layer->offset().x(), 0) > std::numeric_limits<int>::max()
+                || qint64(height) - qMin(layer->offset().y(), 0) > std::numeric_limits<int>::max())
+                return -1;
+        }
+    }
     auto cmd = std::make_unique<DocumentSnapshotCommand>(this, "Paste");
     const QSize oldSize = size();
     if (expandCanvas) {
@@ -180,7 +196,12 @@ int Document::pasteImage(const QImage &image, const QString &name, bool expandCa
         m_height = qMax(m_height, image.height());
         for (auto &layer : m_layers) {
             // Preserve any already-retained content and its document-space offset.
-            const QSize buffer = layer->image().size().expandedTo(size());
+            // A negative origin needs extra local storage to reach the new
+            // right/bottom canvas edges. Keep the origin and all existing pixels.
+            const QPoint origin = layer->offset();
+            const QSize canvasExtent(m_width - qMin(origin.x(), 0),
+                                     m_height - qMin(origin.y(), 0));
+            const QSize buffer = layer->image().size().expandedTo(canvasExtent);
             if (buffer == layer->image().size()) continue;
             QImage padded(buffer, QImage::Format_ARGB32_Premultiplied);
             padded.fill(Qt::transparent);
@@ -432,10 +453,13 @@ bool Document::saveNative(const QString &filePath) {
     QDataStream out(&file);
     out.setVersion(QDataStream::Qt_6_0);
     out << kPswMagic;
-    // Preserve legacy output unless this document needs retained-movement state.
+    // Preserve legacy output only when it preserves the explicit movement state.
     qint32 version = 1;
     for (const auto &layer : m_layers) {
-        if (layer->retainsOffCanvasPixels()) { version = 2; break; }
+        // v1 infers retention from geometry. Positioned or differently sized
+        // ordinary layers also need v2 to keep their explicit false flag.
+        if (layer->retainsOffCanvasPixels() || layer->image().size() != size()
+            || !layer->offset().isNull()) { version = 2; break; }
     }
     out << version;
     out << qint32(m_width) << qint32(m_height);
@@ -492,7 +516,9 @@ bool Document::loadNative(const QString &filePath) {
         layer->setLocked(locked);
         layer->setBlendMode(static_cast<BlendMode>(blend));
         layer->setOffset(offset);
-        // v1 has no flag; preserve its existing oversized/positioned semantics.
+        // v2 always uses its explicit flag, even for canvas-sized zero-origin
+        // retained layers. Legacy v1 has no movement provenance: geometry is
+        // the only available inference and cannot identify that matched case.
         layer->setRetainsOffCanvasPixels(version == 2 ? retained
                                                      : img.size() != QSize(w,h) || !offset.isNull());
         layers.push_back(layer);
@@ -608,6 +634,8 @@ void Document::cropTo(const QRect &rect) {
         // The crop is in document space, not the retained bitmap's local space.
         layer->setImage(layer->image().copy(r.translated(-layer->offset())));
         layer->setOffset(QPoint());
+        // Crop deliberately discards the outside bitmap, including its retention state.
+        layer->setRetainsOffCanvasPixels(false);
     }
     m_width = r.width();
     m_height = r.height();

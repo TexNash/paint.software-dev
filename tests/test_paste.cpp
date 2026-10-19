@@ -17,7 +17,10 @@
 #include <QStyleFactory>
 #include <QStyle>
 #include <QAccessible>
+#include <QCheckBox>
+#include <QDockWidget>
 #include "dialogs/pastedialog.h"
+#include "dialogs/settingsdialog.h"
 #include "theme.h"
 #include <iostream>
 #include "mainwindow.h"
@@ -66,6 +69,84 @@ static void paths() {
     CHECK(doc->activeLayer()->image().pixelColor(39, 29) == QColor(Qt::red));
     CHECK(doc->activeLayer()->image().size() == doc->size());
 }
+
+static void utilityPanelPreferences() {
+    QSettings settings("PaintDali", "PaintDali");
+    settings.remove("ui/followUtilityPanels");
+    settings.remove("ui/hideUtilityPanelsOnDeactivate");
+
+    SettingsDialog dialog;
+    auto *follow = dialog.findChild<QCheckBox *>("followUtilityPanels");
+    auto *hide = dialog.findChild<QCheckBox *>("hideUtilityPanelsOnDeactivate");
+    CHECK(follow != nullptr);
+    CHECK(hide != nullptr);
+    if (!follow || !hide) {
+        settings.remove("ui/followUtilityPanels");
+        settings.remove("ui/hideUtilityPanelsOnDeactivate");
+        return;
+    }
+
+    CHECK(!follow->isChecked());
+    CHECK(!hide->isChecked());
+    int changes = 0;
+    QObject::connect(&dialog, &SettingsDialog::panelBehaviorChanged,
+                     [&changes]() { ++changes; });
+    follow->setChecked(true);
+    hide->setChecked(true);
+    CHECK(settings.value("ui/followUtilityPanels").toBool());
+    CHECK(settings.value("ui/hideUtilityPanelsOnDeactivate").toBool());
+    CHECK(changes == 2);
+
+    // The opt-in auto-hide must restore visible panels, but not panels the user
+    // had already hidden themselves.
+    settings.setValue("ui/hideUtilityPanelsOnDeactivate", false);
+    MainWindow window;
+    auto *tools = window.findChild<QDockWidget *>("ToolsDock");
+    auto *colors = window.findChild<QDockWidget *>("ColorsDock");
+    CHECK(tools != nullptr);
+    CHECK(colors != nullptr);
+    if (!tools || !colors) {
+        settings.remove("ui/followUtilityPanels");
+        settings.remove("ui/hideUtilityPanelsOnDeactivate");
+        return;
+    }
+    window.show();
+    tools->show();
+    colors->hide();
+    QApplication::processEvents();
+    CHECK(tools->window()->isVisible());
+    CHECK(!colors->isVisible());
+
+    const bool followInvoked = QMetaObject::invokeMethod(
+        &window, "repositionFloatingUtilityWindows", Qt::DirectConnection);
+    CHECK(followInvoked);
+    QRect mainFrame = window.frameGeometry();
+    CHECK(tools->window()->frameGeometry().topLeft() == mainFrame.topLeft() + QPoint(65, 164));
+    window.move(mainFrame.topLeft() + QPoint(40, 30));
+    QApplication::processEvents();
+    const bool followAfterMove = QMetaObject::invokeMethod(
+        &window, "repositionFloatingUtilityWindows", Qt::DirectConnection);
+    CHECK(followAfterMove);
+    mainFrame = window.frameGeometry();
+    CHECK(tools->window()->frameGeometry().topLeft() == mainFrame.topLeft() + QPoint(65, 164));
+
+    settings.setValue("ui/hideUtilityPanelsOnDeactivate", true);
+    const bool inactiveInvoked = QMetaObject::invokeMethod(
+        &window, "onApplicationStateChanged", Qt::DirectConnection,
+        Q_ARG(Qt::ApplicationState, Qt::ApplicationInactive));
+    CHECK(inactiveInvoked);
+    CHECK(!tools->window()->isVisible());
+
+    const bool activeInvoked = QMetaObject::invokeMethod(
+        &window, "onApplicationStateChanged", Qt::DirectConnection,
+        Q_ARG(Qt::ApplicationState, Qt::ApplicationActive));
+    CHECK(activeInvoked);
+    CHECK(tools->window()->isVisible());
+    CHECK(!colors->isVisible());
+    settings.remove("ui/followUtilityPanels");
+    settings.remove("ui/hideUtilityPanelsOnDeactivate");
+}
+
 static void cancelPrompt() {
     for (int choice : {2, 3, 4}) {
         MainWindow w;
@@ -692,6 +773,7 @@ int main(int argc, char **argv) {
     QSettings("PaintDali", "PaintDali").setValue("ui/language", "en");
     I18n::setLanguage(I18n::Lang::English);
     pasteDialogStyles();
+    utilityPanelPreferences();
     paths();
     cancelPrompt();
     expandPaste();

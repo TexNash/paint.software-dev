@@ -21,6 +21,7 @@ signals:
     void colorSchemeChanged();
     void languageChanged();
     void canvasSettingsChanged();
+    void panelBehaviorChanged();
 
 private:
     QWidget *buildUserInterfacePage();

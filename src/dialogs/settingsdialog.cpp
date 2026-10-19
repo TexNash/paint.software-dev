@@ -90,6 +90,29 @@ QWidget *SettingsDialog::buildUserInterfacePage() {
 
     layout->addLayout(form);
 
+    QSettings settings("PaintDali", "PaintDali");
+    auto *followPanels = new QCheckBox(TR("Panneaux flottants liés à la fenêtre principale"));
+    followPanels->setObjectName("followUtilityPanels");
+    followPanels->setToolTip(TR("Repositionne les panneaux flottants dans les coins quand la fenêtre principale est déplacée ou redimensionnée."));
+    followPanels->setChecked(settings.value("ui/followUtilityPanels", false).toBool());
+    connect(followPanels, &QCheckBox::toggled, this, [this](bool checked) {
+        QSettings settings("PaintDali", "PaintDali");
+        settings.setValue("ui/followUtilityPanels", checked);
+        emit panelBehaviorChanged();
+    });
+    layout->addWidget(followPanels);
+
+    auto *hidePanels = new QCheckBox(TR("Masquer les panneaux flottants hors focus"));
+    hidePanels->setObjectName("hideUtilityPanelsOnDeactivate");
+    hidePanels->setToolTip(TR("Les panneaux visibles réapparaissent quand paint.software reprend le focus. Les panneaux ancrés ne sont pas concernés."));
+    hidePanels->setChecked(settings.value("ui/hideUtilityPanelsOnDeactivate", false).toBool());
+    connect(hidePanels, &QCheckBox::toggled, this, [this](bool checked) {
+        QSettings settings("PaintDali", "PaintDali");
+        settings.setValue("ui/hideUtilityPanelsOnDeactivate", checked);
+        emit panelBehaviorChanged();
+    });
+    layout->addWidget(hidePanels);
+
     auto *note = new QLabel(TR("Le changement de langue est appliqué immédiatement."));
     note->setStyleSheet("color: #4a90d9;");
     note->setWordWrap(true);

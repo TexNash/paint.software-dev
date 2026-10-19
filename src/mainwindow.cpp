@@ -121,6 +121,8 @@
 #include <QPrinter>
 #include <QPrintDialog>
 #include <QWindow>
+#include <QMoveEvent>
+#include <QResizeEvent>
 #include <QFile>
 #include <QDateTime>
 #include <QDir>
@@ -174,6 +176,16 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     createStatusBar();
     createKeyboardShortcuts();
     loadUiState();
+
+    m_applicationActive = qApp->applicationState() == Qt::ApplicationActive;
+    connect(qApp, &QGuiApplication::applicationStateChanged,
+            this, &MainWindow::onApplicationStateChanged);
+
+    m_utilityWindowFollowTimer = new QTimer(this);
+    m_utilityWindowFollowTimer->setSingleShot(true);
+    m_utilityWindowFollowTimer->setInterval(50);
+    connect(m_utilityWindowFollowTimer, &QTimer::timeout,
+            this, &MainWindow::repositionFloatingUtilityWindows);
 
     // Connect signals
     connect(m_canvas, &CanvasWidget::cursorPositionChanged, this, &MainWindow::updateStatusBar);
@@ -233,10 +245,11 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 
     // Keep the floating utility windows in sync with the app's minimise state
     // (some WMs don't send a WindowStateChange event on external minimise).
-    auto *minimizeWatch = new QTimer(this);
-    minimizeWatch->setInterval(200);
-    connect(minimizeWatch, &QTimer::timeout, this, &MainWindow::syncUtilityWindowsToMainState);
-    minimizeWatch->start();
+    auto *utilityWindowStateWatch = new QTimer(this);
+    utilityWindowStateWatch->setInterval(200);
+    connect(utilityWindowStateWatch, &QTimer::timeout,
+            this, &MainWindow::syncUtilityWindowsToMainState);
+    utilityWindowStateWatch->start();
 
     // Autosave every 60s so a crash doesn't lose everything.
     auto *autosaveTimer = new QTimer(this);
@@ -795,6 +808,10 @@ void MainWindow::showSettingsDialog() {
     connect(&dlg, &SettingsDialog::canvasSettingsChanged, this, [this]() {
         if (m_canvas) m_canvas->reloadSettings();
     });
+    connect(&dlg, &SettingsDialog::panelBehaviorChanged, this, [this]() {
+        scheduleUtilityWindowFollow();
+        syncUtilityWindowsToMainState();
+    });
     dlg.exec();
 }
 
@@ -898,6 +915,11 @@ void MainWindow::resetUtilityWindow(QDockWidget *dock) {
     // calling setFloating() would tear it out — leaving the emptied group window
     // behind as a blank top-level window. Position the wrapper instead.
     if (dock->window() == this) dock->setFloating(true);
+    positionUtilityWindow(dock, true);
+}
+
+void MainWindow::positionUtilityWindow(QDockWidget *dock, bool resetSize) {
+    if (!dock || !m_canvas) return;
     QWidget *top = dock->window();
     if (!top || top == this) return;
 
@@ -910,6 +932,24 @@ void MainWindow::resetUtilityWindow(QDockWidget *dock) {
     const QRect app = frameGeometry();          // includes the WM title bar
     const int rightW = 262;
 
+    int width = top->width();
+    int height = top->height();
+    if (resetSize) {
+        if (dock == m_toolsDock) {
+            width = top->sizeHint().width();
+            height = 312;
+        } else if (dock == m_historyDock) {
+            width = rightW;
+            height = 300;
+        } else if (dock == m_layersDock) {
+            width = rightW;
+            height = 260;
+        } else if (dock == m_colorsDock) {
+            width = 230;
+            height = std::max(300, top->sizeHint().height());
+        }
+    }
+
     auto place = [&](int x, int y, int w, int h) {
         x = std::max(app.left() + 6, std::min(x, app.right() - w - 6));
         y = std::max(app.top() + 6, std::min(y, app.bottom() - h - 6));
@@ -918,17 +958,29 @@ void MainWindow::resetUtilityWindow(QDockWidget *dock) {
     };
 
     if (dock == m_toolsDock) {
-        place(app.left() + 65, app.top() + 164, top->sizeHint().width(), 312);
+        place(app.left() + 65, app.top() + 164, width, height);
     } else if (dock == m_historyDock) {
-        place(app.right() - rightW - 28, app.top() + 153, rightW, 300);
+        place(app.right() - width - 28, app.top() + 153, width, height);
     } else if (dock == m_layersDock) {
-        place(app.right() - rightW - 28, app.bottom() - 260 - 78, rightW, 260);
+        place(app.right() - width - 28, app.bottom() - height - 78, width, height);
     } else if (dock == m_colorsDock) {
-        // Opens collapsed (wheel + palette); "Plus >>" adds the sliders. Take the
-        // height from the panel: hard-coding it either crops the palette or, since
-        // Qt enforces the minimum anyway, anchors the window too low.
-        const int h = std::max(300, top->sizeHint().height());
-        place(app.left() + 28, app.bottom() - h - 76, 230, h);
+        place(app.left() + 28, app.bottom() - height - 76, width, height);
+    }
+}
+
+void MainWindow::scheduleUtilityWindowFollow() {
+    if (!m_utilityWindowFollowTimer) return;
+    QSettings settings("PaintDali", "PaintDali");
+    if (settings.value("ui/followUtilityPanels", false).toBool())
+        m_utilityWindowFollowTimer->start();
+}
+
+void MainWindow::repositionFloatingUtilityWindows() {
+    QSettings settings("PaintDali", "PaintDali");
+    if (!settings.value("ui/followUtilityPanels", false).toBool()) return;
+    for (QDockWidget *dock : {m_toolsDock, m_historyDock, m_layersDock, m_colorsDock}) {
+        if (dock && !dock->isHidden() && dock->window() != this)
+            positionUtilityWindow(dock);
     }
 }
 
@@ -3415,12 +3467,26 @@ void MainWindow::changeEvent(QEvent *event) {
     QMainWindow::changeEvent(event);
 }
 
+void MainWindow::moveEvent(QMoveEvent *event) {
+    QMainWindow::moveEvent(event);
+    scheduleUtilityWindowFollow();
+}
+
+void MainWindow::resizeEvent(QResizeEvent *event) {
+    QMainWindow::resizeEvent(event);
+    scheduleUtilityWindowFollow();
+}
+
+void MainWindow::onApplicationStateChanged(Qt::ApplicationState state) {
+    m_applicationActive = state == Qt::ApplicationActive;
+    syncUtilityWindowsToMainState();
+}
+
 // Floating utility windows are separate top-level windows, so on some window
 // managers they don't follow the main window when it is minimised. Keep them in
-// sync: hide the visible floating docks when minimised, restore them when the
-// app comes back. Called from changeEvent AND a low-frequency timer, because a
-// few WMs (e.g. Muffin/Cinnamon) don't deliver a WindowStateChange on external
-// minimise.
+// sync with minimisation and (when opted in) application activation. Called from
+// changeEvent, applicationStateChanged and a low-frequency timer because some
+// WMs don't deliver a WindowStateChange on external minimise.
 void MainWindow::syncUtilityWindowsToMainState() {
     // Only Minimized is authoritative. Minimising under Muffin/Cinnamon walks the
     // window through Hidden -> Windowed -> Minimized, so counting the transient
@@ -3429,26 +3495,29 @@ void MainWindow::syncUtilityWindowsToMainState() {
     bool minimized = isMinimized();
     if (QWindow *wh = windowHandle())
         if (wh->visibility() == QWindow::Minimized) minimized = true;
-    if (minimized == m_minimized) return;
-    m_minimized = minimized;
+    QSettings settings("PaintDali", "PaintDali");
+    const bool hideOnDeactivate = settings.value("ui/hideUtilityPanelsOnDeactivate", false).toBool();
+    const bool shouldHide = minimized || (hideOnDeactivate && !m_applicationActive);
+    if (shouldHide == m_utilityWindowsHidden) return;
+    m_utilityWindowsHidden = shouldHide;
 
-    if (minimized) {
-        m_hiddenOnMinimize.clear();
-        m_hiddenOnMinimizeGeometry.clear();
+    if (shouldHide) {
+        m_hiddenUtilityWindows.clear();
+        m_hiddenUtilityWindowGeometry.clear();
         for (QDockWidget *dock : {m_toolsDock, m_historyDock, m_layersDock, m_colorsDock}) {
             if (!dock || !dock->isVisible()) continue;
             // Hide the panel's top-level window, not the dock: isFloating() is
             // false for a panel Qt has wrapped in a QDockWidgetGroupWindow, and
             // that group window — not the dock — is what stays on screen.
             QWidget *top = dock->window();
-            if (!top || top == this || m_hiddenOnMinimize.contains(top)) continue;
-            m_hiddenOnMinimize.append(top);
-            m_hiddenOnMinimizeGeometry.append(top->geometry());
+            if (!top || top == this || m_hiddenUtilityWindows.contains(top)) continue;
+            m_hiddenUtilityWindows.append(top);
+            m_hiddenUtilityWindowGeometry.append(top->geometry());
             top->hide();
         }
     } else {
-        for (int i = 0; i < m_hiddenOnMinimize.size(); ++i) {
-            QWidget *top = m_hiddenOnMinimize.at(i);
+        for (int i = 0; i < m_hiddenUtilityWindows.size(); ++i) {
+            QWidget *top = m_hiddenUtilityWindows.at(i);
             if (!top) continue;
             top->show();
             // Showing a hidden floating dock can drop its floating state, which
@@ -3457,12 +3526,12 @@ void MainWindow::syncUtilityWindowsToMainState() {
             if (auto *dock = qobject_cast<QDockWidget *>(top)) {
                 if (!dock->isFloating()) {
                     dock->setFloating(true);
-                    dock->setGeometry(m_hiddenOnMinimizeGeometry.at(i));
+                    dock->setGeometry(m_hiddenUtilityWindowGeometry.at(i));
                 }
             }
         }
-        m_hiddenOnMinimize.clear();
-        m_hiddenOnMinimizeGeometry.clear();
+        m_hiddenUtilityWindows.clear();
+        m_hiddenUtilityWindowGeometry.clear();
     }
 }
 

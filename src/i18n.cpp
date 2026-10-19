@@ -346,6 +346,14 @@ const QHash<QString, QString> &table() {
         {"Fermer", "Close"},
         {"Le changement de langue est appliqué immédiatement.",
          "The language change is applied immediately."},
+        {"Panneaux flottants liés à la fenêtre principale",
+         "Keep floating panels attached to the main window"},
+        {"Repositionne les panneaux flottants dans les coins quand la fenêtre principale est déplacée ou redimensionnée.",
+         "Repositions floating panels in the corners when the main window is moved or resized."},
+        {"Masquer les panneaux flottants hors focus",
+         "Hide floating panels when the application loses focus"},
+        {"Les panneaux visibles réapparaissent quand paint.software reprend le focus. Les panneaux ancrés ne sont pas concernés.",
+         "Visible panels reappear when paint.software regains focus. Docked panels are not affected."},
         {"Options...", "Settings..."},
 
         // ---- Utility-icon tooltips (menu bar, right side) ----

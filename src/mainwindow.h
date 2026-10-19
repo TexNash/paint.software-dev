@@ -9,6 +9,7 @@
 #include <QAction>
 #include <QActionGroup>
 #include <QProgressBar>
+#include <QTimer>
 #include <QStringList>
 #include <QMap>
 #include <QVector>
@@ -26,6 +27,8 @@ class HistoryPanel;
 class ToolOptionsPanel;
 class PluginManager;
 class PluginEffect;
+class QMoveEvent;
+class QResizeEvent;
 
 class MainWindow : public QMainWindow {
     Q_OBJECT
@@ -39,6 +42,8 @@ public:
 protected:
     void closeEvent(QCloseEvent *event) override;
     void changeEvent(QEvent *event) override;   // follow minimize/restore
+    void moveEvent(QMoveEvent *event) override;
+    void resizeEvent(QResizeEvent *event) override;
 private:
     void syncUtilityWindowsToMainState();
 protected:
@@ -48,6 +53,8 @@ protected:
     void dropEvent(QDropEvent *event) override;
 
 private slots:
+    void onApplicationStateChanged(Qt::ApplicationState state);
+    void repositionFloatingUtilityWindows();
     // File
     void newDocument();
     void openDocument();
@@ -162,6 +169,8 @@ private:
     void updateRecentFilesMenu();
     void createMenuBarCornerIcons();
     void resetUtilityWindow(QDockWidget *dock);
+    void positionUtilityWindow(QDockWidget *dock, bool resetSize = false);
+    void scheduleUtilityWindowFollow();
     void populateFixedToolbar();
     void rebuildToolsPaletteTooltips();
     void layoutToolsPalette(bool horizontal);
@@ -243,9 +252,11 @@ private:
 
     bool m_normalizingDockLayout = false;
     bool m_restoringState = false;
-    bool m_minimized = false;
+    bool m_utilityWindowsHidden = false;
+    bool m_applicationActive = true;
+    QTimer *m_utilityWindowFollowTimer = nullptr;
     // Top-level windows hidden with the app. Not always the QDockWidget itself:
     // Qt wraps grouped panels in a QDockWidgetGroupWindow, which owns the window.
-    QVector<QPointer<QWidget>> m_hiddenOnMinimize;
-    QVector<QRect> m_hiddenOnMinimizeGeometry;  // their geometry, to restore on show
+    QVector<QPointer<QWidget>> m_hiddenUtilityWindows;
+    QVector<QRect> m_hiddenUtilityWindowGeometry;  // saved positions to restore on show
 };

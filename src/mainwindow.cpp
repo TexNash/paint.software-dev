@@ -4,6 +4,7 @@
 #include "i18n.h"
 #include "theme.h"
 #include "core/document.h"
+#include "core/adjustmentpreview.h"
 #include "canvas/canvaswidget.h"
 #include "panels/layerspanel.h"
 #include "panels/colorspanel.h"
@@ -2382,31 +2383,7 @@ void MainWindow::applySelectionFilterToTargetLayers(const std::function<QImage(c
         if (rect.isEmpty()) continue;
 
         QImage before = layer->image().copy();
-        QImage original = layer->image().copy(rect).convertToFormat(QImage::Format_ARGB32_Premultiplied);
-        QImage processed = operation(original).convertToFormat(QImage::Format_ARGB32_Premultiplied);
-        if (processed.size() != original.size()) continue;
-
-        QImage mask = m_document->selection().maskForImage(layer->image().size(), layer->offset()).copy(rect).convertToFormat(QImage::Format_Grayscale8);
-        for (int y = 0; y < rect.height(); ++y) {
-            QRgb *destLine = reinterpret_cast<QRgb*>(layer->image().scanLine(rect.y() + y)) + rect.x();
-            const QRgb *srcLine = reinterpret_cast<const QRgb*>(original.constScanLine(y));
-            const QRgb *fxLine = reinterpret_cast<const QRgb*>(processed.constScanLine(y));
-            const uchar *maskLine = mask.constScanLine(y);
-
-            for (int x = 0; x < rect.width(); ++x) {
-                const int amount = maskLine[x];
-                if (amount == 0) continue;
-
-                const QRgb src = srcLine[x];
-                const QRgb fx = fxLine[x];
-                const int inv = 255 - amount;
-                destLine[x] = qRgba(
-                    (qRed(src) * inv + qRed(fx) * amount) / 255,
-                    (qGreen(src) * inv + qGreen(fx) * amount) / 255,
-                    (qBlue(src) * inv + qBlue(fx) * amount) / 255,
-                    (qAlpha(src) * inv + qAlpha(fx) * amount) / 255);
-            }
-        }
+        layer->setImage(adjustedImage(before, layer->offset(), m_document->selection(), operation));
 
         if (layer->image() != before) {
             m_document->pushImageEdit(index, before, description);
@@ -3261,12 +3238,30 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
     }
     case 3: {
         CurvesDialog dlg(this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        Curves adj;
-        adj.setControlPoints(dlg.controlPoints());
-        applyImageOperationToTargetLayers([adj](const QImage &image) mutable {
-            return adj.apply(image);
-        }, adj.name());
+        AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
+        auto operation = [](const QVector<QPointF> &points) -> ImageOperation {
+            return [points](const QImage &image) {
+                Curves adj;
+                adj.setControlPoints(points);
+                return adj.apply(image);
+            };
+        };
+        connect(&dlg, &QDialog::rejected, &preview, &AdjustmentPreview::cancel);
+        connect(&dlg, &CurvesDialog::curveChanged, &preview, [&]() {
+            preview.request(operation(dlg.controlPoints()));
+        });
+        if (dlg.exec() != QDialog::Accepted) { preview.cancel(); return; }
+        auto finalOperation = operation(dlg.controlPoints());
+        preview.commit(finalOperation, "Curves");
+        m_lastEffect = [this, finalOperation]() {
+            AdjustmentPreview repeat(m_document, m_canvas, targetLayerIndices());
+            repeat.commit(finalOperation, "Curves");
+        };
+        m_lastEffectLabel = "Curves";
+        if (m_repeatEffectAction) {
+            m_repeatEffectAction->setEnabled(true);
+            m_repeatEffectAction->setText(TR("Répéter : ") + m_lastEffectLabel);
+        }
         break;
     }
     case 4: {

@@ -48,6 +48,7 @@ CanvasWidget::CanvasWidget(QWidget *parent)
 }
 
 void CanvasWidget::setDocument(Document *doc) {
+    m_previewImage = QImage();
     m_document = doc;
     if (doc) {
         connect(doc, &Document::documentChanged, this, [this]() {
@@ -220,17 +221,19 @@ void CanvasWidget::paintEvent(QPaintEvent *) {
     drawCheckerboard(painter, canvasRect.toRect());
 
     // Render document
-    if (!m_cacheValid) {
-        m_cachedRender = m_document->flattenVisible();
-        m_cacheValid = true;
-    } else if (!m_dirtyRender.isEmpty()) {
-        QPainter cachePainter(&m_cachedRender);
-        cachePainter.setCompositionMode(QPainter::CompositionMode_Source);
-        for (const QRect &dirty : m_dirtyRender)
-            cachePainter.drawImage(dirty.topLeft(), m_document->flattenVisible(dirty));
+    if (m_previewImage.isNull()) {
+        if (!m_cacheValid) {
+            m_cachedRender = m_document->flattenVisible();
+            m_cacheValid = true;
+        } else if (!m_dirtyRender.isEmpty()) {
+            QPainter cachePainter(&m_cachedRender);
+            cachePainter.setCompositionMode(QPainter::CompositionMode_Source);
+            for (const QRect &dirty : m_dirtyRender)
+                cachePainter.drawImage(dirty.topLeft(), m_document->flattenVisible(dirty));
+        }
+        m_dirtyRender = QRegion();
     }
-    m_dirtyRender = QRegion();
-    painter.drawImage(canvasRect, m_cachedRender);
+    painter.drawImage(canvasRect, m_previewImage.isNull() ? m_cachedRender : m_previewImage);
 
     // Grid at high zoom
     if (m_showGrid && m_zoom >= 4.0) {

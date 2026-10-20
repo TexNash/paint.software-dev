@@ -18,6 +18,20 @@ public:
     virtual QString description() const = 0;
 };
 
+struct ImageEditState { int index; QImage before, after; };
+class MultiImageEditCommand : public HistoryCommand {
+public:
+    MultiImageEditCommand(Document *doc, std::vector<ImageEditState> edits, QString description);
+    void undo() override;
+    void redo() override;
+    QString description() const override { return m_description; }
+private:
+    void apply(bool after);
+    Document *m_doc;
+    std::vector<ImageEditState> m_edits;
+    QString m_description;
+};
+
 class ImageEditCommand : public HistoryCommand {
 public:
     ImageEditCommand(Document *doc, int layerIndex, const QImage &before, const QImage &after, const QString &desc);

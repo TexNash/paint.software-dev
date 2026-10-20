@@ -39,5 +39,28 @@ The objective is not merely to reproduce Paint.NET's feature list. The applicati
 - Changes are tested where practical.
 - Visual and interactive behaviour requiring human verification is identified explicitly.
 
+## Upstream contribution requirements
+Source: [upstream CONTRIBUTING.md](https://github.com/Univers4craft/paint.software/blob/main/CONTRIBUTING.md), reviewed 20 October 2026. Recheck it when preparing an upstream contribution for any changed requirements.
+
+- Work on a topic branch in the contributor's fork. Keep each pull request limited to one topic.
+- Follow the surrounding C++17 style and Qt6 idioms.
+- For bug fixes and added behaviour, add or update coverage in `tests/test_all.cpp`. Additional focused test executables may supplement this coverage.
+- Layer storage uses `QImage::Format_ARGB32_Premultiplied`. Convert to straight alpha before raw colour-channel calculations, then restore premultiplied storage. Preserve alpha and the established premultiplied selection/compositing calculations.
+- Before committing, build the application and run the upstream-required functional tests:
+
+  ```bash
+  cmake -B build
+  cmake --build build -j
+  cmake --build build --target paintdotnet_tests
+  QT_QPA_PLATFORM=offscreen ./build/paintdotnet_tests
+  ```
+
+  Run additional tests relevant to the change as well; an equivalent separate build directory is acceptable.
+- When authorised, use a clear commit message, push to the contributor's fork, and target `Univers4craft/paint.software:main` with the pull request. Explain what changed and why.
+- Check GitHub Actions build/test results. Upstream merge requires maintainer review and approval; only the maintainer merges into `main`.
+- An Issue is optional for discussing a bug or idea before implementation. Do not create Issues or other external communications without explicit user authorisation.
+
+These requirements do not authorise commits, pushes, or pull requests; the explicit approval rule above still applies.
+
 ## Human role
 The human directs product vision, priorities, and acceptance decisions. The AI agent is responsible for proposing technical solutions and performing the approved implementation work. The human is not expected to write application code.

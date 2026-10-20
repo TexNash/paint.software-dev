@@ -6,6 +6,8 @@
 #include <QColor>
 #include <QPainter>
 #include <QMouseEvent>
+#include <QElapsedTimer>
+#include <QThread>
 #include <QDir>
 #include <QFile>
 #include <cstdio>
@@ -17,6 +19,7 @@
 #include "core/layer.h"
 #include "core/selection.h"
 #include "core/history.h"
+#include "core/adjustmentpreview.h"
 #include "canvas/canvaswidget.h"
 #include "i18n.h"
 #include "theme.h"
@@ -1233,6 +1236,72 @@ int main(int argc, char **argv) {
         { Posterize a; a.setLevels(3); testAdj("Posterize", new Posterize(a), true); }
         { Threshold a; a.setThreshold(128); testAdj("Threshold", new Threshold(a), true); }
         { ColorBalance a; a.setCyanRed(40); testAdj("ColorBalance", new ColorBalance(a), true); }
+    }
+
+    SECTION("Curves canvas preview, selection, transparency and grouped history");
+    {
+        Document doc(4, 4);
+        QImage source(4, 4, QImage::Format_ARGB32_Premultiplied);
+        source.fill(QColor(64, 96, 128, 128));
+        source.setPixel(0, 0, 0);
+        doc.layerAt(0)->setImage(source);
+        doc.addLayer(source, "Second layer");
+        doc.layerAt(1)->setOffset(QPoint(1, 0));
+        doc.history().clear();
+        doc.setModified(false);
+        QImage mask(4, 4, QImage::Format_Grayscale8);
+        mask.fill(0);
+        mask.scanLine(1)[1] = 255;
+        mask.scanLine(1)[2] = 128;
+        doc.selection().setMaskImage(mask);
+        CanvasWidget canvas;
+        canvas.setDocument(&doc);
+        auto operation = [](const QImage &image) {
+            Curves curves;
+            curves.setControlPoints({{0, 255}, {255, 255}});
+            return curves.apply(image);
+        };
+        {
+            AdjustmentPreview preview(&doc, &canvas, {0, 1});
+            QImage displayed;
+            QObject::connect(&preview, &AdjustmentPreview::previewReady, &canvas,
+                             [&](const QImage &image) { displayed = image; });
+            preview.request(operation);
+            QElapsedTimer timer;
+            timer.start();
+            while (displayed.isNull() && timer.elapsed() < 5000) {
+                QCoreApplication::processEvents();
+                QThread::msleep(1);
+            }
+            CHECK(!displayed.isNull(), "Curves delivers a canvas preview");
+            CHECK(doc.layerAt(0)->image() == source && doc.layerAt(1)->image() == source,
+                  "Preview leaves original layer images untouched");
+            preview.cancel();
+            CHECK(doc.history().currentIndex() == 0 && !doc.isModified(),
+                  "Cancel leaves history and modified state untouched");
+        }
+        AdjustmentPreview preview(&doc, &canvas, {0, 1});
+        CHECK(preview.commit(operation, "Curves"), "Curves commits adjusted layers");
+        const QImage after0 = doc.layerAt(0)->image();
+        const QImage after1 = doc.layerAt(1)->image();
+        CHECK(after0.format() == QImage::Format_ARGB32_Premultiplied &&
+              after1.format() == QImage::Format_ARGB32_Premultiplied,
+              "Curves preserves premultiplied layer storage");
+        CHECK(after0.pixel(1, 1) == qRgba(128, 128, 128, 128),
+              "Curves maps straight colour then restores premultiplication");
+        CHECK(after0.pixel(2, 1) == qRgba(80, 88, 96, 128),
+              "Feathered selection blends premultiplied colour without changing alpha");
+        CHECK(after1.pixel(0, 1) == after0.pixel(1, 1),
+              "Selection follows document coordinates on an offset layer");
+        CHECK(after0.pixel(3, 3) == source.pixel(3, 3) && after0.pixel(0, 0) == 0,
+              "Unselected and transparent pixels remain unchanged");
+        CHECK(doc.history().currentIndex() == 1, "Multiple layers create one Curves undo entry");
+        doc.history().undo();
+        CHECK(doc.layerAt(0)->image() == source && doc.layerAt(1)->image() == source,
+              "Undo restores both original layers");
+        doc.history().redo();
+        CHECK(doc.layerAt(0)->image() == after0 && doc.layerAt(1)->image() == after1,
+              "Redo restores both adjusted layers");
     }
 
     // ---------- I18N ----------

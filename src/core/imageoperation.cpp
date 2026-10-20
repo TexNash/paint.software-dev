@@ -10,6 +10,8 @@ QImage adjustedImage(const QImage &source, const QPoint &offset,
     QImage original = source.copy(rect).convertToFormat(QImage::Format_ARGB32_Premultiplied);
     QImage processed = operation(original).convertToFormat(QImage::Format_ARGB32_Premultiplied);
     if (processed.size() != original.size()) return source;
+    // Coverage blending interpolates premultiplied colour and alpha together.
+    // The adjustment itself (e.g. Curves) un-premultiplies before colour math.
     QImage result = source.convertToFormat(QImage::Format_ARGB32_Premultiplied);
     QImage mask = selection.maskForImage(source.size(), offset).copy(rect).convertToFormat(QImage::Format_Grayscale8);
     for (int y = 0; y < rect.height(); ++y) {

@@ -43,7 +43,10 @@ PreviewDialog::PreviewDialog(const QString &title, const QImage &source,
 
         connect(slider, &QSlider::valueChanged, spin, &QSpinBox::setValue);
         connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), slider, &QSlider::setValue);
-        connect(slider, &QSlider::valueChanged, this, [this]() { updatePreview(); });
+        connect(slider, &QSlider::valueChanged, this, [this]() {
+            updatePreview();
+            emit parametersChanged();
+        });
 
         grid->addWidget(lab, i, 0);
         grid->addWidget(slider, i, 1);

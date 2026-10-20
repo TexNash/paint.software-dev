@@ -50,6 +50,11 @@
 #include <QTemporaryDir>
 #include <QFileInfo>
 #include "dialogs/resizedialog.h"
+#include "dialogs/previewdialog.h"
+#include "dialogs/huesaturationdialog.h"
+#include <QSlider>
+#include <QSpinBox>
+#include <QLabel>
 #include "dialogs/saveconfigdialog.h"
 #include <QPushButton>
 #include <QComboBox>
@@ -101,6 +106,9 @@
 #include "adjustments/threshold.h"
 #include "adjustments/desaturate.h"
 #include "adjustments/colorbalance.h"
+#include "adjustments/exposure.h"
+#include "adjustments/highlightsshadows.h"
+#include "adjustments/temperaturetint.h"
 
 #include "plugins/plugin_api.h"
 #include "plugins/plugineffect.h"
@@ -1302,6 +1310,338 @@ int main(int argc, char **argv) {
         doc.history().redo();
         CHECK(doc.layerAt(0)->image() == after0 && doc.layerAt(1)->image() == after1,
               "Redo restores both adjusted layers");
+    }
+
+    SECTION("Brightness/Contrast dialog preserves thumbnail and reports parameter changes");
+    {
+        QImage source = makeImage(8, 8, QColor(64, 96, 128, 128));
+        PreviewDialog dialog("Brightness / Contrast", source,
+            {{"Brightness", -100, 100, 0, ""}, {"Contrast", -100, 100, 0, ""}},
+            [](const QImage &image, const QVector<int> &values) {
+                BrightnessContrast adjustment;
+                adjustment.setBrightness(values[0]);
+                adjustment.setContrast(values[1]);
+                return adjustment.apply(image);
+            });
+        int changes = 0;
+        QObject::connect(&dialog, &PreviewDialog::parametersChanged, &dialog, [&]() { ++changes; });
+        QLabel *thumbnail = nullptr;
+        for (auto *label : dialog.findChildren<QLabel *>())
+            if (!label->pixmap().isNull()) thumbnail = label;
+        CHECK(thumbnail != nullptr, "Existing thumbnail remains available");
+        const QImage before = thumbnail ? thumbnail->pixmap().toImage() : QImage();
+        dialog.findChildren<QSlider *>().first()->setValue(40);
+        CHECK(changes == 1 && dialog.values()[0] == 40, "Slider emits one synchronised parameter notification");
+        CHECK(thumbnail && thumbnail->pixmap().toImage() != before, "Thumbnail still updates on slider change");
+        dialog.findChildren<QSpinBox *>().last()->setValue(20);
+        CHECK(changes == 2 && dialog.values()[1] == 20, "Numeric entry emits synchronised parameter notification");
+    }
+
+    SECTION("Hue/Saturation control notifications and neutral saturation");
+    {
+        HueSaturationDialog dialog;
+        int changes = 0;
+        QObject::connect(&dialog, &HueSaturationDialog::parametersChanged, &dialog, [&]() { ++changes; });
+        CHECK(dialog.hue() == 0 && dialog.saturation() == 100 && dialog.lightness() == 0,
+              "Hue/Saturation starts with neutral controls");
+        HueSaturation adjustment;
+        adjustment.setSaturation(dialog.saturation() - 100);
+        QImage source = makeImage(8, 8, QColor(64, 96, 128, 128));
+        CHECK(adjustment.apply(source).convertToFormat(source.format()) == source,
+              "Neutral dialog saturation maps to an unchanged image");
+        dialog.findChildren<QSlider *>().first()->setValue(30);
+        CHECK(changes == 1 && dialog.hue() == 30, "Hue slider reports parameter changes");
+        dialog.findChildren<QSpinBox *>()[1]->setValue(140);
+        CHECK(changes == 2 && dialog.saturation() == 140, "Saturation numeric entry reports changes");
+        dialog.findChildren<QSpinBox *>().last()->setValue(20);
+        CHECK(changes == 3 && dialog.lightness() == 20, "Lightness numeric entry reports changes");
+        for (auto *button : dialog.findChildren<QPushButton *>())
+            if (button->text() == "↺") button->click();
+        CHECK(dialog.hue() == 0 && dialog.saturation() == 100 && dialog.lightness() == 0,
+              "Per-control Reset restores neutral Hue/Saturation values");
+    }
+
+    SECTION("Levels thumbnail, gamma controls and neutral mapping");
+    {
+        QImage source = makeImage(8, 8, QColor(64, 96, 128, 128));
+        PreviewDialog dialog("Levels", source,
+            {{"Input black", 0, 255, 0, ""}, {"Input white", 0, 255, 255, ""},
+             {"Gamma", 10, 1000, 100, "%"}},
+            [](const QImage &image, const QVector<int> &values) {
+                Levels adjustment;
+                adjustment.setInputBlack(values[0]);
+                adjustment.setInputWhite(values[1]);
+                adjustment.setGamma(values[2] / 100.0);
+                return adjustment.apply(image);
+            });
+        QLabel *thumbnail = nullptr;
+        for (auto *label : dialog.findChildren<QLabel *>())
+            if (!label->pixmap().isNull()) thumbnail = label;
+        CHECK(thumbnail != nullptr, "Levels retains its thumbnail");
+        const QImage before = thumbnail ? thumbnail->pixmap().toImage() : QImage();
+        int changes = 0;
+        QObject::connect(&dialog, &PreviewDialog::parametersChanged, &dialog, [&]() { ++changes; });
+        dialog.findChildren<QSpinBox *>().last()->setValue(180);
+        CHECK(changes == 1 && dialog.values()[2] == 180, "Gamma numeric entry notifies canvas preview");
+        CHECK(thumbnail && thumbnail->pixmap().toImage() != before, "Gamma updates existing thumbnail");
+        Levels neutral;
+        CHECK(neutral.apply(source).convertToFormat(source.format()) == source,
+              "Default Levels preserves neutral pixels and alpha");
+    }
+
+    SECTION("Sepia thumbnail, intensity and alpha preservation");
+    {
+        QImage source = makeImage(8, 8, QColor(64, 96, 128, 128));
+        source.setPixel(0, 0, 0);
+        PreviewDialog dialog("Sepia", source, {{"Intensity", 0, 100, 80, "%"}},
+            [](const QImage &image, const QVector<int> &values) {
+                Sepia adjustment;
+                adjustment.setIntensity(values[0]);
+                return adjustment.apply(image);
+            });
+        QLabel *thumbnail = nullptr;
+        for (auto *label : dialog.findChildren<QLabel *>())
+            if (!label->pixmap().isNull()) thumbnail = label;
+        CHECK(thumbnail != nullptr && dialog.values()[0] == 80, "Sepia retains thumbnail and default intensity");
+        const QImage before = thumbnail ? thumbnail->pixmap().toImage() : QImage();
+        int changes = 0;
+        QObject::connect(&dialog, &PreviewDialog::parametersChanged, &dialog, [&]() { ++changes; });
+        dialog.findChildren<QSpinBox *>().first()->setValue(0);
+        CHECK(changes == 1 && dialog.values()[0] == 0, "Sepia numeric entry notifies preview");
+        CHECK(thumbnail && thumbnail->pixmap().toImage() != before, "Sepia thumbnail updates with intensity");
+        Sepia adjustment;
+        adjustment.setIntensity(0);
+        CHECK(adjustment.apply(source).convertToFormat(source.format()) == source,
+              "Zero Sepia intensity preserves original pixels");
+        adjustment.setIntensity(100);
+        const QImage processed = adjustment.apply(source).convertToFormat(source.format());
+        CHECK(qAlpha(processed.pixel(1, 1)) == 128 && processed.pixel(0, 0) == 0,
+              "Sepia preserves partial alpha and transparent pixels");
+    }
+
+    SECTION("Posterize thumbnail, level controls and alpha preservation");
+    {
+        QImage source = makeImage(8, 8, QColor(64, 96, 192, 128));
+        source.setPixel(0, 0, 0);
+        PreviewDialog dialog("Posterize", source, {{"Levels", 2, 64, 4, ""}},
+            [](const QImage &image, const QVector<int> &values) {
+                Posterize adjustment;
+                adjustment.setLevels(values[0]);
+                return adjustment.apply(image);
+            });
+        QLabel *thumbnail = nullptr;
+        for (auto *label : dialog.findChildren<QLabel *>())
+            if (!label->pixmap().isNull()) thumbnail = label;
+        CHECK(thumbnail != nullptr && dialog.values()[0] == 4, "Posterize retains thumbnail and default four levels");
+        const QImage before = thumbnail ? thumbnail->pixmap().toImage() : QImage();
+        int changes = 0;
+        QObject::connect(&dialog, &PreviewDialog::parametersChanged, &dialog, [&]() { ++changes; });
+        dialog.findChildren<QSpinBox *>().first()->setValue(2);
+        CHECK(changes == 1 && dialog.values()[0] == 2, "Posterize numeric entry notifies preview");
+        CHECK(thumbnail && thumbnail->pixmap().toImage() != before, "Posterize thumbnail updates with levels");
+        dialog.findChildren<QSlider *>().first()->setValue(64);
+        CHECK(changes == 2 && dialog.values()[0] == 64, "Posterize maximum levels synchronise controls");
+        Posterize adjustment;
+        adjustment.setLevels(2);
+        const QImage processed = adjustment.apply(source);
+        CHECK(qRed(processed.pixel(1, 1)) == 0 && qBlue(processed.pixel(1, 1)) == 255,
+              "Posterize quantises straight colour channels at two levels");
+        const QImage stored = processed.convertToFormat(source.format());
+        CHECK(qAlpha(stored.pixel(1, 1)) == 128 && stored.pixel(0, 0) == 0,
+              "Posterize preserves partial alpha and transparent pixels");
+    }
+
+    SECTION("Threshold thumbnail, control endpoints and alpha preservation");
+    {
+        QImage source = makeImage(8, 8, QColor(64, 96, 192, 128));
+        source.setPixel(0, 0, 0);
+        PreviewDialog dialog("Threshold", source, {{"Threshold", 0, 255, 128, ""}},
+            [](const QImage &image, const QVector<int> &values) {
+                Threshold adjustment;
+                adjustment.setThreshold(values[0]);
+                return adjustment.apply(image);
+            });
+        QLabel *thumbnail = nullptr;
+        for (auto *label : dialog.findChildren<QLabel *>())
+            if (!label->pixmap().isNull()) thumbnail = label;
+        CHECK(thumbnail != nullptr && dialog.values()[0] == 128, "Threshold retains thumbnail and default 128");
+        const QImage before = thumbnail ? thumbnail->pixmap().toImage() : QImage();
+        int changes = 0;
+        QObject::connect(&dialog, &PreviewDialog::parametersChanged, &dialog, [&]() { ++changes; });
+        dialog.findChildren<QSpinBox *>().first()->setValue(0);
+        CHECK(changes == 1 && dialog.values()[0] == 0, "Threshold numeric entry notifies preview");
+        CHECK(thumbnail && thumbnail->pixmap().toImage() != before, "Threshold thumbnail updates with control changes");
+        dialog.findChildren<QSlider *>().first()->setValue(255);
+        CHECK(changes == 2 && dialog.values()[0] == 255, "Threshold upper endpoint synchronises controls");
+        Threshold adjustment;
+        adjustment.setThreshold(0);
+        const QImage white = adjustment.apply(source).convertToFormat(source.format());
+        CHECK(white.pixel(1, 1) == qRgba(128, 128, 128, 128) && white.pixel(0, 0) == 0,
+              "Threshold zero produces white while preserving partial and zero alpha");
+        adjustment.setThreshold(255);
+        const QImage black = adjustment.apply(source).convertToFormat(source.format());
+        CHECK(black.pixel(1, 1) == qRgba(0, 0, 0, 128) && black.pixel(0, 0) == 0,
+              "Threshold 255 produces black for darker pixels while preserving alpha");
+    }
+
+    SECTION("Color Balance thumbnail, channel controls and alpha preservation");
+    {
+        QImage source = makeImage(8, 8, QColor(64, 96, 192, 128));
+        source.setPixel(0, 0, 0);
+        PreviewDialog dialog("Color Balance", source,
+            {{"Cyan / Red", -100, 100, 0, ""}, {"Magenta / Green", -100, 100, 0, ""},
+             {"Yellow / Blue", -100, 100, 0, ""}},
+            [](const QImage &image, const QVector<int> &values) {
+                ColorBalance adjustment;
+                adjustment.setCyanRed(values[0]);
+                adjustment.setMagentaGreen(values[1]);
+                adjustment.setYellowBlue(values[2]);
+                return adjustment.apply(image);
+            });
+        QLabel *thumbnail = nullptr;
+        for (auto *label : dialog.findChildren<QLabel *>())
+            if (!label->pixmap().isNull()) thumbnail = label;
+        CHECK(thumbnail != nullptr && dialog.values() == QVector<int>({0,0,0}),
+              "Color Balance retains thumbnail and neutral defaults");
+        const QImage before = thumbnail ? thumbnail->pixmap().toImage() : QImage();
+        int changes = 0;
+        QObject::connect(&dialog, &PreviewDialog::parametersChanged, &dialog, [&]() { ++changes; });
+        dialog.findChildren<QSpinBox *>()[0]->setValue(30);
+        dialog.findChildren<QSlider *>()[1]->setValue(-20);
+        dialog.findChildren<QSpinBox *>()[2]->setValue(40);
+        CHECK(changes == 3 && dialog.values() == QVector<int>({30,-20,40}),
+              "All Color Balance channels notify preview with synchronised values");
+        CHECK(thumbnail && thumbnail->pixmap().toImage() != before, "Color Balance thumbnail updates");
+        ColorBalance adjustment;
+        CHECK(adjustment.apply(source).convertToFormat(source.format()) == source,
+              "Neutral Color Balance preserves original pixels");
+        adjustment.setCyanRed(30); adjustment.setMagentaGreen(-20); adjustment.setYellowBlue(40);
+        const QImage processed = adjustment.apply(source).convertToFormat(source.format());
+        CHECK(qAlpha(processed.pixel(1, 1)) == 128 && processed.pixel(0, 0) == 0,
+              "Color Balance preserves partial alpha and transparent pixels");
+    }
+
+    SECTION("Exposure thumbnail, signed controls and alpha preservation");
+    {
+        QImage source = makeImage(8, 8, QColor(64, 96, 192, 128));
+        source.setPixel(0, 0, 0);
+        PreviewDialog dialog("Exposure", source, {{"Exposure", -100, 100, 0, ""}},
+            [](const QImage &image, const QVector<int> &values) {
+                Exposure adjustment;
+                adjustment.setExposure(values[0]);
+                return adjustment.apply(image);
+            });
+        QLabel *thumbnail = nullptr;
+        for (auto *label : dialog.findChildren<QLabel *>())
+            if (!label->pixmap().isNull()) thumbnail = label;
+        CHECK(thumbnail != nullptr && dialog.values()[0] == 0, "Exposure retains thumbnail and neutral default");
+        const QImage before = thumbnail ? thumbnail->pixmap().toImage() : QImage();
+        int changes = 0;
+        QObject::connect(&dialog, &PreviewDialog::parametersChanged, &dialog, [&]() { ++changes; });
+        dialog.findChildren<QSpinBox *>().first()->setValue(-50);
+        CHECK(changes == 1 && dialog.values()[0] == -50, "Negative Exposure numeric entry notifies preview");
+        CHECK(thumbnail && thumbnail->pixmap().toImage() != before, "Exposure thumbnail updates");
+        dialog.findChildren<QSlider *>().first()->setValue(50);
+        CHECK(changes == 2 && dialog.values()[0] == 50, "Positive Exposure slider synchronises controls");
+        Exposure adjustment;
+        CHECK(adjustment.apply(source).convertToFormat(source.format()) == source,
+              "Neutral Exposure preserves original pixels");
+        adjustment.setExposure(50);
+        const QImage bright = adjustment.apply(source).convertToFormat(source.format());
+        adjustment.setExposure(-50);
+        const QImage dark = adjustment.apply(source).convertToFormat(source.format());
+        CHECK(qRed(bright.pixel(1, 1)) > qRed(source.pixel(1, 1)) &&
+              qRed(dark.pixel(1, 1)) < qRed(source.pixel(1, 1)),
+              "Exposure brightens and darkens relative to original");
+        CHECK(qAlpha(bright.pixel(1, 1)) == 128 && qAlpha(dark.pixel(1, 1)) == 128 &&
+              bright.pixel(0, 0) == 0 && dark.pixel(0, 0) == 0,
+              "Exposure preserves partial alpha and transparent pixels");
+    }
+
+    SECTION("Highlights/Shadows thumbnail, controls and alpha preservation");
+    {
+        QImage source = makeImage(8, 8, QColor(64, 96, 192, 128));
+        source.setPixel(0, 0, 0);
+        PreviewDialog dialog("Highlights / Shadows", source,
+            {{"Highlights", -100, 100, 0, ""}, {"Shadows", -100, 100, 0, ""}},
+            [](const QImage &image, const QVector<int> &values) {
+                HighlightsShadows adjustment;
+                adjustment.setHighlights(values[0]);
+                adjustment.setShadows(values[1]);
+                return adjustment.apply(image);
+            });
+        QLabel *thumbnail = nullptr;
+        for (auto *label : dialog.findChildren<QLabel *>())
+            if (!label->pixmap().isNull()) thumbnail = label;
+        CHECK(thumbnail != nullptr && dialog.values() == QVector<int>({0,0}),
+              "Highlights/Shadows retains thumbnail and neutral defaults");
+        const QImage before = thumbnail ? thumbnail->pixmap().toImage() : QImage();
+        int changes = 0;
+        QObject::connect(&dialog, &PreviewDialog::parametersChanged, &dialog, [&]() { ++changes; });
+        dialog.findChildren<QSpinBox *>().first()->setValue(-40);
+        dialog.findChildren<QSlider *>().last()->setValue(60);
+        CHECK(changes == 2 && dialog.values() == QVector<int>({-40,60}),
+              "Both Highlights/Shadows controls notify preview with synchronised values");
+        CHECK(thumbnail && thumbnail->pixmap().toImage() != before, "Highlights/Shadows thumbnail updates");
+        HighlightsShadows adjustment;
+        CHECK(adjustment.apply(source).convertToFormat(source.format()) == source,
+              "Neutral Highlights/Shadows preserves original pixels");
+        adjustment.setHighlights(-40);
+        const QImage dark = adjustment.apply(source).convertToFormat(source.format());
+        adjustment.setHighlights(0); adjustment.setShadows(60);
+        const QImage bright = adjustment.apply(source).convertToFormat(source.format());
+        CHECK(qRed(dark.pixel(1, 1)) < qRed(source.pixel(1, 1)) &&
+              qRed(bright.pixel(1, 1)) > qRed(source.pixel(1, 1)),
+              "Highlights and shadows independently affect the original image");
+        CHECK(qAlpha(bright.pixel(1, 1)) == 128 && qAlpha(dark.pixel(1, 1)) == 128 &&
+              bright.pixel(0, 0) == 0 && dark.pixel(0, 0) == 0,
+              "Highlights/Shadows preserves partial alpha and transparent pixels");
+    }
+
+    SECTION("Temperature/Tint thumbnail, controls and alpha preservation");
+    {
+        QImage source = makeImage(8, 8, QColor(64, 96, 192, 128));
+        source.setPixel(0, 0, 0);
+        PreviewDialog dialog("Temperature / Tint", source,
+            {{"Temperature", -100, 100, 0, ""}, {"Tint", -100, 100, 0, ""}},
+            [](const QImage &image, const QVector<int> &values) {
+                TemperatureTint adjustment;
+                adjustment.setTemperature(values[0]);
+                adjustment.setTint(values[1]);
+                return adjustment.apply(image);
+            });
+        QLabel *thumbnail = nullptr;
+        for (auto *label : dialog.findChildren<QLabel *>())
+            if (!label->pixmap().isNull()) thumbnail = label;
+        CHECK(thumbnail != nullptr && dialog.values() == QVector<int>({0,0}),
+              "Temperature/Tint retains thumbnail and neutral defaults");
+        const QImage before = thumbnail ? thumbnail->pixmap().toImage() : QImage();
+        int changes = 0;
+        QObject::connect(&dialog, &PreviewDialog::parametersChanged, &dialog, [&]() { ++changes; });
+        dialog.findChildren<QSpinBox *>().first()->setValue(-40);
+        dialog.findChildren<QSlider *>().last()->setValue(60);
+        CHECK(changes == 2 && dialog.values() == QVector<int>({-40,60}),
+              "Both Temperature/Tint controls notify preview with synchronised values");
+        CHECK(thumbnail && thumbnail->pixmap().toImage() != before, "Temperature/Tint thumbnail updates");
+        TemperatureTint adjustment;
+        CHECK(adjustment.apply(source).convertToFormat(source.format()) == source,
+              "Neutral Temperature/Tint preserves original pixels");
+        adjustment.setTemperature(50);
+        const QImage warm = adjustment.apply(source).convertToFormat(source.format());
+        adjustment.setTemperature(-50);
+        const QImage cool = adjustment.apply(source).convertToFormat(source.format());
+        CHECK(qRed(warm.pixel(1, 1)) > qRed(source.pixel(1, 1)) &&
+              qBlue(warm.pixel(1, 1)) < qBlue(source.pixel(1, 1)) &&
+              qRed(cool.pixel(1, 1)) < qRed(source.pixel(1, 1)) &&
+              qBlue(cool.pixel(1, 1)) > qBlue(source.pixel(1, 1)),
+              "Positive and negative temperature shift red and blue in opposite directions");
+        adjustment.setTemperature(0); adjustment.setTint(50);
+        const QImage tinted = adjustment.apply(source).convertToFormat(source.format());
+        CHECK(qGreen(tinted.pixel(1, 1)) < qGreen(source.pixel(1, 1)), "Positive tint reduces green");
+        CHECK(qAlpha(warm.pixel(1, 1)) == 128 && qAlpha(cool.pixel(1, 1)) == 128 &&
+              qAlpha(tinted.pixel(1, 1)) == 128 && warm.pixel(0, 0) == 0 &&
+              cool.pixel(0, 0) == 0 && tinted.pixel(0, 0) == 0,
+              "Temperature/Tint preserves partial alpha and transparent pixels");
     }
 
     // ---------- I18N ----------

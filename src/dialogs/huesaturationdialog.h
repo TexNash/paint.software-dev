@@ -15,6 +15,9 @@ public:
     int saturation() const { return m_satSlider->value(); }
     int lightness() const { return m_lightnessSlider->value(); }
 
+signals:
+    void parametersChanged();
+
 private:
     QSlider *m_hueSlider;
     QSpinBox *m_hueSpin;

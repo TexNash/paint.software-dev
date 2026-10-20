@@ -140,6 +140,10 @@ HueSaturationDialog::HueSaturationDialog(QWidget *parent) : QDialog(parent) {
     connect(m_lightnessSlider, &QSlider::valueChanged, m_lightnessSpin, &QSpinBox::setValue);
     connect(m_lightnessSpin, QOverload<int>::of(&QSpinBox::valueChanged), m_lightnessSlider, &QSlider::setValue);
 
+    connect(m_hueSlider, &QSlider::valueChanged, this, &HueSaturationDialog::parametersChanged);
+    connect(m_satSlider, &QSlider::valueChanged, this, &HueSaturationDialog::parametersChanged);
+    connect(m_lightnessSlider, &QSlider::valueChanged, this, &HueSaturationDialog::parametersChanged);
+
     connect(hueReset, &QPushButton::clicked, this, [this]() { m_hueSlider->setValue(0); });
     connect(satReset, &QPushButton::clicked, this, [this]() { m_satSlider->setValue(100); });
     connect(lightReset, &QPushButton::clicked, this, [this]() { m_lightnessSlider->setValue(0); });

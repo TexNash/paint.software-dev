@@ -409,6 +409,23 @@ void Document::pushImageEdit(int layerIndex, const QImage &before, const QString
     }
 }
 
+bool Document::commitImageEdits(const std::vector<ImageEditState> &edits, const QString &description) {
+    if (edits.empty()) return false;
+    for (const auto &edit : edits)
+        if (auto *layer = layerAt(edit.index)) layer->setImage(edit.after);
+    m_history.push(std::make_unique<MultiImageEditCommand>(this, edits, description));
+    m_modified = true;
+    notifyContentChanged();
+    return true;
+}
+QImage Document::compositeLayers(const std::vector<Layer> &layers, QSize size) {
+    QImage result(size, QImage::Format_ARGB32_Premultiplied);
+    result.fill(Qt::transparent);
+    for (const auto &layer : layers)
+        if (layer.isVisible()) result = layer.composited(result);
+    return result;
+}
+
 QImage Document::flatten() const {
     QImage result(m_width, m_height, QImage::Format_ARGB32_Premultiplied);
     result.fill(Qt::transparent);

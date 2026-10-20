@@ -4,6 +4,7 @@
 #include "i18n.h"
 #include "theme.h"
 #include "core/document.h"
+#include "core/adjustmentpreview.h"
 #include "canvas/canvaswidget.h"
 #include "panels/layerspanel.h"
 #include "panels/colorspanel.h"
@@ -2382,31 +2383,7 @@ void MainWindow::applySelectionFilterToTargetLayers(const std::function<QImage(c
         if (rect.isEmpty()) continue;
 
         QImage before = layer->image().copy();
-        QImage original = layer->image().copy(rect).convertToFormat(QImage::Format_ARGB32_Premultiplied);
-        QImage processed = operation(original).convertToFormat(QImage::Format_ARGB32_Premultiplied);
-        if (processed.size() != original.size()) continue;
-
-        QImage mask = m_document->selection().maskForImage(layer->image().size(), layer->offset()).copy(rect).convertToFormat(QImage::Format_Grayscale8);
-        for (int y = 0; y < rect.height(); ++y) {
-            QRgb *destLine = reinterpret_cast<QRgb*>(layer->image().scanLine(rect.y() + y)) + rect.x();
-            const QRgb *srcLine = reinterpret_cast<const QRgb*>(original.constScanLine(y));
-            const QRgb *fxLine = reinterpret_cast<const QRgb*>(processed.constScanLine(y));
-            const uchar *maskLine = mask.constScanLine(y);
-
-            for (int x = 0; x < rect.width(); ++x) {
-                const int amount = maskLine[x];
-                if (amount == 0) continue;
-
-                const QRgb src = srcLine[x];
-                const QRgb fx = fxLine[x];
-                const int inv = 255 - amount;
-                destLine[x] = qRgba(
-                    (qRed(src) * inv + qRed(fx) * amount) / 255,
-                    (qGreen(src) * inv + qGreen(fx) * amount) / 255,
-                    (qBlue(src) * inv + qBlue(fx) * amount) / 255,
-                    (qAlpha(src) * inv + qAlpha(fx) * amount) / 255);
-            }
-        }
+        layer->setImage(adjustedImage(before, layer->offset(), m_document->selection(), operation));
 
         if (layer->image() != before) {
             m_document->pushImageEdit(index, before, description);
@@ -3223,23 +3200,64 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
         PreviewDialog dlg(TR("Luminosité / Contraste"), layer->image(),
             {{TR("Luminosité"), -100, 100, 0, ""}, {TR("Contraste"), -100, 100, 0, ""}},
             [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        BrightnessContrast adj = build(dlg.values());
-        applyImageOperationToTargetLayers([adj](const QImage &image) mutable {
-            return adj.apply(image);
-        }, adj.name());
+        AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
+        auto operation = [build](const QVector<int> &values) -> ImageOperation {
+            return [build, values](const QImage &image) { return build(values).apply(image); };
+        };
+        connect(&dlg, &QDialog::rejected, &preview, &AdjustmentPreview::cancel);
+        connect(&dlg, &PreviewDialog::parametersChanged, &preview, [&]() {
+            preview.request(operation(dlg.values()));
+        });
+        preview.request(operation(dlg.values()));
+        if (dlg.exec() != QDialog::Accepted) { preview.cancel(); return; }
+        auto finalOperation = operation(dlg.values());
+        const QString name = BrightnessContrast().name();
+        preview.commit(finalOperation, name);
+        m_lastEffect = [this, finalOperation, name]() {
+            AdjustmentPreview repeat(m_document, m_canvas, targetLayerIndices());
+            repeat.commit(finalOperation, name);
+        };
+        m_lastEffectLabel = name;
+        if (m_repeatEffectAction) {
+            m_repeatEffectAction->setEnabled(true);
+            m_repeatEffectAction->setText(TR("Répéter : ") + name);
+        }
         break;
     }
     case 1: {
         HueSaturationDialog dlg(this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        HueSaturation adj;
-        adj.setHue(dlg.hue());
-        adj.setSaturation(dlg.saturation());
-        adj.setLightness(dlg.lightness());
-        applyImageOperationToTargetLayers([adj](const QImage &image) mutable {
-            return adj.apply(image);
-        }, adj.name());
+        AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
+        auto operation = [&dlg]() -> ImageOperation {
+            const int hue = dlg.hue();
+            // The dialog uses 0..200 with 100 neutral; the adjustment uses -100..100.
+            const int saturation = dlg.saturation() - 100;
+            const int lightness = dlg.lightness();
+            return [hue, saturation, lightness](const QImage &image) {
+                HueSaturation adj;
+                adj.setHue(hue);
+                adj.setSaturation(saturation);
+                adj.setLightness(lightness);
+                return adj.apply(image);
+            };
+        };
+        connect(&dlg, &QDialog::rejected, &preview, &AdjustmentPreview::cancel);
+        connect(&dlg, &HueSaturationDialog::parametersChanged, &preview, [&]() {
+            preview.request(operation());
+        });
+        preview.request(operation());
+        if (dlg.exec() != QDialog::Accepted) { preview.cancel(); return; }
+        auto finalOperation = operation();
+        const QString name = HueSaturation().name();
+        preview.commit(finalOperation, name);
+        m_lastEffect = [this, finalOperation, name]() {
+            AdjustmentPreview repeat(m_document, m_canvas, targetLayerIndices());
+            repeat.commit(finalOperation, name);
+        };
+        m_lastEffectLabel = name;
+        if (m_repeatEffectAction) {
+            m_repeatEffectAction->setEnabled(true);
+            m_repeatEffectAction->setText(TR("Répéter : ") + name);
+        }
         break;
     }
     case 2: {
@@ -3252,21 +3270,56 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
              {TR("Blanc d'entrée"), 0, 255, 255, ""},
              {TR("Gamma"), 10, 1000, 100, "%"}},
             [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        Levels adj = build(dlg.values());
-        applyImageOperationToTargetLayers([adj](const QImage &image) mutable {
-            return adj.apply(image);
-        }, adj.name());
+        AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
+        auto operation = [build](const QVector<int> &values) -> ImageOperation {
+            return [build, values](const QImage &image) { return build(values).apply(image); };
+        };
+        connect(&dlg, &QDialog::rejected, &preview, &AdjustmentPreview::cancel);
+        connect(&dlg, &PreviewDialog::parametersChanged, &preview, [&]() {
+            preview.request(operation(dlg.values()));
+        });
+        preview.request(operation(dlg.values()));
+        if (dlg.exec() != QDialog::Accepted) { preview.cancel(); return; }
+        auto finalOperation = operation(dlg.values());
+        const QString name = Levels().name();
+        preview.commit(finalOperation, name);
+        m_lastEffect = [this, finalOperation, name]() {
+            AdjustmentPreview repeat(m_document, m_canvas, targetLayerIndices());
+            repeat.commit(finalOperation, name);
+        };
+        m_lastEffectLabel = name;
+        if (m_repeatEffectAction) {
+            m_repeatEffectAction->setEnabled(true);
+            m_repeatEffectAction->setText(TR("Répéter : ") + name);
+        }
         break;
     }
     case 3: {
         CurvesDialog dlg(this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        Curves adj;
-        adj.setControlPoints(dlg.controlPoints());
-        applyImageOperationToTargetLayers([adj](const QImage &image) mutable {
-            return adj.apply(image);
-        }, adj.name());
+        AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
+        auto operation = [](const QVector<QPointF> &points) -> ImageOperation {
+            return [points](const QImage &image) {
+                Curves adj;
+                adj.setControlPoints(points);
+                return adj.apply(image);
+            };
+        };
+        connect(&dlg, &QDialog::rejected, &preview, &AdjustmentPreview::cancel);
+        connect(&dlg, &CurvesDialog::curveChanged, &preview, [&]() {
+            preview.request(operation(dlg.controlPoints()));
+        });
+        if (dlg.exec() != QDialog::Accepted) { preview.cancel(); return; }
+        auto finalOperation = operation(dlg.controlPoints());
+        preview.commit(finalOperation, "Curves");
+        m_lastEffect = [this, finalOperation]() {
+            AdjustmentPreview repeat(m_document, m_canvas, targetLayerIndices());
+            repeat.commit(finalOperation, "Curves");
+        };
+        m_lastEffectLabel = "Curves";
+        if (m_repeatEffectAction) {
+            m_repeatEffectAction->setEnabled(true);
+            m_repeatEffectAction->setText(TR("Répéter : ") + m_lastEffectLabel);
+        }
         break;
     }
     case 4: {
@@ -3281,11 +3334,28 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
         PreviewDialog dlg(TR("Sépia"), layer->image(),
             {{TR("Intensité"), 0, 100, 80, "%"}},
             [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        Sepia adj = build(dlg.values());
-        applyImageOperationToTargetLayers([adj](const QImage &image) mutable {
-            return adj.apply(image);
-        }, adj.name());
+        AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
+        auto operation = [build](const QVector<int> &values) -> ImageOperation {
+            return [build, values](const QImage &image) { return build(values).apply(image); };
+        };
+        connect(&dlg, &QDialog::rejected, &preview, &AdjustmentPreview::cancel);
+        connect(&dlg, &PreviewDialog::parametersChanged, &preview, [&]() {
+            preview.request(operation(dlg.values()));
+        });
+        preview.request(operation(dlg.values()));
+        if (dlg.exec() != QDialog::Accepted) { preview.cancel(); return; }
+        auto finalOperation = operation(dlg.values());
+        const QString name = Sepia().name();
+        preview.commit(finalOperation, name);
+        m_lastEffect = [this, finalOperation, name]() {
+            AdjustmentPreview repeat(m_document, m_canvas, targetLayerIndices());
+            repeat.commit(finalOperation, name);
+        };
+        m_lastEffectLabel = name;
+        if (m_repeatEffectAction) {
+            m_repeatEffectAction->setEnabled(true);
+            m_repeatEffectAction->setText(TR("Répéter : ") + name);
+        }
         break;
     }
     case 6: {
@@ -3293,11 +3363,28 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
         PreviewDialog dlg(TR("Postériser"), layer->image(),
             {{TR("Niveaux"), 2, 64, 4, ""}},
             [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        Posterize adj = build(dlg.values());
-        applyImageOperationToTargetLayers([adj](const QImage &image) mutable {
-            return adj.apply(image);
-        }, adj.name());
+        AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
+        auto operation = [build](const QVector<int> &values) -> ImageOperation {
+            return [build, values](const QImage &image) { return build(values).apply(image); };
+        };
+        connect(&dlg, &QDialog::rejected, &preview, &AdjustmentPreview::cancel);
+        connect(&dlg, &PreviewDialog::parametersChanged, &preview, [&]() {
+            preview.request(operation(dlg.values()));
+        });
+        preview.request(operation(dlg.values()));
+        if (dlg.exec() != QDialog::Accepted) { preview.cancel(); return; }
+        auto finalOperation = operation(dlg.values());
+        const QString name = Posterize().name();
+        preview.commit(finalOperation, name);
+        m_lastEffect = [this, finalOperation, name]() {
+            AdjustmentPreview repeat(m_document, m_canvas, targetLayerIndices());
+            repeat.commit(finalOperation, name);
+        };
+        m_lastEffectLabel = name;
+        if (m_repeatEffectAction) {
+            m_repeatEffectAction->setEnabled(true);
+            m_repeatEffectAction->setText(TR("Répéter : ") + name);
+        }
         break;
     }
     case 7: {
@@ -3317,11 +3404,28 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
              {TR("Magenta / Vert"), -100, 100, 0, ""},
              {TR("Jaune / Bleu"), -100, 100, 0, ""}},
             [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        ColorBalance adj = build(dlg.values());
-        applyImageOperationToTargetLayers([adj](const QImage &image) mutable {
-            return adj.apply(image);
-        }, adj.name());
+        AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
+        auto operation = [build](const QVector<int> &values) -> ImageOperation {
+            return [build, values](const QImage &image) { return build(values).apply(image); };
+        };
+        connect(&dlg, &QDialog::rejected, &preview, &AdjustmentPreview::cancel);
+        connect(&dlg, &PreviewDialog::parametersChanged, &preview, [&]() {
+            preview.request(operation(dlg.values()));
+        });
+        preview.request(operation(dlg.values()));
+        if (dlg.exec() != QDialog::Accepted) { preview.cancel(); return; }
+        auto finalOperation = operation(dlg.values());
+        const QString name = ColorBalance().name();
+        preview.commit(finalOperation, name);
+        m_lastEffect = [this, finalOperation, name]() {
+            AdjustmentPreview repeat(m_document, m_canvas, targetLayerIndices());
+            repeat.commit(finalOperation, name);
+        };
+        m_lastEffectLabel = name;
+        if (m_repeatEffectAction) {
+            m_repeatEffectAction->setEnabled(true);
+            m_repeatEffectAction->setText(TR("Répéter : ") + name);
+        }
         break;
     }
     case 9: {
@@ -3362,9 +3466,28 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
         PreviewDialog dlg(TR("Exposition"), layer->image(),
             {{TR("Exposition"), -100, 100, 0, ""}},
             [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        Exposure adj = build(dlg.values());
-        applyImageOperationToTargetLayers([adj](const QImage &image) mutable { return adj.apply(image); }, adj.name());
+        AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
+        auto operation = [build](const QVector<int> &values) -> ImageOperation {
+            return [build, values](const QImage &image) { return build(values).apply(image); };
+        };
+        connect(&dlg, &QDialog::rejected, &preview, &AdjustmentPreview::cancel);
+        connect(&dlg, &PreviewDialog::parametersChanged, &preview, [&]() {
+            preview.request(operation(dlg.values()));
+        });
+        preview.request(operation(dlg.values()));
+        if (dlg.exec() != QDialog::Accepted) { preview.cancel(); return; }
+        auto finalOperation = operation(dlg.values());
+        const QString name = Exposure().name();
+        preview.commit(finalOperation, name);
+        m_lastEffect = [this, finalOperation, name]() {
+            AdjustmentPreview repeat(m_document, m_canvas, targetLayerIndices());
+            repeat.commit(finalOperation, name);
+        };
+        m_lastEffectLabel = name;
+        if (m_repeatEffectAction) {
+            m_repeatEffectAction->setEnabled(true);
+            m_repeatEffectAction->setText(TR("Répéter : ") + name);
+        }
         break;
     }
     case 11: {   // Highlights / Shadows
@@ -3374,9 +3497,28 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
         PreviewDialog dlg(TR("Hautes / Basses lumières"), layer->image(),
             {{TR("Hautes lumières"), -100, 100, 0, ""}, {TR("Basses lumières"), -100, 100, 0, ""}},
             [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        HighlightsShadows adj = build(dlg.values());
-        applyImageOperationToTargetLayers([adj](const QImage &image) mutable { return adj.apply(image); }, adj.name());
+        AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
+        auto operation = [build](const QVector<int> &values) -> ImageOperation {
+            return [build, values](const QImage &image) { return build(values).apply(image); };
+        };
+        connect(&dlg, &QDialog::rejected, &preview, &AdjustmentPreview::cancel);
+        connect(&dlg, &PreviewDialog::parametersChanged, &preview, [&]() {
+            preview.request(operation(dlg.values()));
+        });
+        preview.request(operation(dlg.values()));
+        if (dlg.exec() != QDialog::Accepted) { preview.cancel(); return; }
+        auto finalOperation = operation(dlg.values());
+        const QString name = HighlightsShadows().name();
+        preview.commit(finalOperation, name);
+        m_lastEffect = [this, finalOperation, name]() {
+            AdjustmentPreview repeat(m_document, m_canvas, targetLayerIndices());
+            repeat.commit(finalOperation, name);
+        };
+        m_lastEffectLabel = name;
+        if (m_repeatEffectAction) {
+            m_repeatEffectAction->setEnabled(true);
+            m_repeatEffectAction->setText(TR("Répéter : ") + name);
+        }
         break;
     }
     case 12: {   // Temperature / Tint
@@ -3387,9 +3529,28 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
             {{TR("Température (froid → chaud)"), -100, 100, 0, ""},
              {TR("Teinte (vert → magenta)"), -100, 100, 0, ""}},
             [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        TemperatureTint adj = build(dlg.values());
-        applyImageOperationToTargetLayers([adj](const QImage &image) mutable { return adj.apply(image); }, adj.name());
+        AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
+        auto operation = [build](const QVector<int> &values) -> ImageOperation {
+            return [build, values](const QImage &image) { return build(values).apply(image); };
+        };
+        connect(&dlg, &QDialog::rejected, &preview, &AdjustmentPreview::cancel);
+        connect(&dlg, &PreviewDialog::parametersChanged, &preview, [&]() {
+            preview.request(operation(dlg.values()));
+        });
+        preview.request(operation(dlg.values()));
+        if (dlg.exec() != QDialog::Accepted) { preview.cancel(); return; }
+        auto finalOperation = operation(dlg.values());
+        const QString name = TemperatureTint().name();
+        preview.commit(finalOperation, name);
+        m_lastEffect = [this, finalOperation, name]() {
+            AdjustmentPreview repeat(m_document, m_canvas, targetLayerIndices());
+            repeat.commit(finalOperation, name);
+        };
+        m_lastEffectLabel = name;
+        if (m_repeatEffectAction) {
+            m_repeatEffectAction->setEnabled(true);
+            m_repeatEffectAction->setText(TR("Répéter : ") + name);
+        }
         break;
     }
     case 13: {   // Invert Alpha
@@ -3402,11 +3563,28 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
         PreviewDialog dlg(TR("Seuil"), layer->image(),
             {{TR("Seuil :"), 0, 255, 128, ""}},
             [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        Threshold adj = build(dlg.values());
-        applyImageOperationToTargetLayers([adj](const QImage &image) mutable {
-            return adj.apply(image);
-        }, adj.name());
+        AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
+        auto operation = [build](const QVector<int> &values) -> ImageOperation {
+            return [build, values](const QImage &image) { return build(values).apply(image); };
+        };
+        connect(&dlg, &QDialog::rejected, &preview, &AdjustmentPreview::cancel);
+        connect(&dlg, &PreviewDialog::parametersChanged, &preview, [&]() {
+            preview.request(operation(dlg.values()));
+        });
+        preview.request(operation(dlg.values()));
+        if (dlg.exec() != QDialog::Accepted) { preview.cancel(); return; }
+        auto finalOperation = operation(dlg.values());
+        const QString name = Threshold().name();
+        preview.commit(finalOperation, name);
+        m_lastEffect = [this, finalOperation, name]() {
+            AdjustmentPreview repeat(m_document, m_canvas, targetLayerIndices());
+            repeat.commit(finalOperation, name);
+        };
+        m_lastEffectLabel = name;
+        if (m_repeatEffectAction) {
+            m_repeatEffectAction->setEnabled(true);
+            m_repeatEffectAction->setText(TR("Répéter : ") + name);
+        }
         break;
     }
     }

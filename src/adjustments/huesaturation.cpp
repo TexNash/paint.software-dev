@@ -2,6 +2,8 @@
 #include <QColor>
 
 QImage HueSaturation::apply(const QImage &input) {
+    // Avoid HSV round-trip rounding and redundant history for neutral controls.
+    if (m_hue == 0 && m_saturation == 0 && m_lightness == 0) return input;
     QImage result = input.convertToFormat(QImage::Format_ARGB32);
     int w = result.width(), h = result.height();
 

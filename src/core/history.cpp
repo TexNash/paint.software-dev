@@ -3,6 +3,16 @@
 #include "layer.h"
 #include <algorithm>
 
+MultiImageEditCommand::MultiImageEditCommand(Document *doc, std::vector<ImageEditState> edits, QString description)
+    : m_doc(doc), m_edits(std::move(edits)), m_description(std::move(description)) {}
+void MultiImageEditCommand::apply(bool after) {
+    for (const auto &edit : m_edits)
+        if (auto *layer = m_doc->layerAt(edit.index)) layer->setImage(after ? edit.after : edit.before);
+    m_doc->notifyContentChanged();
+}
+void MultiImageEditCommand::undo() { apply(false); }
+void MultiImageEditCommand::redo() { apply(true); }
+
 // ImageEditCommand
 ImageEditCommand::ImageEditCommand(Document *doc, int layerIndex, const QImage &before, const QImage &after, const QString &desc)
     : m_doc(doc), m_layerIndex(layerIndex), m_before(before), m_after(after), m_description(desc) {}

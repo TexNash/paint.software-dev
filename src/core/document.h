@@ -80,6 +80,8 @@ public:
     void notifyContentChanged() { emit documentChanged(); emit layersChanged(); }
 
     // Rendering
+    static QImage compositeLayers(const std::vector<Layer> &layers, QSize size);
+    bool commitImageEdits(const std::vector<ImageEditState> &edits, const QString &description);
     QImage flatten() const;
     QImage flattenVisible() const;
     // Same composition as flattenVisible(), restricted to a document-space tile.

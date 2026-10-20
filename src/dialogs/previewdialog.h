@@ -31,6 +31,9 @@ public:
 
     QVector<int> values() const;
 
+signals:
+    void parametersChanged();
+
 private:
     void updatePreview();
 

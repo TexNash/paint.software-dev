@@ -41,6 +41,8 @@ public:
     QPointF canvasToWidget(const QPointF &canvasPos) const;
 
     // Rendering
+    void setPreviewImage(const QImage &image) { m_previewImage = image; update(); }
+    void clearPreviewImage() { m_previewImage = QImage(); updateCanvas(); }
     void updateCanvas();
     void updateCanvasRegion(const QRect &documentRect);
     void setShowGrid(bool show) { m_showGrid = show; update(); }
@@ -115,6 +117,7 @@ private:
     QPainterPath m_selectionOutline;
 
     // Cached render
+    QImage m_previewImage;
     QImage m_cachedRender;
     bool m_cacheValid = false;
     QRegion m_dirtyRender;

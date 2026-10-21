@@ -3197,9 +3197,8 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
         auto build = [](const QVector<int> &v) {
             BrightnessContrast a; a.setBrightness(v[0]); a.setContrast(v[1]); return a;
         };
-        PreviewDialog dlg(TR("Luminosité / Contraste"), layer->image(),
-            {{TR("Luminosité"), -100, 100, 0, ""}, {TR("Contraste"), -100, 100, 0, ""}},
-            [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
+        PreviewDialog dlg(TR("Luminosité / Contraste"),
+            {{TR("Luminosité"), -100, 100, 0, ""}, {TR("Contraste"), -100, 100, 0, ""}}, this);
         AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
         auto operation = [build](const QVector<int> &values) -> ImageOperation {
             return [build, values](const QImage &image) { return build(values).apply(image); };
@@ -3265,11 +3264,10 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
         auto build = [](const QVector<int> &v) {
             Levels a; a.setInputBlack(v[0]); a.setInputWhite(v[1]); a.setGamma(v[2] / 100.0); return a;
         };
-        PreviewDialog dlg(TR("Niveaux"), layer->image(),
+        PreviewDialog dlg(TR("Niveaux"),
             {{TR("Noir d'entrée"), 0, 255, 0, ""},
              {TR("Blanc d'entrée"), 0, 255, 255, ""},
-             {TR("Gamma"), 10, 1000, 100, "%"}},
-            [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
+             {TR("Gamma"), 10, 1000, 100, "%"}}, this);
         AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
         auto operation = [build](const QVector<int> &values) -> ImageOperation {
             return [build, values](const QImage &image) { return build(values).apply(image); };
@@ -3331,9 +3329,8 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
     }
     case 5: {
         auto build = [](const QVector<int> &v) { Sepia a; a.setIntensity(v[0]); return a; };
-        PreviewDialog dlg(TR("Sépia"), layer->image(),
-            {{TR("Intensité"), 0, 100, 80, "%"}},
-            [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
+        PreviewDialog dlg(TR("Sépia"),
+            {{TR("Intensité"), 0, 100, 80, "%"}}, this);
         AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
         auto operation = [build](const QVector<int> &values) -> ImageOperation {
             return [build, values](const QImage &image) { return build(values).apply(image); };
@@ -3360,9 +3357,8 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
     }
     case 6: {
         auto build = [](const QVector<int> &v) { Posterize a; a.setLevels(v[0]); return a; };
-        PreviewDialog dlg(TR("Postériser"), layer->image(),
-            {{TR("Niveaux"), 2, 64, 4, ""}},
-            [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
+        PreviewDialog dlg(TR("Postériser"),
+            {{TR("Niveaux"), 2, 64, 4, ""}}, this);
         AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
         auto operation = [build](const QVector<int> &values) -> ImageOperation {
             return [build, values](const QImage &image) { return build(values).apply(image); };
@@ -3399,11 +3395,10 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
         auto build = [](const QVector<int> &v) {
             ColorBalance a; a.setCyanRed(v[0]); a.setMagentaGreen(v[1]); a.setYellowBlue(v[2]); return a;
         };
-        PreviewDialog dlg(TR("Balance des couleurs"), layer->image(),
+        PreviewDialog dlg(TR("Balance des couleurs"),
             {{TR("Cyan / Rouge"), -100, 100, 0, ""},
              {TR("Magenta / Vert"), -100, 100, 0, ""},
-             {TR("Jaune / Bleu"), -100, 100, 0, ""}},
-            [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
+             {TR("Jaune / Bleu"), -100, 100, 0, ""}}, this);
         AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
         auto operation = [build](const QVector<int> &values) -> ImageOperation {
             return [build, values](const QImage &image) { return build(values).apply(image); };
@@ -3463,9 +3458,8 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
     }
     case 10: {   // Exposure
         auto build = [](const QVector<int> &v) { Exposure a; a.setExposure(v[0]); return a; };
-        PreviewDialog dlg(TR("Exposition"), layer->image(),
-            {{TR("Exposition"), -100, 100, 0, ""}},
-            [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
+        PreviewDialog dlg(TR("Exposition"),
+            {{TR("Exposition"), -100, 100, 0, ""}}, this);
         AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
         auto operation = [build](const QVector<int> &values) -> ImageOperation {
             return [build, values](const QImage &image) { return build(values).apply(image); };
@@ -3494,9 +3488,8 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
         auto build = [](const QVector<int> &v) {
             HighlightsShadows a; a.setHighlights(v[0]); a.setShadows(v[1]); return a;
         };
-        PreviewDialog dlg(TR("Hautes / Basses lumières"), layer->image(),
-            {{TR("Hautes lumières"), -100, 100, 0, ""}, {TR("Basses lumières"), -100, 100, 0, ""}},
-            [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
+        PreviewDialog dlg(TR("Hautes / Basses lumières"),
+            {{TR("Hautes lumières"), -100, 100, 0, ""}, {TR("Basses lumières"), -100, 100, 0, ""}}, this);
         AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
         auto operation = [build](const QVector<int> &values) -> ImageOperation {
             return [build, values](const QImage &image) { return build(values).apply(image); };
@@ -3525,10 +3518,9 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
         auto build = [](const QVector<int> &v) {
             TemperatureTint a; a.setTemperature(v[0]); a.setTint(v[1]); return a;
         };
-        PreviewDialog dlg(TR("Température / Teinte"), layer->image(),
+        PreviewDialog dlg(TR("Température / Teinte"),
             {{TR("Température (froid → chaud)"), -100, 100, 0, ""},
-             {TR("Teinte (vert → magenta)"), -100, 100, 0, ""}},
-            [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
+             {TR("Teinte (vert → magenta)"), -100, 100, 0, ""}}, this);
         AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
         auto operation = [build](const QVector<int> &values) -> ImageOperation {
             return [build, values](const QImage &image) { return build(values).apply(image); };
@@ -3560,9 +3552,8 @@ void MainWindow::applyAdjustment(int adjustmentIndex) {
     }
     case 14: {   // Threshold
         auto build = [](const QVector<int> &v) { Threshold a; a.setThreshold(v[0]); return a; };
-        PreviewDialog dlg(TR("Seuil"), layer->image(),
-            {{TR("Seuil :"), 0, 255, 128, ""}},
-            [build](const QImage &src, const QVector<int> &v) mutable { return build(v).apply(src); }, this);
+        PreviewDialog dlg(TR("Seuil"),
+            {{TR("Seuil :"), 0, 255, 128, ""}}, this);
         AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
         auto operation = [build](const QVector<int> &values) -> ImageOperation {
             return [build, values](const QImage &image) { return build(values).apply(image); };

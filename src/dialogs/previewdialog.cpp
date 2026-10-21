@@ -9,26 +9,35 @@
 #include <QPushButton>
 #include <QPainter>
 
+PreviewDialog::PreviewDialog(const QString &title, QVector<Param> params, QWidget *parent)
+    : QDialog(parent), m_params(std::move(params)) {
+    setupUi(title);
+}
+
 PreviewDialog::PreviewDialog(const QString &title, const QImage &source,
                              QVector<Param> params, Renderer renderer, QWidget *parent)
     : QDialog(parent), m_renderer(std::move(renderer)), m_params(std::move(params)) {
-    setWindowTitle(title);
-
     // Downscale the source so the renderer runs on a small image on every drag.
     const int maxDim = 340;
     m_previewSource = (source.width() > maxDim || source.height() > maxDim)
         ? source.scaled(maxDim, maxDim, Qt::KeepAspectRatio, Qt::SmoothTransformation)
         : source;
 
-    auto *root = new QVBoxLayout(this);
-
     m_preview = new QLabel;
     m_preview->setAlignment(Qt::AlignCenter);
     m_preview->setMinimumSize(maxDim, 220);
     m_preview->setStyleSheet("border: 1px solid palette(mid);");
-    root->addWidget(m_preview);
+    setupUi(title);
+    updatePreview();
+}
+
+void PreviewDialog::setupUi(const QString &title) {
+    setWindowTitle(title);
+    auto *root = new QVBoxLayout(this);
+    if (m_preview) root->addWidget(m_preview);
 
     auto *grid = new QGridLayout;
+    if (!m_preview) grid->setColumnStretch(1, 1);
     for (int i = 0; i < m_params.size(); ++i) {
         const Param &p = m_params[i];
         auto *lab = new QLabel(p.label);
@@ -44,7 +53,7 @@ PreviewDialog::PreviewDialog(const QString &title, const QImage &source,
         connect(slider, &QSlider::valueChanged, spin, &QSpinBox::setValue);
         connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), slider, &QSlider::setValue);
         connect(slider, &QSlider::valueChanged, this, [this]() {
-            updatePreview();
+            if (m_preview) updatePreview();
             emit parametersChanged();
         });
 
@@ -65,8 +74,6 @@ PreviewDialog::PreviewDialog(const QString &title, const QImage &source,
         for (int i = 0; i < m_params.size(); ++i)
             m_sliders[i]->setValue(m_params[i].value);
     });
-
-    updatePreview();
 }
 
 QVector<int> PreviewDialog::values() const {

@@ -2,6 +2,8 @@
 // Exercises the real code paths: tools, effects, adjustments, layers,
 // selection, undo/redo, save/load, i18n and theming.
 #include <QApplication>
+#include "dialogs/previewdialog.h"
+#include <QDialogButtonBox>
 #include <QImage>
 #include <QColor>
 #include <QPainter>
@@ -675,6 +677,36 @@ static void retainedMergeRegression() {
 // =====================================================================
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
+    {
+        const QVector<PreviewDialog::Param> params = {{"Amount", -100, 100, 0, "%"}};
+        PreviewDialog controls("Parameters", params);
+        int changes = 0;
+        QObject::connect(&controls, &PreviewDialog::parametersChanged, [&]() { ++changes; });
+        auto *slider = controls.findChild<QSlider *>();
+        auto *spin = controls.findChild<QSpinBox *>();
+        slider->setValue(25);
+        CHECK(spin->value() == 25 && controls.values() == QVector<int>({25}), "Parameter slider synchronises values");
+        spin->setValue(-40);
+        CHECK(slider->value() == -40 && changes == 2, "Parameter spin emits one change");
+        auto *buttons = controls.findChild<QDialogButtonBox *>();
+        buttons->button(QDialogButtonBox::Reset)->click();
+        CHECK(controls.values() == QVector<int>({0}) && changes == 3, "Parameter Reset restores defaults and emits change");
+        CHECK(controls.findChildren<QLabel *>().size() == 1, "Parameters-only dialog has only its parameter label");
+        buttons->button(QDialogButtonBox::Ok)->click();
+        CHECK(controls.result() == QDialog::Accepted, "Parameter OK accepts");
+        buttons->button(QDialogButtonBox::Cancel)->click();
+        CHECK(controls.result() == QDialog::Rejected, "Parameter Cancel rejects");
+        int renders = 0;
+        QImage source(340, 340, QImage::Format_ARGB32_Premultiplied);
+        source.fill(Qt::transparent);
+        PreviewDialog embedded("Embedded", source, params,
+            [&](const QImage &image, const QVector<int> &) { ++renders; return image; });
+        CHECK(renders == 1, "Embedded dialog renders initial thumbnail");
+        embedded.findChild<QSlider *>()->setValue(10);
+        CHECK(renders == 2, "Embedded dialog still renders on parameter changes");
+        CHECK(embedded.findChildren<QLabel *>().size() == 2, "Embedded dialog retains image label");
+        CHECK(controls.sizeHint().height() < embedded.sizeHint().height(), "Parameters-only layout is shorter");
+    }
     resizeStraightAlphaCharacterization();
     retainedCropRegression();
     retainedExpansionRegression();

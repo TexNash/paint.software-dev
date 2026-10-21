@@ -14,6 +14,7 @@
 #include "adjustments/highlightsshadows.h"
 #include "adjustments/temperaturetint.h"
 #include "adjustments/brightnesscontrast.h"
+#include <QLabel>
 #include <QSlider>
 #include <QSpinBox>
 #include <QDialogButtonBox>
@@ -61,6 +62,31 @@ int main(int argc, char **argv) {
         qputenv(name,path.toUtf8());
     }
     QApplication app(argc, argv);
+    {
+        MainWindow window;
+        for (int index : {0, 2, 5, 6, 8, 10, 11, 12, 14}) {
+            QTimer::singleShot(0, &window, [&window]() {
+                auto *dialog = window.findChild<PreviewDialog *>();
+                check(dialog, "Adjustment parameter dialog opens");
+                check(dialog->findChildren<QLabel *>().size() == dialog->values().size(),
+                      "Adjustment has parameter labels only, no embedded image");
+                dialog->reject();
+            });
+            check(QMetaObject::invokeMethod(&window, "applyAdjustment", Qt::DirectConnection, Q_ARG(int, index)),
+                  "Open adjustment for layout regression");
+        }
+        QTimer::singleShot(0, &window, [&window]() {
+            auto *dialog = window.findChild<PreviewDialog *>();
+            check(dialog, "Gaussian Blur dialog opens");
+            bool imageFound = false;
+            for (auto *label : dialog->findChildren<QLabel *>())
+                imageFound |= !label->pixmap().isNull();
+            check(imageFound, "Effects retain embedded image previews");
+            dialog->reject();
+        });
+        check(QMetaObject::invokeMethod(&window, "applyEffect", Qt::DirectConnection, Q_ARG(int, 0)),
+              "Open representative effect");
+    }
     Document doc(8,8);
     doc.layerAt(0)->setImage(sample());
     CanvasWidget canvas; canvas.setDocument(&doc); canvas.resize(160,160);

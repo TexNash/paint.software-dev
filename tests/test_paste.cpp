@@ -23,11 +23,13 @@
 #include <QLabel>
 #include <QKeyEvent>
 #include <QMouseEvent>
+#include <QLineF>
 #include <QEnterEvent>
 #include <QStyleFactory>
 #include <QStyle>
 #include <QAccessible>
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDockWidget>
 #include "dialogs/pastedialog.h"
 #include "dialogs/settingsdialog.h"
@@ -278,6 +280,14 @@ static void expandPaste() {
 static void drag(CanvasWidget *canvas, QPoint start, QPoint delta,
                  Qt::KeyboardModifiers modifiers = Qt::NoModifier, Qt::MouseButton button = Qt::LeftButton) {
     auto *tool = canvas->currentTool();
+    // Existing drag fixtures move artwork; pivot gestures are tested explicitly.
+    if (tool->type() == ToolType::Move && button == Qt::LeftButton) {
+        const auto *session = canvas->document()->floatingPixelSession();
+        const QRect rect = session ? session->sourceBounds().toAlignedRect() : canvas->document()->selection().boundingRect();
+        const QPointF pivot = session ? session->rotationPivot() : QRectF(rect).center();
+        if (!rect.isEmpty() && QLineF(start,pivot).length() <= SelHandles::pivotRadius(rect,canvas->zoom()))
+            start.rx() -= qMax(1,rect.width()/5);
+    }
     QMouseEvent press(QEvent::MouseButtonPress, QPointF(start), QPointF(start), button, button, modifiers);
     QMouseEvent move(QEvent::MouseMove, QPointF(start+delta), QPointF(start+delta), Qt::NoButton, button, modifiers);
     QMouseEvent release(QEvent::MouseButtonRelease, QPointF(start+delta), QPointF(start+delta), button, Qt::NoButton, modifiers);
@@ -539,8 +549,9 @@ static void retainedSelectedMove() {
     drag(canvas,QPoint(300,200),QPoint(-50,-40));
     doc->selection().selectRect(QRect(95,85,20,20));
     drag(canvas,QPoint(105,95),QPoint(25,20));
-    CHECK(doc->activeLayer()->image().pixelColor(175,155) == QColor(Qt::red));
-    CHECK(doc->activeLayer()->image().pixelColor(150,130).alpha() == 0);
+    CHECK(doc->flatten().pixelColor(125,115) == QColor(Qt::red));
+    const auto effective = doc->snapshotEffectiveLayers()[doc->activeLayerIndex()];
+    CHECK(effective->image().pixelColor(QPoint(100,90)-effective->offset()).alpha() == 0);
     CHECK(doc->activeLayer()->image().pixelColor(839,629) == QColor(Qt::red));
     CHECK(doc->activeLayer()->offset() == QPoint(-50,-40));
     doc->history().undo();
@@ -759,6 +770,117 @@ static void floatingPasteGestures() {
     CHECK(doc->flatten() == before && doc->layerCount() == 1);
 }
 
+static void cropWorkflow() {
+    MainWindow window;
+    auto *canvas = window.findChild<CanvasWidget *>();
+    auto *doc = canvas->document();
+    fullCanvasView(canvas);
+    const QSize originalSize = doc->size();
+    QImage image(80, 60, QImage::Format_ARGB32_Premultiplied);
+    image.fill(Qt::red);
+    QApplication::clipboard()->setImage(image);
+    noPrompt(window, "paste");
+    drag(canvas, QPoint(40,30), QPoint(100,80));
+    const QRect selection = doc->selection().boundingRect();
+    const int history = doc->history().currentIndex();
+    invoke(window, "cropToSelection");
+    CHECK(doc->size() == selection.size());
+    CHECK(!doc->selection().hasSelection() && !doc->floatingPixelSession());
+    CHECK(doc->history().currentIndex() == history + 2);
+    invoke(window, "undo");
+    CHECK(doc->size() == originalSize && doc->floatingPixelSession());
+    CHECK(doc->floatingPixelSession()->isSuspended());
+    drag(canvas, QPoint(140,110), QPoint(100,0));
+    CHECK(doc->flatten().pixelColor(140,110).alpha() == 0);
+    CHECK(doc->flatten().pixelColor(240,110) == QColor(Qt::red));
+    invoke(window, "undo"); // movement
+    invoke(window, "undo"); // Finish
+    CHECK(doc->floatingPixelSession() && !doc->floatingPixelSession()->isSuspended());
+    drag(canvas, QPoint(140,110), QPoint(100,0));
+    CHECK(doc->flatten().pixelColor(140,110) == QColor(Qt::white));
+
+    // Crop also settles a legacy selected-pixel gesture without migrating it.
+    doc->finishFloatingPixels();
+    doc->selection().selectRect(QRect(200,80,80,60));
+    auto *tool = canvas->currentTool();
+    QMouseEvent press(QEvent::MouseButtonPress, QPointF(240,110), QPointF(240,110),
+                      Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+    QMouseEvent move(QEvent::MouseMove, QPointF(260,120), QPointF(260,120),
+                     Qt::NoButton, Qt::LeftButton, Qt::NoModifier);
+    tool->mousePressEvent(QPointF(240,110), &press, *canvas);
+    tool->mouseMoveEvent(QPointF(260,120), &move, *canvas);
+    const QRect movedSelection = doc->selection().boundingRect();
+    const QImage beforeCrop = doc->flatten().copy(movedSelection);
+    invoke(window, "cropToSelection");
+    CHECK(doc->size() == movedSelection.size() && doc->flatten() == beforeCrop);
+    invoke(window, "undo");
+    CHECK(doc->selection().boundingRect() == movedSelection && doc->floatingPixelSession());
+
+    MainWindow queuedWindow;
+    auto *queuedCanvas = queuedWindow.findChild<CanvasWidget *>();
+    auto *queuedDoc = queuedCanvas->document();
+    fullCanvasView(queuedCanvas);
+    QApplication::clipboard()->setImage(image);
+    noPrompt(queuedWindow, "paste");
+    auto send = [&](QEvent::Type type, QPoint point, Qt::MouseButton button, Qt::MouseButtons buttons) {
+        const QPointF widget = queuedCanvas->canvasToWidget(point);
+        QMouseEvent event(type, widget, widget, button, buttons, Qt::NoModifier);
+        QApplication::sendEvent(queuedCanvas, &event);
+    };
+    send(QEvent::MouseButtonPress, QPoint(24,30), Qt::LeftButton, Qt::LeftButton);
+    send(QEvent::MouseMove, QPoint(784,30), Qt::NoButton, Qt::LeftButton);
+    CHECK(queuedDoc->floatingPixelSession()->transform() == QTransform());
+    invoke(queuedWindow, "cropToSelection");
+    CHECK(queuedDoc->size() == QSize(40,60)); // latest pose crosses the right canvas edge
+    CHECK(queuedDoc->flatten().pixelColor(20,30) == QColor(Qt::red));
+    CHECK(queuedDoc->history().currentIndex() == 4); // Paste, Move, Finish, Crop
+    invoke(queuedWindow, "undo");
+    CHECK(queuedDoc->selection().boundingRect() == QRect(760,0,40,60));
+    queuedCanvas->flushFloatingMove();
+    CHECK(queuedDoc->selection().boundingRect() == QRect(760,0,40,60));
+}
+
+static void floatingResamplingControls() {
+    using Sampling=FloatingPixelSession::Sampling;
+    MainWindow window;
+    auto *canvas=window.findChild<CanvasWidget *>(); fullCanvasView(canvas);
+    auto *doc=canvas->document();
+    QApplication::clipboard()->setImage(fixture(80,60)); noPrompt(window,"paste");
+    auto *combo=window.findChild<QComboBox *>("floatingResampling");
+    CHECK(combo && combo->count()==3 && combo->currentIndex()==int(Sampling::Bicubic));
+    CHECK(doc->floatingPixelSession()->sampling()==Sampling::Bicubic);
+    CHECK(doc->setFloatingPixelTransform(QTransform().rotate(17)*QTransform::fromTranslate(80.25,60.5)));
+    const QImage source=doc->floatingPixelSession()->sourcePixels();
+    const QImage smooth=doc->flatten();
+    const int history=doc->history().currentIndex();
+    combo->setCurrentIndex(int(Sampling::Nearest));
+    CHECK(doc->floatingPixelSession()->sampling()==Sampling::Nearest && doc->flatten()!=smooth);
+    CHECK(doc->history().currentIndex()==history+1);
+    invoke(window,"undo");
+    CHECK(combo->currentIndex()==int(Sampling::Bicubic) && doc->flatten()==smooth);
+    invoke(window,"redo");
+    CHECK(combo->currentIndex()==int(Sampling::Nearest));
+    CHECK(doc->floatingPixelSession()->sourcePixels().cacheKey()==source.cacheKey());
+    combo->setCurrentIndex(int(Sampling::Bilinear));
+    CHECK(doc->floatingPixelSession()->sampling()==Sampling::Bilinear);
+    invoke(window,"copy");
+    const auto copied=ClipboardPixels::decode(*QApplication::clipboard()->mimeData());
+    CHECK(copied && copied->coverage==doc->floatingPixelSession()->renderCoverage(doc->selection().boundingRect()));
+    QTemporaryDir dir;
+    const QString path=dir.filePath("filtered.psw");
+    CHECK(doc->saveNative(path));
+    MainWindow reopened;
+    reopened.openFile(path);
+    auto *restored=reopened.findChild<CanvasWidget *>()->document();
+    CHECK(restored->floatingPixelSession()->sampling()==Sampling::Bilinear
+          && reopened.findChild<QComboBox *>("floatingResampling")->currentIndex()==int(Sampling::Bilinear));
+    // A preference change with no session applies to the next paste/lift.
+    invoke(window,"deselectAll");
+    combo->setCurrentIndex(int(Sampling::Nearest));
+    QApplication::clipboard()->setImage(fixture(80,60)); noPrompt(window,"paste");
+    CHECK(canvas->document()->floatingPixelSession()->sampling()==Sampling::Nearest);
+}
+
 static void floatingContextAndClipboard() {
     MainWindow window;
     auto *canvas = window.findChild<CanvasWidget *>();
@@ -813,7 +935,7 @@ static void floatingContextAndClipboard() {
     targetDoc->setPrimaryColor(Qt::green);
     invoke(target, "fillSelection");
     CHECK(targetDoc->floatingPixelSession()->isSuspended());
-    CHECK(targetDoc->flatten().pixelColor(20, 20) == QColor(Qt::green));
+    CHECK(targetDoc->flatten().pixelColor(targetDoc->selection().boundingRect().topLeft() + QPoint(20,20)) == QColor(Qt::green));
     invoke(target, "undo");
     CHECK(targetDoc->floatingPixelSession() && !targetDoc->floatingPixelSession()->isSuspended()
           && targetDoc->flatten() == visible);
@@ -824,6 +946,123 @@ static void floatingContextAndClipboard() {
     noPrompt(target, "pasteIntoNewLayer");
     CHECK(targetDoc->layerCount() == 3 && targetDoc->activeLayerIndex() == 2);
     CHECK(targetDoc->floatingPixelSession()->targets(targetDoc->layerAt(2)));
+}
+
+// Stage 6 acceptance audit: placement is document-space and independent of
+// clipboard geometry, while each document retains its own editable source.
+static void floatingPlacementAndSoftClipboard() {
+    MainWindow source;
+    auto *canvas = source.findChild<CanvasWidget *>();
+    auto *doc = canvas->document();
+    canvas->resize(480, 360);
+    canvas->setZoom(4.0);
+    canvas->setPan(QPointF(-400, -280));
+    const QRect view = canvas->rect().adjusted(canvas->rulerSize(), canvas->rulerSize(), 0, 0);
+    QPoint expected = canvas->widgetToCanvas(view.topLeft()).toPoint();
+    expected.setX(qBound(0, expected.x(), doc->width()-40));
+    expected.setY(qBound(0, expected.y(), doc->height()-30));
+    CHECK(expected.x() > 0 && expected.y() > 0);
+    QApplication::clipboard()->setImage(fixture());
+    noPrompt(source, "paste");
+    CHECK(doc->floatingPixelSession()->transform() == QTransform::fromTranslate(expected.x(), expected.y()));
+    invoke(source, "undo");
+    CHECK(!doc->floatingPixelSession());
+    invoke(source, "redo");
+    CHECK(doc->floatingPixelSession()->transform() == QTransform::fromTranslate(expected.x(), expected.y()));
+
+    MainWindow target;
+    auto *targetCanvas = target.findChild<CanvasWidget *>();
+    fullCanvasView(targetCanvas);
+    auto *other = targetCanvas->document();
+    // An irregular soft mask includes selected fully transparent source pixels.
+    QImage pixels = fixture(); pixels.setPixel(12, 10, 0);
+    QImage coverage(pixels.size(), QImage::Format_Grayscale8); coverage.fill(0);
+    for (int y=3; y<26; ++y) for (int x=3; x<35; ++x)
+        if ((x+y)%7) coverage.scanLine(y)[x] = uchar(32 + (x*17+y*11)%224);
+    coverage.scanLine(10)[12] = 255;
+    CHECK(doc->pasteFloatingPixels(pixels, coverage, QPoint(10, 15)));
+    const QImage originalSource = doc->floatingPixelSession()->sourcePixels();
+    const QImage originalCoverage = doc->floatingPixelSession()->sourceCoverage();
+    invoke(source, "copy");
+    const auto copied = ClipboardPixels::decode(*QApplication::clipboard()->mimeData());
+    const QRect selected(3,3,32,23);
+    CHECK(copied && copied->coverage == coverage.copy(selected));
+    CHECK(copied && copied->pixels.pixel(9,7) == 0
+          && copied->pixels.pixel(1,1) == pixels.pixel(4,4));
+    noPrompt(target, "paste");
+    CHECK(other->floatingPixelSession()->sourceCoverage() == coverage.copy(selected));
+    CHECK(other->floatingPixelSession()->sourcePixels().pixel(9,7) == 0);
+    CHECK(other->setFloatingPixelTransform(QTransform().rotate(19)*QTransform::fromTranslate(80,60)));
+    CHECK(doc->floatingPixelSession()->sourcePixels() == originalSource
+          && doc->floatingPixelSession()->sourceCoverage() == originalCoverage
+          && doc->floatingPixelSession()->transform() == QTransform::fromTranslate(10,15));
+    const QImage appearance = other->flatten();
+    QTemporaryDir dir;
+    CHECK(other->saveNative(dir.filePath("soft.psw")));
+    Document reopened;
+    CHECK(reopened.loadNative(dir.filePath("soft.psw")) && reopened.flatten() == appearance);
+    CHECK(reopened.floatingPixelSession()->sourceCoverage() == coverage.copy(selected));
+    invoke(target, "selectAll");
+    CHECK(!other->floatingPixelSession());
+    invoke(target, "undo");
+    CHECK(other->floatingPixelSession() && other->flatten() == appearance);
+    CHECK(QMetaObject::invokeMethod(&target, "selectTool", Qt::DirectConnection,
+                                   Q_ARG(ToolType, ToolType::MoveSelection)));
+    CHECK(other->floatingPixelSession()->isSuspended());
+    const QImage beforeOutline = other->flatten();
+    const QRect outline = other->selection().boundingRect();
+    QPoint grab = outline.center();
+    bool found = false;
+    for (int y=outline.top()+8; y<outline.bottom()-8 && !found; ++y)
+        for (int x=outline.left()+8; x<outline.right()-8; ++x)
+            if (other->selection().isSelected(x,y)
+                && SelHandles::at(outline,QPointF(x,y),targetCanvas->zoom()) == SelHandles::Handle::None) {
+                grab = QPoint(x,y); found = true; break;
+            }
+    CHECK(found);
+    const QPointF start = targetCanvas->canvasToWidget(grab);
+    const QPointF end = start + QPointF(8*targetCanvas->zoom(), 5*targetCanvas->zoom());
+    QMouseEvent press(QEvent::MouseButtonPress,start,start,Qt::LeftButton,Qt::LeftButton,Qt::NoModifier);
+    QApplication::sendEvent(targetCanvas,&press);
+    QMouseEvent move(QEvent::MouseMove,end,end,Qt::NoButton,Qt::LeftButton,Qt::NoModifier);
+    QApplication::sendEvent(targetCanvas,&move);
+    QMouseEvent release(QEvent::MouseButtonRelease,end,end,Qt::LeftButton,Qt::NoButton,Qt::NoModifier);
+    QApplication::sendEvent(targetCanvas,&release);
+    CHECK(!other->floatingPixelSession() && other->flatten() == beforeOutline);
+    CHECK(other->selection().boundingRect() == outline.translated(8,5));
+    CHECK(QMetaObject::invokeMethod(&target, "selectTool", Qt::DirectConnection,
+                                   Q_ARG(ToolType, ToolType::Move)));
+    drag(targetCanvas,other->selection().boundingRect().center(),QPoint(10,0));
+    CHECK(other->floatingPixelSession() && other->floatingPixelSession()->targets(other->activeLayer()));
+}
+
+static void copiedPastePlacement() {
+    MainWindow window;
+    auto *canvas = window.findChild<CanvasWidget *>();
+    auto *doc = canvas->document();
+    fullCanvasView(canvas);
+    QImage pixels = fixture(20,20);
+    QImage mask(pixels.size(),QImage::Format_Grayscale8); mask.fill(255);
+    CHECK(doc->pasteFloatingPixels(pixels,mask,QPoint(350,250)));
+    invoke(window,"copy");
+    noPrompt(window,"paste");
+    CHECK(doc->floatingPixelSession()->transform() == QTransform::fromTranslate(350,250));
+    // Pan the copied area entirely out of view, then paste without recopying.
+    canvas->resize(400,300); canvas->setZoom(4); canvas->setPan(QPointF(-2000,-1400));
+    const QRect view = canvas->rect().adjusted(canvas->rulerSize(),canvas->rulerSize(),0,0);
+    const QRectF visible(canvas->widgetToCanvas(view.topLeft()),canvas->widgetToCanvas(view.bottomRight()));
+    const auto copied = ClipboardPixels::decode(*QApplication::clipboard()->mimeData());
+    CHECK(copied.has_value());
+    if (!copied) return;
+    const QPoint expected = copied->pasteOrigin(visible,doc->size());
+    CHECK(expected != QPoint(350,250));
+    noPrompt(window,"pasteIntoNewLayer");
+    const QTransform placed = QTransform::fromTranslate(expected.x(),expected.y());
+    CHECK(doc->floatingPixelSession()->transform() == placed && doc->layerCount() == 2);
+    invoke(window,"undo");
+    CHECK(doc->layerCount() == 1 && doc->floatingPixelSession()->transform() == QTransform::fromTranslate(350,250));
+    invoke(window,"redo");
+    CHECK(doc->layerCount() == 2 && doc->floatingPixelSession()->transform() == placed);
 }
 
 static void floatingCoalescing() {
@@ -839,26 +1078,26 @@ static void floatingCoalescing() {
     };
     const qint64 initialMask = doc->selection().mask().cacheKey();
     send(QEvent::MouseMove, QPoint(40, 30), Qt::NoButton, Qt::NoButton);
-    send(QEvent::MouseButtonPress, QPoint(40, 30), Qt::LeftButton, Qt::LeftButton);
+    send(QEvent::MouseButtonPress, QPoint(30, 30), Qt::LeftButton, Qt::LeftButton);
     canvas->flushFloatingMove();
     CHECK(updates == 0 && doc->selection().mask().cacheKey() == initialMask);
-    for (int i = 1; i <= 200; ++i) send(QEvent::MouseMove, QPoint(40+i, 130), Qt::NoButton, Qt::LeftButton);
+    for (int i = 1; i <= 200; ++i) send(QEvent::MouseMove, QPoint(30+i, 130), Qt::NoButton, Qt::LeftButton);
     CHECK(updates == 0); // positions wait for one frame; old positions do no work
     canvas->flushFloatingMove();
     CHECK(updates == 1 && doc->floatingPixelSession()->transform() == QTransform::fromTranslate(200, 100));
     const qint64 movedMask = doc->selection().mask().cacheKey();
-    for (int i = 0; i < 20; ++i) { send(QEvent::MouseMove, QPoint(240, 130), Qt::NoButton, Qt::LeftButton); canvas->flushFloatingMove(); }
+    for (int i = 0; i < 20; ++i) { send(QEvent::MouseMove, QPoint(230, 130), Qt::NoButton, Qt::LeftButton); canvas->flushFloatingMove(); }
     CHECK(updates == 1 && doc->selection().mask().cacheKey() == movedMask);
-    send(QEvent::MouseMove, QPoint(250, 140), Qt::NoButton, Qt::LeftButton);
-    send(QEvent::MouseButtonRelease, QPoint(260, 150), Qt::LeftButton, Qt::NoButton);
+    send(QEvent::MouseMove, QPoint(240, 140), Qt::NoButton, Qt::LeftButton);
+    send(QEvent::MouseButtonRelease, QPoint(250, 150), Qt::LeftButton, Qt::NoButton);
     CHECK(updates == 2 && doc->floatingPixelSession()->transform() == QTransform::fromTranslate(220, 120));
     CHECK(doc->history().currentIndex() == 2);
     invoke(window, "undo");
     CHECK(doc->floatingPixelSession()->transform() == QTransform());
     invoke(window, "redo");
     CHECK(doc->floatingPixelSession()->transform() == QTransform::fromTranslate(220, 120));
-    send(QEvent::MouseButtonPress, QPoint(250, 140), Qt::LeftButton, Qt::LeftButton);
-    send(QEvent::MouseMove, QPoint(260, 150), Qt::NoButton, Qt::LeftButton);
+    send(QEvent::MouseButtonPress, QPoint(240, 140), Qt::LeftButton, Qt::LeftButton);
+    send(QEvent::MouseMove, QPoint(250, 150), Qt::NoButton, Qt::LeftButton);
     doc->history().undo(); // history panel/direct navigation discards pending input
     canvas->flushFloatingMove();
     CHECK(doc->floatingPixelSession()->transform() == QTransform());
@@ -873,6 +1112,33 @@ static void floatingCoalescing() {
         canvas->updateCanvas(); canvas->render(&full);
         CHECK(partial == full);
     }
+    CHECK(doc->finishFloatingPixels());
+    doc->activeLayer()->clear(Qt::white);
+    doc->selection().selectRect(QRect(20,20,80,60));
+    doc->history().clear();
+    updates = 0;
+    const qint64 initialOrdinaryMask = doc->selection().mask().cacheKey();
+    send(QEvent::MouseButtonPress,QPoint(40,40),Qt::LeftButton,Qt::LeftButton);
+    CHECK(doc->floatingPixelSession());
+    const QImage lifted = doc->floatingPixelSession()->sourcePixels();
+    send(QEvent::MouseMove,QPoint(40,40),Qt::NoButton,Qt::LeftButton);
+    canvas->flushFloatingMove();
+    CHECK(updates == 0 && doc->selection().mask().cacheKey() == initialOrdinaryMask);
+    for (int i = 1; i <= 200; ++i)
+        send(QEvent::MouseMove,QPoint(40+i,140),Qt::NoButton,Qt::LeftButton);
+    CHECK(updates == 0);
+    canvas->flushFloatingMove();
+    CHECK(updates == 1 && doc->floatingPixelSession()->sourcePixels().cacheKey() == lifted.cacheKey());
+    const qint64 ordinaryMask = doc->selection().mask().cacheKey();
+    for (int i = 0; i < 20; ++i) {
+        send(QEvent::MouseMove,QPoint(240,140),Qt::NoButton,Qt::LeftButton);
+        canvas->flushFloatingMove();
+    }
+    CHECK(updates == 1 && doc->selection().mask().cacheKey() == ordinaryMask);
+    send(QEvent::MouseButtonRelease,QPoint(250,150),Qt::LeftButton,Qt::NoButton);
+    CHECK(doc->history().currentIndex() == 1);
+    invoke(window,"undo");
+    CHECK(!doc->floatingPixelSession() && doc->selection().boundingRect() == QRect(20,20,80,60));
 }
 
 static void floatingNativeAndDocumentSwitch() {
@@ -1126,10 +1392,12 @@ static void benchmarkFloating() {
 
 // Phase timings complement the event/render benchmark; kept opt-in so CI has
 // no wall-clock pass/fail thresholds. Use identical builds for comparisons.
-static void benchmarkStage4A() {
+static void benchmarkStage4A(FloatingPixelSession::Sampling sampling=FloatingPixelSession::Sampling::Bicubic) {
     for (bool layered : {false, true}) {
         MainWindow window;
         auto *canvas = window.findChild<CanvasWidget *>(); auto *doc = canvas->document();
+        CHECK(QMetaObject::invokeMethod(&window,"selectTool",Qt::DirectConnection,Q_ARG(ToolType,ToolType::Move)));
+        window.findChild<QComboBox *>("floatingResampling")->setCurrentIndex(int(sampling));
         doc->resize(4000, 3000); fullCanvasView(canvas); canvas->setZoom(0.2);
         if (layered) {
             doc->addLayer("Target"); doc->activeLayer()->setOffset(QPoint(-25, 17));
@@ -1149,7 +1417,7 @@ static void benchmarkStage4A() {
             for (int i = 0; i < 12; ++i) { QElapsedTimer timer; timer.start(); operation(i); samples.push_back(timer.nsecsElapsed()/1e6); }
             const double mean = std::accumulate(samples.begin(), samples.end(), 0.0)/samples.size();
             std::sort(samples.begin(), samples.end());
-            std::cout << "PROFILE layers=" << doc->layerCount() << " shape=" << (layered ? "ellipse" : "rectangle")
+            std::cout << "PROFILE mode=" << int(sampling) << " layers=" << doc->layerCount() << " shape=" << (layered ? "ellipse" : "rectangle")
                       << " phase=" << phase << " mean_ms=" << mean << " p95_ms=" << samples.back()
                       << " max_ms=" << samples.back() << std::endl;
         };
@@ -1170,6 +1438,11 @@ static void benchmarkStage4A() {
                   << " cost_kib=" << cacheBefore.costKiB << " limit_kib=" << cacheBefore.limitKiB << std::endl;
         const QTransform original = session->transform();
         measure("transform_frame", [&](int i) { doc->setFloatingPixelTransform(original * QTransform::fromTranslate(i*9, i*3)); canvas->render(&screen); });
+        if (QCoreApplication::arguments().contains("--benchmark-stage4c")) {
+            const auto reduced=QTransform::fromScale(0.25,0.25)*QTransform::fromTranslate(700,250);
+            doc->setFloatingPixelTransform(reduced);
+            measure("reduction_frame", [&](int i) { doc->setFloatingPixelTransform(reduced*QTransform::fromTranslate(i*9,i*3)); canvas->render(&screen); });
+        }
     }
 }
 
@@ -1189,6 +1462,10 @@ int main(int argc, char **argv) {
     I18n::setLanguage(I18n::Lang::English);
     if (app.arguments().contains("--benchmark-floating")) { benchmarkFloating(); return failures ? 1 : 0; }
     if (app.arguments().contains("--benchmark-stage4a")) { benchmarkStage4A(); return failures ? 1 : 0; }
+    if (app.arguments().contains("--benchmark-stage4c")) {
+        for (auto mode:{FloatingPixelSession::Sampling::Nearest,FloatingPixelSession::Sampling::Bilinear,FloatingPixelSession::Sampling::Bicubic}) benchmarkStage4A(mode);
+        return failures ? 1 : 0;
+    }
     pasteDialogStyles();
     utilityPanelPreferences();
     paths();
@@ -1207,8 +1484,12 @@ int main(int argc, char **argv) {
     pendingToolPaste();
     floatingPasteGestures();
     floatingContextAndClipboard();
+    floatingResamplingControls();
+    cropWorkflow();
     floatingNativeAndDocumentSwitch();
     floatingCoalescing();
+    floatingPlacementAndSoftClipboard();
+    copiedPastePlacement();
     floatingLayerAppearance();
     std::cout << checks << " paste checks, " << failures << " failures\n";
     return failures ? 1 : 0;

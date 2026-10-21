@@ -8,6 +8,7 @@
 #include "tools/texttool.h"
 #include "tools/recolortool.h"
 #include "tools/selectiontool.h"
+#include "tools/movetool.h"
 #include "core/hatchpatterns.h"
 #include "core/layer.h"
 #include "toolicons.h"
@@ -222,6 +223,20 @@ ToolOptionsPanel::ToolOptionsPanel(QWidget *parent) : QWidget(parent) {
     layout->addWidget(m_blendModeCombo);
     connect(m_blendModeCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &ToolOptionsPanel::onBlendModeChanged);
+
+    m_resamplingLabel = new QLabel(TR("Rééchantillonnage :"));
+    layout->addWidget(m_resamplingLabel);
+    m_resamplingCombo = new QComboBox;
+    m_resamplingCombo->setObjectName("floatingResampling");
+    m_resamplingCombo->addItems({TR("Plus proche voisin"),TR("Bilinéaire"),TR("Bicubique")});
+    m_resamplingCombo->setFixedHeight(20);
+    layout->addWidget(m_resamplingCombo);
+    connect(m_resamplingCombo,QOverload<int>::of(&QComboBox::currentIndexChanged),this,[this](int mode) {
+        if (auto *move = dynamic_cast<MoveTool *>(m_tool)) {
+            move->setSampling(static_cast<FloatingPixelSession::Sampling>(mode));
+            emit resamplingChanged(mode);
+        }
+    });
 
     // --- Sampling source (Fill / Magic Wand): Image vs Layer (Paint.NET) ---
     m_samplingLabel = new QLabel(TR("Échantillonnage :"));
@@ -463,6 +478,11 @@ void ToolOptionsPanel::updateFromTool() {
     m_blendModeCombo->blockSignals(false);
 
     // Sampling source: reflect the active Fill / Magic Wand tool.
+    if (auto *move = dynamic_cast<MoveTool *>(m_tool)) {
+        m_resamplingCombo->blockSignals(true);
+        m_resamplingCombo->setCurrentIndex(int(move->sampling()));
+        m_resamplingCombo->blockSignals(false);
+    }
     {
         bool sampleImage = true;
         if (auto *fill = dynamic_cast<FillTool*>(m_tool)) sampleImage = fill->sampleImage();
@@ -607,6 +627,8 @@ void ToolOptionsPanel::updateFromTool() {
     const bool hasSampling = (t == ToolType::Fill || t == ToolType::MagicWand);
     m_samplingLabel->setVisible(hasSampling);
     m_samplingCombo->setVisible(hasSampling);
+    m_resamplingLabel->setVisible(t == ToolType::Move);
+    m_resamplingCombo->setVisible(t == ToolType::Move);
 
     // Recolor target (clicked pixel vs secondary colour): Recolor only.
     const bool hasRecolorTarget = (t == ToolType::Recolor);
@@ -854,6 +876,15 @@ void ToolOptionsPanel::retranslate() {
     m_cornerLabel->setText(TR("Coin :"));
     m_blendModeLabel->setText(TR("Mode :"));
     m_samplingLabel->setText(TR("Échantillonnage :"));
+    m_resamplingLabel->setText(TR("Rééchantillonnage :"));
+    {
+        const int mode=m_resamplingCombo->currentIndex();
+        m_resamplingCombo->blockSignals(true);
+        m_resamplingCombo->clear();
+        m_resamplingCombo->addItems({TR("Plus proche voisin"),TR("Bilinéaire"),TR("Bicubique")});
+        m_resamplingCombo->setCurrentIndex(mode);
+        m_resamplingCombo->blockSignals(false);
+    }
     {
         const int s = m_samplingCombo->currentIndex();
         m_samplingCombo->blockSignals(true);

@@ -3,6 +3,7 @@
 #include <QImage>
 #include <QMimeData>
 #include <QPoint>
+#include <QRectF>
 #include <memory>
 #include <optional>
 
@@ -23,6 +24,9 @@ struct ClipboardPixels {
     static std::optional<ClipboardPixels> decode(const QMimeData &mime);
     std::unique_ptr<QMimeData> mimeData() const;
     QImage standardImage() const;
+    // Preserve copied document coordinates while visible; otherwise move along
+    // the line toward the visible canvas centre until the sample fits the view.
+    QPoint pasteOrigin(const QRectF &visibleCanvas, const QSize &canvasSize) const;
 
 private:
     bool isValid() const;

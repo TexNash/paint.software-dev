@@ -1476,6 +1476,18 @@ void MainWindow::createDockPanels() {
             this, &MainWindow::selectTool);
     connect(m_toolOptionsPanel, &ToolOptionsPanel::toolOptionsChanged,
             this, [this]() { if (m_canvas) m_canvas->update(); });
+    connect(m_toolOptionsPanel,&ToolOptionsPanel::resamplingChanged,this,[this](int mode) {
+        if (!m_document || !m_canvas || !m_document->floatingPixelSession()) return;
+        m_canvas->flushFloatingMove();
+        if (m_currentTool) m_currentTool->deactivate(*m_canvas);
+        if (!m_document->floatingPixelSession()) return;
+        if (!m_document->setFloatingSampling(static_cast<FloatingPixelSession::Sampling>(mode))) {
+            if (auto *move=dynamic_cast<MoveTool *>(m_currentTool)) {
+                move->setSampling(m_document->floatingPixelSession()->sampling());
+                m_toolOptionsPanel->setTool(move);
+            }
+        }
+    });
     auto *optionsBar = new QToolBar("Barre d'outils variable", this);
     optionsBar->setObjectName("VariableToolbar");
     optionsBar->setMovable(false);
@@ -1764,6 +1776,15 @@ void MainWindow::closeCurrentDocument() {
 }
 
 void MainWindow::updateImageList() {
+    if (m_document && m_document->floatingPixelSession()) {
+        if (auto *move=dynamic_cast<MoveTool *>(m_currentTool)) {
+            const auto mode=m_document->floatingPixelSession()->sampling();
+            if (move->sampling() != mode) {
+                move->setSampling(mode);
+                m_toolOptionsPanel->setTool(move);
+            }
+        }
+    }
     if (m_imageListBar)
         m_imageListBar->setDocuments(m_documents, m_activeDocIndex);
     updateTitle();
@@ -2100,6 +2121,7 @@ void MainWindow::pastePixels(bool intoNewLayer) {
         || (!intoNewLayer && m_document->activeLayer()->isLocked())) return;
     const auto *mime = QApplication::clipboard()->mimeData();
     auto pixels = mime ? ClipboardPixels::decode(*mime) : std::optional<ClipboardPixels>();
+    const bool hasSourceOrigin = pixels.has_value();
     QImage img = pixels ? pixels->pixels : clipboardImage();
     if (img.isNull()) return;
     if (!pixels) pixels = ClipboardPixels::capture(img, QPoint(), Selection());
@@ -2114,12 +2136,14 @@ void MainWindow::pastePixels(bool intoNewLayer) {
     // Finish any pending Line/Shape edit on its original layer, not the newly
     // pasted layer. This must remain after the dialog's cancellation boundary.
     if (m_currentTool) m_currentTool->deactivate(*m_canvas);
-    // Use the viewport's visible top-left when zoomed in; exact reference
-    // placement remains a manual acceptance item. Full-canvas paste starts at 0,0.
+    // Internal clipboard pixels retain their document-space source position.
+    // External images retain the established visible-top-left fallback.
     QPoint origin;
     const QRect view = m_canvas->rect().adjusted(m_canvas->rulerSize(), m_canvas->rulerSize(), 0, 0);
     const QRectF visible(m_canvas->widgetToCanvas(view.topLeft()), m_canvas->widgetToCanvas(view.bottomRight()));
-    if (!expand && !visible.contains(QRectF(QPointF(), m_document->size()))) {
+    if (hasSourceOrigin && !expand) {
+        origin = pixels->pasteOrigin(visible, m_document->size());
+    } else if (!expand && !visible.contains(QRectF(QPointF(), m_document->size()))) {
         origin = visible.topLeft().toPoint();
         origin.setX(qBound(0, origin.x(), qMax(0, m_document->width() - img.width())));
         origin.setY(qBound(0, origin.y(), qMax(0, m_document->height() - img.height())));
@@ -2127,7 +2151,10 @@ void MainWindow::pastePixels(bool intoNewLayer) {
     const QSize canvas = expand ? m_document->size().expandedTo(img.size()) : m_document->size();
     // Bypass a context suspension: a newly pasted session starts in Move.
     m_canvas->setCurrentTool(nullptr);
-    if (!m_document->pasteFloatingPixels(pixels->pixels, pixels->coverage, origin, intoNewLayer, canvas)) {
+    auto sampling=FloatingPixelSession::Sampling::Bicubic;
+    for (const auto &tool:m_tools)
+        if (auto *move=dynamic_cast<MoveTool *>(tool.get())) sampling=move->sampling();
+    if (!m_document->pasteFloatingPixels(pixels->pixels, pixels->coverage, origin, intoNewLayer, canvas,sampling)) {
         m_canvas->setCurrentTool(m_currentTool);
         statusBar()->showMessage(TR("Unable to allocate the pasted image."), 5000);
         return;
@@ -2689,14 +2716,13 @@ void MainWindow::flipVertical() {
 }
 
 void MainWindow::cropToSelection() {
+    if (!m_document) return;
+    if (m_currentTool) m_currentTool->deactivate(*m_canvas);
     if (!m_document->selection().hasSelection()) return;
-    QRect rect = m_document->selection().boundingRect();
-    if (rect.isEmpty()) return;
 
     // Undoable crop that also updates the document dimensions (keeps canvas and
     // document size in sync).
-    m_document->cropTo(rect);
-    emit m_document->selectionChanged();
+    if (!m_document->cropToSelection()) return;
     m_canvas->updateCanvas();
     m_sizeLabel->setText(QString("%1 × %2").arg(m_document->width()).arg(m_document->height()));
 }
@@ -2732,6 +2758,8 @@ void MainWindow::selectTool(ToolType type) {
                 return;
             }
             m_currentTool = tool.get();
+            if (auto *move=dynamic_cast<MoveTool *>(m_currentTool))
+                if (m_document->floatingPixelSession()) move->setSampling(m_document->floatingPixelSession()->sampling());
             m_canvas->setCursor(m_currentTool->cursor());
             m_toolOptionsPanel->setTool(m_currentTool);
             if (m_toolLabel) m_toolLabel->setText(TR(m_currentTool->name()));

@@ -3,6 +3,15 @@ project(PaintDali VERSION 1.1.1 LANGUAGES C CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# Full-resolution filtered selection sampling is a hot numerical loop. With no
+# build type CMake otherwise compiles it unoptimised, causing multi-second drags.
+# Keep explicit Debug/Release and multi-config builds under their normal flags.
+# Apply consistently to every target using the shared core source list.
+if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES
+   AND CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    set_property(SOURCE src/core/floatingpixelsession.cpp APPEND PROPERTY COMPILE_OPTIONS -O2)
+endif()
 set(CMAKE_AUTOMOC ON)
 set(CMAKE_AUTORCC ON)
 set(CMAKE_AUTOUIC ON)

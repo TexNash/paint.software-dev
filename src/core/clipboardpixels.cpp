@@ -151,3 +151,26 @@ std::optional<ClipboardPixels> ClipboardPixels::decode(const QMimeData &mime) {
     if (!result.isValid()) return std::nullopt;
     return result;
 }
+
+QPoint ClipboardPixels::pasteOrigin(const QRectF &visibleCanvas, const QSize &canvasSize) const {
+    const QRectF canvas(QPointF(), canvasSize);
+    const QRectF visible = visibleCanvas.intersected(canvas);
+    QPointF origin = sourceOrigin;
+    if (!visible.isEmpty() && !visible.intersects(QRectF(origin, pixels.size()))) {
+        const QPointF half(pixels.width()/2.0, pixels.height()/2.0);
+        const QPointF centre = visible.center();
+        const QPointF direction = origin + half - centre;
+        // Inset by half the sample so the whole sample fits when possible.
+        // A sample larger than the view is centred on that axis.
+        const double extentX = qMax(0.0, (visible.width()-pixels.width())/2.0);
+        const double extentY = qMax(0.0, (visible.height()-pixels.height())/2.0);
+        double fraction = 1.0;
+        if (direction.x() != 0) fraction = qMin(fraction, extentX/qAbs(direction.x()));
+        if (direction.y() != 0) fraction = qMin(fraction, extentY/qAbs(direction.y()));
+        origin = centre + direction*fraction - half;
+    }
+    QPoint result = origin.toPoint();
+    result.setX(qBound(0, result.x(), qMax(0, canvasSize.width()-pixels.width())));
+    result.setY(qBound(0, result.y(), qMax(0, canvasSize.height()-pixels.height())));
+    return result;
+}

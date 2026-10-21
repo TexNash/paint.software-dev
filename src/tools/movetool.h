@@ -1,7 +1,7 @@
 #pragma once
 #include "tool.h"
 #include "selectionhandles.h"
-#include <QImage>
+#include "core/floatingpixelsession.h"
 #include <QRect>
 #include <QPointer>
 #include <memory>
@@ -22,27 +22,25 @@ public:
     void drawOverlay(QPainter &painter, const CanvasWidget &canvas) override;
     void keyPressEvent(QKeyEvent *event, CanvasWidget &canvas) override;
     void deactivate(CanvasWidget &canvas) override;
+    FloatingPixelSession::Sampling sampling() const { return m_sampling; }
+    void setSampling(FloatingPixelSession::Sampling sampling) {
+        if (FloatingPixelSession::validSampling(sampling)) m_sampling = sampling;
+    }
 
 private:
     void finishSessionGesture();
+    FloatingPixelSession::Sampling m_sampling = FloatingPixelSession::Sampling::Bicubic;
     bool m_sessionGesture = false;
+    bool m_pivotGesture = false;
     bool m_sessionWasModified = false;
     QPointer<Document> m_sessionDocument;
     QTransform m_sessionStartTransform;
+    QPointF m_sessionStartPivot;
     std::unique_ptr<DocumentSnapshotCommand> m_sessionCommand;
     QMetaObject::Connection m_historyConnection;
     bool m_moving = false;
     QPointF m_startPos;
     QPoint m_originalOffset;
-
-    // When a selection is active we move only the selected pixels (like Paint.NET's
-    // "Move Selected Pixels"): lift them onto a floating layer, leave a hole behind,
-    // and drag both the pixels and the marquee.
-    bool m_movingSelection = false;
-    QImage m_originalImage;   // layer pixels at press (for undo + recompositing)
-    QImage m_floating;        // the selected pixels on transparent, document-sized
-    QImage m_hole;            // the layer with the selected pixels erased
-    QPoint m_lastDelta;       // last applied marquee translation (incremental)
 
     // Dragging a handle rescales the artwork itself, not just the marquee: the
     // selected pixels are stretched or squashed onto the new bounds.
@@ -50,17 +48,12 @@ private:
     SelHandles::Handle m_handle = SelHandles::Handle::None;
     QRect m_originalRect;     // selection bounds at press
     QRect m_previewRect;      // bounds being dragged to
-    QImage m_floatingCrop;    // the lifted pixels, cropped to m_originalRect
-    QImage m_originalMask;    // selection mask at press, rescaled/rotated alongside
 
     // Dragging just outside the box (or with the right button) rotates the lifted
-    // pixels and the marquee about the box centre (Paint.NET). Shift snaps to 15°.
+    // pixels and the marquee about the session pivot. Shift snaps to 15°.
     bool m_rotating = false;
-    QPointF m_rotCenter;      // box centre (rotation pivot), canvas space
+    QPointF m_rotCenter;      // rotation pivot at press, canvas space
     double m_rotStartAngle = 0.0;  // pointer angle at press, degrees
     double m_angle = 0.0;     // rotation applied so far, degrees
 
-    // Ctrl at press moves a COPY: the original pixels stay put (the hole is not
-    // cleared), so only the floating duplicate is dragged/rotated/resized.
-    bool m_copyMode = false;
 };

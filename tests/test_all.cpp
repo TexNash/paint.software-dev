@@ -9,6 +9,7 @@
 #include <QColor>
 #include <QPainter>
 #include <QMouseEvent>
+#include <QLineF>
 #include <QElapsedTimer>
 #include <QThread>
 #include <QDir>
@@ -177,6 +178,16 @@ static void testInvertProcess(unsigned char *rgba, int w, int h,
 }
 
 static void strokeTool(Tool *tool, CanvasWidget &canvas, QPointF a, QPointF b) {
+    // These existing strokes exercise artwork movement, not the new pivot nub.
+    if (tool->type() == ToolType::Move && canvas.document()) {
+        const auto *session = canvas.document()->floatingPixelSession();
+        const QRect rect = session ? session->sourceBounds().toAlignedRect() : canvas.document()->selection().boundingRect();
+        const QPointF pivot = session ? session->rotationPivot() : QRectF(rect).center();
+        if (!rect.isEmpty() && QLineF(a,pivot).length() <= SelHandles::pivotRadius(rect,canvas.zoom())) {
+            const QPointF offset(-rect.width()/5.0,0);
+            a += offset; b += offset;
+        }
+    }
     QMouseEvent e1 = pressEv(a);   tool->mousePressEvent(a, &e1, canvas);
     QMouseEvent e2 = moveEv((a+b)/2); tool->mouseMoveEvent((a+b)/2, &e2, canvas);
     QMouseEvent e3 = moveEv(b);     tool->mouseMoveEvent(b, &e3, canvas);
@@ -279,6 +290,412 @@ static void retainedCropRegression() {
                   "cropped layer returns to ordinary pixel-baked Move");
         }
     }
+}
+
+static void maskedCropRegression() {
+    SECTION("Mask-aware crop preserves geometry, layer metadata and two-step floating history");
+    for (bool floating : {false, true}) {
+        Document doc(12, 10);
+        doc.activeLayer()->clear(QColor(20, 100, 200, 128));
+        QImage top(8, 8, QImage::Format_ARGB32_Premultiplied);
+        top.fill(QColor(180, 60, 20, 160));
+        top.setPixel(3, 3, 0);
+        doc.addLayer(top, "offset hidden locked");
+        doc.activeLayer()->setOffset(QPoint(1, 1));
+        doc.activeLayer()->setRetainsOffCanvasPixels(true);
+        doc.activeLayer()->setOpacity(0.4f);
+        doc.activeLayer()->setBlendMode(BlendMode::Multiply);
+        doc.activeLayer()->setVisible(false);
+        doc.activeLayer()->setLocked(true);
+        QImage mask(12, 10, QImage::Format_Grayscale8);
+        mask.fill(0);
+        for (int y = 2; y < 8; ++y)
+            for (int x = 2; x < 9; ++x)
+                mask.scanLine(y)[x] = (x == 5 && y == 5) ? 0 : (x == 2 ? 128 : 255);
+        if (floating) {
+            QImage source(7, 6, QImage::Format_ARGB32_Premultiplied);
+            source.fill(QColor(0, 220, 100, 180));
+            source.setPixel(2, 2, 0); // selected transparency must not shrink geometry
+            CHECK(doc.beginFloatingPixelSession(1, source, mask.copy(2, 2, 7, 6), QPoint(2, 2)), "create crop session");
+        }
+        doc.selection().setMaskImage(mask);
+        const auto beforeLayers = doc.snapshotLayers();
+        const auto effective = doc.snapshotEffectiveLayers();
+        const int history = doc.history().currentIndex();
+        std::vector<QImage> expected;
+        for (const auto &layer : effective) {
+            QImage pixels(7, 6, QImage::Format_ARGB32_Premultiplied);
+            pixels.fill(Qt::transparent);
+            { QPainter painter(&pixels); painter.drawImage(layer->offset() - QPoint(2, 2), layer->image()); }
+            for (int y = 0; y < 6; ++y) {
+                auto *line = reinterpret_cast<QRgb *>(pixels.scanLine(y));
+                for (int x = 0; x < 7; ++x) {
+                    const int c = mask.constScanLine(y + 2)[x + 2];
+                    const QRgb p = line[x];
+                    line[x] = qRgba(qRed(p)*c/255, qGreen(p)*c/255, qBlue(p)*c/255, qAlpha(p)*c/255);
+                }
+            }
+            expected.push_back(pixels);
+        }
+        CHECK(doc.cropToSelection(), "mask crop succeeds");
+        CHECK(doc.size() == QSize(7, 6) && !doc.selection().hasSelection() && !doc.floatingPixelSession(), "crop clears selection and session");
+        CHECK(doc.history().currentIndex() == history + (floating ? 2 : 1), "floating crop has separate Finish and Crop history");
+        for (int i = 0; i < doc.layerCount(); ++i) {
+            CHECK(doc.layerAt(i)->image() == expected[i], "every layer uses exact premultiplied crop coverage");
+            CHECK(doc.layerAt(i)->offset().isNull() && !doc.layerAt(i)->retainsOffCanvasPixels(), "cropped layer discards outside storage");
+        }
+        CHECK(!doc.activeLayer()->isVisible() && doc.activeLayer()->isLocked()
+              && doc.activeLayer()->blendMode() == BlendMode::Multiply && doc.activeLayer()->opacity() == 0.4f
+              && doc.activeLayer()->name() == "offset hidden locked", "crop preserves layer properties");
+        QTemporaryDir directory;
+        const QString path = directory.path() + "/crop.psw";
+        CHECK(doc.saveNative(path), "save masked crop");
+        Document reopened(path);
+        CHECK(reopened.size() == doc.size() && reopened.layerAt(1)->image() == expected[1]
+              && !reopened.floatingPixelSession(), "native reopen preserves finished cropped pixels");
+        doc.history().undo();
+        CHECK(doc.size() == QSize(12, 10) && doc.selection().mask() == mask && doc.activeLayerIndex() == 1, "undo crop restores canvas selection and active layer");
+        if (floating) {
+            CHECK(doc.floatingPixelSession() && doc.floatingPixelSession()->isSuspended(), "undo crop restores editable context-boundary object");
+            doc.history().undo();
+            CHECK(doc.floatingPixelSession() && !doc.floatingPixelSession()->isSuspended(), "undo Finish restores background-preserving session");
+        }
+        CHECK(doc.layerAt(1)->image() == beforeLayers[1]->image() && doc.layerAt(1)->offset() == QPoint(1, 1), "undo restores original layer bytes and offset");
+        if (floating) doc.history().redo();
+        doc.history().redo();
+        CHECK(doc.layerAt(1)->image() == expected[1] && !doc.floatingPixelSession(), "redo reproduces crop");
+    }
+    for (QPoint offset : {QPoint(-4, -3), QPoint(100, 100), QPoint(INT_MIN, INT_MAX)}) {
+        Document doc(8, 6);
+        doc.activeLayer()->setOffset(offset);
+        doc.selection().selectRect(QRect(-2, -2, 5, 5));
+        CHECK(doc.cropToSelection() && doc.size() == QSize(3, 3), "crop clips bounds to canvas even with extreme offsets");
+        CHECK(doc.activeLayer()->image().pixel(0, 0) == (offset == QPoint(-4, -3) ? qRgb(255,255,255) : 0), "offset crop samples layer in document space");
+    }
+    Document empty(8, 6);
+    empty.setModified(false);
+    const int history = empty.history().currentIndex();
+    CHECK(!empty.cropToSelection() && !empty.isModified() && empty.history().currentIndex() == history, "empty selection is a clean no-op");
+    QImage outside(20, 20, QImage::Format_Grayscale8);
+    outside.fill(0); outside.scanLine(15)[15] = 255;
+    empty.selection().setMaskImage(outside);
+    CHECK(!empty.cropToSelection() && empty.size() == QSize(8,6) && !empty.isModified(), "entirely off-canvas selection is a clean no-op");
+    {
+        Document doc(8, 6);
+        QImage source(2, 2, QImage::Format_ARGB32_Premultiplied);
+        source.fill(Qt::red);
+        QImage coverage(2, 2, QImage::Format_Grayscale8);
+        coverage.fill(255);
+        CHECK(doc.pasteFloatingPixels(source, coverage, QPoint()), "prepare rejected crop fixture");
+        CHECK(doc.setFloatingPixelTransform(QTransform::fromScale(1000000,1000000)), "prepare oversized Finish domain");
+        doc.setModified(false);
+        const int history = doc.history().currentIndex();
+        const QImage mask = doc.selection().mask();
+        const QImage layer = doc.activeLayer()->image();
+        CHECK(!doc.cropToSelection(), "crop rejects unmaterializable Finish checkpoint");
+        CHECK(doc.size() == QSize(8,6) && doc.activeLayer()->image() == layer
+              && doc.selection().mask() == mask && doc.floatingPixelSession()
+              && !doc.floatingPixelSession()->isSuspended() && !doc.isModified()
+              && doc.history().currentIndex() == history, "rejected crop preserves document session and history");
+    }
+    for (bool suspended : {false, true}) {
+        Document doc(40, 30);
+        QImage source(24, 18, QImage::Format_ARGB32_Premultiplied);
+        source.fill(QColor(20, 160, 240, 100));
+        QImage coverage(source.size(), QImage::Format_Grayscale8);
+        coverage.fill(255);
+        CHECK(doc.pasteFloatingPixels(source, coverage, QPoint()), "paste rotated crop fixture");
+        QTransform transform;
+        transform.translate(-5, 3);
+        transform.rotate(25);
+        transform.scale(1.2, 0.9);
+        CHECK(doc.setFloatingPixelTransform(transform), "rotate scale and move partly off canvas");
+        if (suspended) CHECK(doc.suspendFloatingPixels(), "suspend before crop");
+        const QRect bounds = doc.selection().boundingRect().intersected(QRect(QPoint(), doc.size()));
+        const QImage mask = doc.selection().mask().copy(bounds);
+        const QImage rendered = doc.flatten().copy(bounds);
+        const int history = doc.history().currentIndex();
+        CHECK(doc.cropToSelection(), "crop transformed session");
+        CHECK(doc.size() == bounds.size(), "transformed crop discards off-canvas extent");
+        CHECK(doc.history().currentIndex() == history + (suspended ? 1 : 2), "already suspended crop reuses existing Finish checkpoint");
+        bool correct = true;
+        for (int y = 0; y < bounds.height(); ++y)
+            for (int x = 0; x < bounds.width(); ++x) {
+                const QRgb p = rendered.pixel(x,y);
+                const int c = mask.constScanLine(y)[x];
+                correct &= doc.activeLayer()->image().pixel(x,y) == qRgba(qRed(p)*c/255,qGreen(p)*c/255,qBlue(p)*c/255,qAlpha(p)*c/255);
+            }
+        CHECK(correct, "rotated crop applies geometry independently of source alpha");
+        doc.history().undo();
+        CHECK(doc.size() == QSize(40,30) && doc.floatingPixelSession(), "undo transformed crop restores session");
+    }
+}
+
+static void advancedFloatingControlsRegression() {
+    SECTION("Ordinary lifts, signed resize and rotation pivots");
+    Document doc(200,160);
+    doc.activeLayer()->clear(Qt::white);
+    { QPainter p(&doc.activeLayer()->image()); p.fillRect(20,20,40,30,Qt::red); }
+    doc.activeLayer()->image().setPixelColor(23,24,Qt::blue);
+    doc.selection().selectRect(QRect(20,20,40,30));
+    CanvasWidget canvas; canvas.setDocument(&doc);
+    MoveTool tool;
+    // Raw events intentionally exercise the pivot nub too.
+    auto gesture = [&](QPointF from, QPointF to, Qt::MouseButton button = Qt::LeftButton,
+                       Qt::KeyboardModifiers mods = Qt::NoModifier) {
+        QMouseEvent press(QEvent::MouseButtonPress,from,from,button,button,mods);
+        QMouseEvent move(QEvent::MouseMove,to,to,Qt::NoButton,button,mods);
+        QMouseEvent release(QEvent::MouseButtonRelease,to,to,button,Qt::NoButton,mods);
+        tool.mousePressEvent(from,&press,canvas);
+        tool.mouseMoveEvent(to,&move,canvas);
+        tool.mouseReleaseEvent(to,&release,canvas);
+    };
+    const QImage original = doc.flatten();
+    gesture(QPointF(30,30),QPointF(30,30));
+    CHECK(!doc.floatingPixelSession() && doc.flatten() == original && !doc.history().canUndo(), "ordinary click creates no lift or history");
+    gesture(QPointF(30,30),QPointF(80,30));
+    CHECK(doc.floatingPixelSession() && doc.flatten().pixelColor(30,30).alpha() == 0
+          && doc.flatten().pixelColor(80,30) == QColor(Qt::red), "ordinary Move lifts pixels leaving a hole");
+    const QImage source = doc.floatingPixelSession()->sourcePixels();
+    const QImage coverage = doc.floatingPixelSession()->sourceCoverage();
+    gesture(QPointF(80,30),QPointF(110,30));
+    CHECK(doc.flatten().pixelColor(80,30) == QColor(Qt::white), "intermediate destination restores background");
+    CHECK(doc.floatingPixelSession()->sourcePixels().cacheKey() == source.cacheKey()
+          && doc.floatingPixelSession()->sourceCoverage().cacheKey() == coverage.cacheKey(), "repeated movement retains immutable source and mask");
+    doc.history().undo(); doc.history().undo();
+    CHECK(!doc.floatingPixelSession() && doc.flatten() == original, "undo first lift restores original pixels and selection");
+    doc.history().redo(); doc.history().redo();
+    CHECK(doc.floatingPixelSession() && doc.flatten().pixelColor(110,30) == QColor(Qt::red), "redo ordinary movement restores session");
+
+    const QPointF defaultPivot = doc.floatingPixelSession()->rotationPivot();
+    const QImage beforePivot = doc.flatten();
+    const qint64 maskKey = doc.selection().mask().cacheKey();
+    const QTransform beforeTransform = doc.floatingPixelSession()->transform();
+    gesture(defaultPivot,QPointF(-20,-30));
+    CHECK(doc.floatingPixelSession()->rotationPivot() == QPointF(-20,-30)
+          && doc.flatten() == beforePivot && doc.selection().mask().cacheKey() == maskKey
+          && doc.floatingPixelSession()->transform() == beforeTransform, "off-canvas pivot drag changes no pixels mask or transform");
+    CHECK(doc.history().undoDescription() == "Move Rotation Pivot", "pivot has its own history entry");
+    doc.history().undo();
+    CHECK(doc.floatingPixelSession()->rotationPivot() == defaultPivot, "undo pivot restores original rotation centre");
+    doc.history().redo();
+    CHECK(doc.floatingPixelSession()->rotationPivot() == QPointF(-20,-30), "redo pivot restores custom centre");
+    QTemporaryDir directory;
+    const QString path = directory.filePath("pivot.psw");
+    CHECK(doc.saveNative(path), "save ordinary lift with custom pivot");
+    CHECK(doc.floatingPixelSession()->rotationPivot() == QPointF(-20,-30), "save retains pivot in the open document");
+    Document reopened(path);
+    CHECK(reopened.floatingPixelSession() && reopened.flatten() == doc.flatten()
+          && !reopened.floatingPixelSession()->hasCustomRotationPivot()
+          && reopened.floatingPixelSession()->rotationPivot() == defaultPivot, "native reopen restores ordinary lift and resets pivot as Paint.NET does");
+    const QPointF pivot = doc.floatingPixelSession()->rotationPivot();
+    gesture(pivot+QPointF(100,0),pivot+QPointF(0,100),Qt::RightButton,Qt::ShiftModifier);
+    CHECK(QLineF(doc.floatingPixelSession()->rotationPivot(),pivot).length() < 0.00001, "rotation fixes custom pivot");
+    CHECK(doc.floatingPixelSession()->sourcePixels().cacheKey() == source.cacheKey(), "rotation retains original source");
+    doc.history().undo();
+    CHECK(doc.floatingPixelSession()->transform() == beforeTransform, "undo custom-pivot rotation restores transform");
+    const int noOpHistory = doc.history().currentIndex();
+    gesture(pivot,pivot);
+    CHECK(doc.history().currentIndex() == noOpHistory && doc.history().canRedo(), "stationary pivot click preserves redo branch");
+    gesture(QPointF(110,30),QPointF(120,40));
+    CHECK(QLineF(doc.floatingPixelSession()->rotationPivot(),pivot+QPointF(10,10)).length() < 0.00001, "custom pivot follows artwork translation");
+    doc.history().undo();
+    CHECK(!doc.setFloatingRotationPivot(QPointF(std::numeric_limits<double>::infinity(),0)), "reject nonfinite pivot");
+
+    const QRect rect(20,20,40,30);
+    const auto flip = SelHandles::resizeTransform(rect,SelHandles::Handle::Right,QPointF(-21,35),Qt::NoModifier);
+    CHECK(flip.m11() == -1 && flip.m22() == 1, "crossing opposite side produces signed horizontal reflection");
+    CHECK(flip.map(QPointF(20,20)) == QPointF(20,20), "crossed resize keeps opposite edge anchored");
+    const auto symmetric = SelHandles::resizeTransform(rect,SelHandles::Handle::BottomRight,QPointF(0,5),Qt::AltModifier|Qt::ShiftModifier);
+    CHECK(symmetric.m11() < 0 && symmetric.m22() < 0 && qAbs(symmetric.m11()-symmetric.m22()) < 0.00001
+          && symmetric.map(QRectF(rect).center()) == QRectF(rect).center(), "Shift Alt crossing keeps ratio and centre with both axes reflected");
+    const auto zero = SelHandles::resizeTransform(rect,SelHandles::Handle::Right,QPointF(19,35),Qt::NoModifier);
+    CHECK(zero.isInvertible(), "crossing exact anchor never creates singular transform");
+
+    // Real asymmetric pixel fixture distinguishes a flip from normalization.
+    Document flipped(100,80);
+    flipped.activeLayer()->clear(Qt::transparent);
+    { QPainter p(&flipped.activeLayer()->image()); p.fillRect(40,20,20,30,Qt::red); p.fillRect(60,20,20,30,Qt::blue); }
+    flipped.selection().selectRect(QRect(40,20,40,30));
+    CanvasWidget flipCanvas; flipCanvas.setDocument(&flipped);
+    strokeTool(&tool,flipCanvas,QPointF(79,35),QPointF(-1,35));
+    CHECK(flipped.floatingPixelSession() && flipped.floatingPixelSession()->transform().m11() == -1
+          && flipped.flatten().pixelColor(5,30) == QColor(Qt::blue)
+          && flipped.flatten().pixelColor(35,30) == QColor(Qt::red), "real nub crossing flips artwork rather than normalizing it");
+    const QImage reflected = flipped.flatten();
+    flipped.history().undo();
+    CHECK(!flipped.floatingPixelSession() && flipped.flatten().pixelColor(45,30) == QColor(Qt::red), "undo flip restores ordinary selection");
+    flipped.history().redo();
+    CHECK(flipped.flatten() == reflected, "redo flip restores reflected pixels");
+    CHECK(flipped.cropToSelection(), "crop migrated flipped selection");
+    flipped.history().undo();
+    CHECK(flipped.floatingPixelSession(), "Undo Crop restores migrated selection session");
+
+    for (QPoint offset : {QPoint(-5,4),QPoint(6,-3)}) {
+        Document ordinary(60,50), independent(60,50);
+        ordinary.activeLayer()->clear(QColor(80,120,200,128));
+        ordinary.activeLayer()->setOffset(offset);
+        QImage mask(60,50,QImage::Format_Grayscale8); mask.fill(0);
+        for (int y=10;y<30;++y)
+            for (int x=10;x<40;++x) mask.scanLine(y)[x] = x==10 ? 128 : 255;
+        mask.scanLine(15)[15] = 0;
+        ordinary.selection().setMaskImage(mask);
+        const QImage before = ordinary.flatten();
+        CHECK(ordinary.prepareFloatingPixelGesture(), "ordinary fractional selection lifts at offset");
+        CHECK(ordinary.flatten() == before, "initial fractional lift preserves original raster exactly");
+        const QTransform initial = ordinary.floatingPixelSession()->transform();
+        const QImage source = ordinary.floatingPixelSession()->sourcePixels();
+        CHECK(ordinary.setFloatingPixelTransform(initial * QTransform::fromTranslate(100,100)), "ordinary selection moves fully off canvas");
+        CHECK(ordinary.setFloatingPixelTransform(initial), "ordinary selection returns from off canvas");
+        CHECK(ordinary.flatten() == before && ordinary.selection().mask() == mask
+              && ordinary.floatingPixelSession()->sourcePixels().cacheKey() == source.cacheKey(), "round trip restores fractional mask source and transparent pixels without resampling");
+        CHECK(!independent.floatingPixelSession() && independent.flatten().pixelColor(20,20) == QColor(Qt::white), "ordinary sessions remain document independent");
+    }
+    Document nudged(60,50);
+    nudged.selection().selectRect(QRect(10,10,30,20));
+    CanvasWidget nudgeCanvas; nudgeCanvas.setDocument(&nudged);
+    QKeyEvent key(QEvent::KeyPress,Qt::Key_Right,Qt::ControlModifier);
+    tool.keyPressEvent(&key,nudgeCanvas);
+    CHECK(nudged.floatingPixelSession() && nudged.selection().boundingRect() == QRect(20,10,30,20), "Ctrl arrow lifts ordinary selection and nudges ten pixels");
+    nudged.history().undo();
+    CHECK(!nudged.floatingPixelSession() && nudged.selection().boundingRect() == QRect(10,10,30,20), "undo keyboard lift restores ordinary selection");
+}
+
+static void filteredFloatingRegression() {
+    SECTION("Filtered floating sampling keeps colour alpha and geometry independent");
+    using Sampling=FloatingPixelSession::Sampling;
+    auto layer=std::make_shared<Layer>(10,10);
+    layer->clear(Qt::transparent);
+    QImage source(4,4,QImage::Format_ARGB32_Premultiplied);
+    QImage mask(4,4,QImage::Format_Grayscale8); mask.fill(255);
+    for (int y=0;y<4;++y) for (int x=0;x<4;++x)
+        source.setPixelColor(x,y,x==2 ? Qt::white : Qt::black);
+    for (Sampling mode:{Sampling::Nearest,Sampling::Bilinear,Sampling::Bicubic}) {
+        auto session=FloatingPixelSession::create(layer,source,mask,QPoint(),mode);
+        CHECK(session && session->setTransform(QTransform::fromTranslate(0.5,0)), "filtered half-pixel fixture initializes");
+        const QRgb pixel=session->render(QRect(2,1,1,1)).pixel(0,0);
+        const int expected=mode==Sampling::Nearest ? 255 : mode==Sampling::Bilinear ? 128 : 143;
+        CHECK(qRed(pixel)==expected && qGreen(pixel)==expected && qAlpha(pixel)==255, "sampling matches independent nearest bilinear and Catmull-Rom midpoint values");
+        CHECK(session->renderScaled(QRect(2,1,1,1),QSize(1,1)).pixel(0,0)==pixel, "thumbnail samples the same filtered pixel centre");
+        CHECK(session->sourcePixels()==source && session->sourceCoverage()==mask, "filter leaves original pixels and coverage immutable");
+        session->setTransform(QTransform::fromTranslate(2,3));
+        auto nearest=FloatingPixelSession::create(layer,source,mask,QPoint(2,3));
+        CHECK(session->render(QRect(0,0,10,10))==nearest->render(QRect(0,0,10,10)), "integer movement remains byte-exact in every mode");
+        session->setTransform(QTransform::fromScale(2,2));
+        const QImage grown=session->render(QRect(-1,-1,10,10));
+        bool opaque=true;
+        for (int y=-1;y<9;++y) for (int x=-1;x<9;++x)
+            opaque &= qAlpha(grown.pixel(x+1,y+1))==(x>=0 && y>=0 && x<8 && y<8 ? 255 : 0);
+        CHECK(opaque, "integer enlargement of an opaque rectangle introduces no translucent border or halo");
+    }
+    source.fill(Qt::red);
+    for (int y=0;y<4;++y) { source.setPixelColor(2,y,Qt::blue); mask.scanLine(y)[2]=0; }
+    auto selected=FloatingPixelSession::create(layer,source,mask,QPoint(),Sampling::Bilinear);
+    selected->setTransform(QTransform::fromTranslate(0.5,0));
+    const QRgb edge=selected->render(QRect(2,1,1,1)).pixel(0,0);
+    CHECK(qRed(edge)==128 && qBlue(edge)==0 && qAlpha(edge)==128, "unselected blue cannot bleed into a half-covered red boundary");
+    mask.fill(255);
+    for (int y=0;y<4;++y) source.setPixel(2,y,0);
+    auto transparent=FloatingPixelSession::create(layer,source,mask,QPoint(),Sampling::Bilinear);
+    transparent->setTransform(QTransform::fromTranslate(0.5,0));
+    CHECK(transparent->renderCoverage(QRect(2,1,1,1)).constScanLine(0)[0]==255
+          && transparent->render(QRect(2,1,1,1)).pixel(0,0)==edge, "source transparency and selection coverage produce the same colour but retain distinct geometry");
+
+    for (Sampling mode:{Sampling::Bilinear,Sampling::Bicubic}) {
+        QImage red(1,1,QImage::Format_ARGB32_Premultiplied); red.fill(Qt::red);
+        QImage selected(1,1,QImage::Format_Grayscale8); selected.fill(255);
+        auto diamond=FloatingPixelSession::create(layer,red,selected,QPoint(),mode);
+        diamond->setTransform(QTransform(1,1,-1,1,1,0));
+        const QImage rotated=diamond->render(QRect(0,0,2,2));
+        CHECK(qAlpha(rotated.pixel(0,0))==128 && qAlpha(rotated.pixel(1,0))==128
+              && qAlpha(rotated.pixel(0,1))==128 && qAlpha(rotated.pixel(1,1))==128,
+              "rotated diamond has exact half-pixel geometric coverage at all four corners");
+        QImage odd(3,3,QImage::Format_ARGB32_Premultiplied); odd.fill(Qt::red);
+        QImage oddMask(3,3,QImage::Format_Grayscale8); oddMask.fill(255);
+        auto partial=FloatingPixelSession::create(layer,odd,oddMask,QPoint(),mode);
+        partial->setTransform(QTransform::fromScale(0.25,0.25));
+        CHECK(qAlpha(partial->render(QRect(0,0,1,1)).pixel(0,0))==143,
+              "odd-sized reduction applies geometric area once rather than twice");
+        QImage checker(8,8,QImage::Format_ARGB32_Premultiplied);
+        QImage coverage(8,8,QImage::Format_Grayscale8); coverage.fill(255);
+        for (int y=0;y<8;++y) for (int x=0;x<8;++x) checker.setPixelColor(x,y,(x+y)%2 ? Qt::white : Qt::black);
+        auto reduced=FloatingPixelSession::create(layer,checker,coverage,QPoint(),mode);
+        reduced->setTransform(QTransform::fromScale(0.125,0.125));
+        auto &cache=FloatingRenderCache::shared(); cache.clear();
+        CHECK(!reduced->renderScaled(QRect(0,0,1,1),QSize(1,1)).isNull() && cache.stats().entries==0,
+              "bounded thumbnail never builds full-source reduction levels");
+        CHECK(reduced->renderCoverage(QRect(100,100,1,1)).constScanLine(0)[0]==0 && cache.stats().entries==0,
+              "off-canvas coverage skips reduction processing");
+        const QRgb pixel=reduced->render(QRect(0,0,1,1)).pixel(0,0);
+        CHECK(qRed(pixel)==128 && qAlpha(pixel)==255, "strong reduction averages checkerboard instead of aliasing to one colour");
+        const auto stats=FloatingRenderCache::shared().stats();
+        CHECK(stats.costKiB<=stats.limitKiB, "reduction pyramid shares the existing bounded raster cache");
+    }
+
+    SECTION("Sampling policy history cache native roundtrip and finite-domain invalidation");
+    Document doc(340,280);
+    doc.activeLayer()->clear(QColor(50,120,200,160));
+    QImage pixels(309,271,QImage::Format_ARGB32_Premultiplied);
+    pixels.fill(QColor(200,40,80,100)); pixels.setPixel(10,10,0);
+    QImage geometry(pixels.size(),QImage::Format_Grayscale8); geometry.fill(255);
+    for (int y=0;y<geometry.height();++y) for (int x=0;x<geometry.width();++x)
+        if ((x+y)%7==0) geometry.scanLine(y)[x]=0;
+    CHECK(doc.pasteFloatingPixels(pixels,geometry,QPoint(),false,QSize(),Sampling::Nearest), "sampling history fixture initializes");
+    CHECK(doc.setFloatingPixelTransform(QTransform().rotate(13)*QTransform::fromTranslate(-12.25,17.5)), "sampling fixture crosses tile and canvas edges");
+    const QImage immutable=doc.floatingPixelSession()->sourcePixels();
+    QTemporaryDir directory;
+    for (Sampling mode:{Sampling::Bilinear,Sampling::Bicubic,Sampling::Nearest}) {
+        const QImage before=doc.flatten();
+        const Sampling previous=doc.floatingPixelSession()->sampling();
+        QRegion dirty;
+        const auto connection=QObject::connect(&doc,&Document::floatingPixelsChanged,&doc,[&](const QRegion &area){ dirty+=area; });
+        CHECK(doc.setFloatingSampling(mode), "change live sampling mode");
+        QImage patched=before;
+        { QPainter p(&patched); p.setCompositionMode(QPainter::CompositionMode_Source);
+          for (const QRect &area:dirty) p.drawImage(area.topLeft(),doc.flattenVisible(area)); }
+        CHECK(patched==doc.flatten(), "sampling mode invalidates both old and new edge footprints");
+        QObject::disconnect(connection);
+        const auto *session=doc.floatingPixelSession();
+        CHECK(session->sourcePixels().cacheKey()==immutable.cacheKey(), "changing mode reuses immutable source");
+        CHECK(doc.selection().mask()==session->renderCoverage(QRect(QPoint(),doc.size())), "cached filtered mask agrees with direct coverage");
+        for (BlendMode blend:{BlendMode::Normal,BlendMode::Multiply,BlendMode::Overwrite}) {
+            doc.activeLayer()->setBlendMode(blend);
+            doc.activeLayer()->setOpacity(0.6f);
+            auto effective=doc.snapshotEffectiveLayers(); std::vector<Layer> layers;
+            for (const auto &l:effective) layers.push_back(*l);
+            CHECK(doc.flatten()==Document::compositeLayers(layers,doc.size()), "cached filtered tiles agree with materialized layer composition");
+        }
+        const QString path=directory.filePath("sampling.psw");
+        CHECK(doc.saveNative(path), "save filtered native session");
+        Document reopened(path);
+        CHECK(reopened.floatingPixelSession() && reopened.floatingPixelSession()->sampling()==mode
+              && reopened.flatten()==doc.flatten() && reopened.selection().mask()==doc.selection().mask(), "native reopen preserves mode filtered pixels and independent geometry");
+        doc.history().undo();
+        CHECK(doc.floatingPixelSession()->sampling()==previous, "undo restores preceding sampling mode");
+        doc.history().redo();
+        CHECK(doc.floatingPixelSession()->sampling()==mode, "redo restores sampling mode");
+    }
+    const int history=doc.history().currentIndex();
+    CHECK(!doc.setFloatingSampling(static_cast<Sampling>(99)) && doc.history().currentIndex()==history, "invalid sampling policy is a history-preserving no-op");
+    doc.activeLayer()->setLocked(true);
+    CHECK(!doc.setFloatingSampling(Sampling::Bilinear) && doc.floatingPixelSession()->sampling()==Sampling::Nearest
+          && doc.history().currentIndex()==history, "locked target rejects appearance-changing sampling edits");
+    doc.activeLayer()->setLocked(false);
+    CHECK(!FloatingPixelSession::create(layer,source,mask,QPoint(),static_cast<Sampling>(99)), "invalid sampler cannot initialize a session");
+    CHECK(doc.setFloatingSampling(Sampling::Bicubic), "prepare serialized policy validation fixture");
+    const QString corrupt=directory.filePath("invalid-sampling.psw");
+    CHECK(doc.saveNative(corrupt), "save policy validation fixture");
+    { QFile file(corrupt); CHECK(file.open(QIODevice::ReadWrite) && file.seek(file.size()-4), "open serialized policy field");
+      QDataStream out(&file); out.setVersion(QDataStream::Qt_6_0); out << qint32(99); }
+    Document unchanged(3,2);
+    CHECK(!unchanged.loadNative(corrupt) && unchanged.size()==QSize(3,2)
+          && unchanged.flatten().pixelColor(0,0)==QColor(Qt::white), "invalid native sampling metadata is rejected atomically");
+    CHECK(doc.setFloatingSampling(Sampling::Bicubic) && doc.suspendFloatingPixels(), "filtered context can be suspended");
+    const QImage suspended=doc.flatten();
+    CHECK(doc.setFloatingSampling(Sampling::Bilinear) && doc.flatten()==suspended, "changing mode at a context boundary preserves its exact lift pose");
+    CHECK(doc.cropToSelection(), "crop filtered selection");
+    doc.history().undo();
+    CHECK(doc.floatingPixelSession(), "undo filtered crop restores editable session");
 }
 
 static void retainedExpansionRegression() {
@@ -713,6 +1130,9 @@ int main(int argc, char **argv) {
     }
     resizeStraightAlphaCharacterization();
     retainedCropRegression();
+    maskedCropRegression();
+    advancedFloatingControlsRegression();
+    filteredFloatingRegression();
     retainedExpansionRegression();
     pasteExpansionBoundsRegression();
     retainedOrthogonalRegression();
@@ -2206,7 +2626,7 @@ int main(int argc, char **argv) {
         MoveTool move;
         strokeTool(&move, canvas, QPointF(10, 10), QPointF(30, 10));          // drag selection +20 in x
 
-        QImage &out = doc.activeLayer()->image();
+        const QImage out = doc.flatten();
         CHECK(out.pixelColor(30, 10).red() > 200, "selected pixels appear at the new location");
         CHECK(out.pixelColor(10, 10).alpha() < 10, "original selected area is now a transparent hole");
         CHECK(out.pixelColor(35, 35).blue() > 200, "unselected pixels elsewhere did NOT move");
@@ -2804,7 +3224,7 @@ int main(int argc, char **argv) {
             tool.mouseMoveEvent(to, &e2, canvas);
             QMouseEvent e3(QEvent::MouseButtonRelease, to, to, Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
             tool.mouseReleaseEvent(to, &e3, canvas);
-            return redBounds(doc.activeLayer()->image());
+            return redBounds(doc.flatten());
         };
         auto near = [](int a, int b) { return std::abs(a - b) <= 3; };
 
@@ -2817,7 +3237,7 @@ int main(int argc, char **argv) {
         r = dragRed(QPointF(99, 70), QPointF(159, 70));
         CHECK(near(r.width(), 120) && near(r.height(), 60), "right handle stretches width only");
         // Pressing away from any handle must still move, not resize.
-        r = dragRed(QPointF(70, 70), QPointF(100, 100));
+        r = dragRed(QPointF(60, 70), QPointF(90, 100));
         CHECK(near(r.width(), 60) && near(r.height(), 60) && near(r.x(), 70) && near(r.y(), 70),
               "pressing inside still moves the artwork unscaled");
     }
@@ -2834,7 +3254,7 @@ int main(int argc, char **argv) {
         canvas.setZoom(1.0);
 
         auto redRect = [&]() {
-            const QImage &img = doc.activeLayer()->image();
+            const QImage img = doc.flatten();
             int x0 = INT_MAX, y0 = INT_MAX, x1 = -1, y1 = -1;
             for (int y = 0; y < img.height(); ++y)
                 for (int x = 0; x < img.width(); ++x) {
@@ -2913,7 +3333,7 @@ int main(int argc, char **argv) {
             Document doc(200, 200);
             build(doc);
             drag(doc, QPointF(99, 99), QPointF(69, 69));
-            const QRect blue = colourBounds(doc.layerAt(1)->image(), Qt::blue);
+            const QRect blue = colourBounds(doc.snapshotEffectiveLayers()[1]->image(), Qt::blue);
             const QRect red = colourBounds(doc.layerAt(0)->image(), Qt::red);
             CHECK(blue.width() < 40 && blue.height() < 40, "resize scales the SELECTED layer");
             CHECK(red == QRect(40, 40, 60, 60), "resize leaves the other layer untouched");
@@ -2921,8 +3341,8 @@ int main(int argc, char **argv) {
         {   // plain move
             Document doc(200, 200);
             build(doc);
-            drag(doc, QPointF(70, 70), QPointF(100, 100));
-            const QRect blue = colourBounds(doc.layerAt(1)->image(), Qt::blue);
+            drag(doc, QPointF(60, 70), QPointF(90, 100));
+            const QRect blue = colourBounds(doc.snapshotEffectiveLayers()[1]->image(), Qt::blue);
             const QRect red = colourBounds(doc.layerAt(0)->image(), Qt::red);
             CHECK(blue.x() > 55, "move shifts the SELECTED layer");
             CHECK(red == QRect(40, 40, 60, 60), "move leaves the other layer untouched");
@@ -2968,7 +3388,7 @@ int main(int argc, char **argv) {
         QMouseEvent r2(QEvent::MouseButtonRelease, c, c, Qt::RightButton, Qt::NoButton, Qt::NoModifier);
         brush.mouseReleaseEvent(c, &r2, canvas);
 
-        const QImage &img = doc.activeLayer()->image();
+        const QImage img = doc.flatten();
         // First half = primary (black); the segment must actually be painted.
         CHECK(qGray(img.pixel(20, 32)) < 120, "first half painted in the primary colour");
         // Second half painted (no gap) AND in the SECONDARY colour — the button
@@ -3060,14 +3480,14 @@ int main(int argc, char **argv) {
             doc.selection().selectRect(QRect(40, 40, 40, 40));
             CanvasWidget canvas; canvas.setDocument(&doc); canvas.setZoom(1.0);
             MoveTool tool;
-            const QPointF from(60, 60), to(160, 160);   // press inside, drag far away
+            const QPointF from(52, 60), to(152, 160);   // press inside, drag far away
             QMouseEvent e1(QEvent::MouseButtonPress, from, from, Qt::LeftButton, Qt::LeftButton, Qt::ControlModifier);
             tool.mousePressEvent(from, &e1, canvas);
             QMouseEvent e2(QEvent::MouseMove, to, to, Qt::NoButton, Qt::LeftButton, Qt::ControlModifier);
             tool.mouseMoveEvent(to, &e2, canvas);
             QMouseEvent e3(QEvent::MouseButtonRelease, to, to, Qt::LeftButton, Qt::NoButton, Qt::ControlModifier);
             tool.mouseReleaseEvent(to, &e3, canvas);
-            const QImage &img = doc.activeLayer()->image();
+            const QImage img = doc.flatten();
             CHECK(img.pixelColor(60, 60).red() > 150, "Ctrl-move leaves the original pixels in place");
             CHECK(img.pixelColor(160, 160).red() > 150, "Ctrl-move drops a copy at the new spot");
         }
@@ -3088,7 +3508,7 @@ int main(int argc, char **argv) {
             tool.mouseMoveEvent(to, &e2, canvas);
             QMouseEvent e3(QEvent::MouseButtonRelease, to, to, Qt::LeftButton, Qt::NoButton, Qt::ShiftModifier);
             tool.mouseReleaseEvent(to, &e3, canvas);
-            const QRect r = redBounds(doc.activeLayer()->image());
+            const QRect r = redBounds(doc.flatten());
             CHECK(near(r.width(), r.height()), "Shift-resize keeps the aspect ratio square");
         }
 
@@ -3109,7 +3529,7 @@ int main(int argc, char **argv) {
             tool.mouseMoveEvent(to, &e2, canvas);
             QMouseEvent e3(QEvent::MouseButtonRelease, to, to, Qt::LeftButton, Qt::NoButton, Qt::AltModifier);
             tool.mouseReleaseEvent(to, &e3, canvas);
-            const QRect r = redBounds(doc.activeLayer()->image());
+            const QRect r = redBounds(doc.flatten());
             CHECK(r.left() < 60, "Alt-resize also moves the opposite (left) edge outward");
             CHECK(near(r.center().x(), centreBefore.x()), "Alt-resize keeps the centre fixed");
         }
@@ -3121,8 +3541,8 @@ int main(int argc, char **argv) {
             doc.activeLayer()->clear(Qt::white);
             { QPainter p(&doc.activeLayer()->image()); p.fillRect(QRect(60, 90, 80, 20), Qt::red); }
             doc.selection().selectRect(QRect(60, 90, 80, 20));
-            const QRect before = redBounds(doc.activeLayer()->image());
-            const int redBefore = countRed(doc.activeLayer()->image());
+            const QRect before = redBounds(doc.flatten());
+            const int redBefore = countRed(doc.flatten());
             CanvasWidget canvas; canvas.setDocument(&doc); canvas.setZoom(1.0);
             MoveTool tool;
             const QPointF c = QRectF(QRect(60, 90, 80, 20)).center();
@@ -3134,10 +3554,10 @@ int main(int argc, char **argv) {
             tool.mouseMoveEvent(to, &e2, canvas);
             QMouseEvent e3(QEvent::MouseButtonRelease, to, to, Qt::RightButton, Qt::NoButton, Qt::NoModifier);
             tool.mouseReleaseEvent(to, &e3, canvas);
-            const QRect after = redBounds(doc.activeLayer()->image());
+            const QRect after = redBounds(doc.flatten());
             CHECK(before.width() > before.height(), "sanity: started wide");
             CHECK(after.height() > after.width(), "rotation turns the wide box tall");
-            CHECK(std::abs(countRed(doc.activeLayer()->image()) - redBefore) < redBefore / 2,
+            CHECK(std::abs(countRed(doc.flatten()) - redBefore) < redBefore / 2,
                   "rotation preserves roughly the same amount of content");
             CHECK(doc.history().canUndo(), "a rotation is undoable");
         }
@@ -4593,7 +5013,7 @@ int main(int argc, char **argv) {
             source.setPixel(0, 0, 0);
             QImage coverage(7, 5, QImage::Format_Grayscale8); coverage.fill(255);
             if (!fullCoverage) { coverage.scanLine(0)[0] = 100; coverage.scanLine(2)[3] = 0; }
-            CHECK(doc.pasteFloatingPixels(source, coverage, QPoint(28, 20)), "regional fixture starts live");
+            CHECK(doc.pasteFloatingPixels(source, coverage, QPoint(28, 20),false,QSize(),FloatingPixelSession::Sampling::Nearest), "regional fixture starts live");
             QRegion dirty; int notifications = 0;
             QObject::connect(&doc, &Document::floatingPixelsChanged, &doc, [&](const QRegion &area) { dirty = area; ++notifications; });
             for (const QTransform transform : {QTransform::fromTranslate(29, 21), QTransform::fromTranslate(-3, -2),
@@ -4730,6 +5150,74 @@ int main(int argc, char **argv) {
         const QImage before = doc.flatten(); const auto beforeStats = cache.stats();
         CHECK(!doc.setFloatingPixelTransform(QTransform::fromScale(0, 1)) && doc.flatten() == before
               && cache.stats().misses == beforeStats.misses, "invalid transforms do not corrupt or invalidate good samples");
+    }
+
+    SECTION("Stage 6 structural lifecycle preserves session target identity");
+    {
+        Document doc(80,60);
+        doc.addLayer("Target");
+        QImage pixels(12,10,QImage::Format_ARGB32_Premultiplied); pixels.fill(Qt::red);
+        QImage mask(pixels.size(),QImage::Format_Grayscale8); mask.fill(128);
+        CHECK(doc.pasteFloatingPixels(pixels,mask,QPoint(20,15)), "soft source starts editable");
+        auto *target = doc.activeLayer();
+        doc.moveLayer(1,0);
+        CHECK(doc.floatingPixelSession()->targets(target) && !doc.floatingPixelSession()->isSuspended(),
+              "reorder retains source ownership by layer identity");
+        doc.history().undo();
+        CHECK(doc.floatingPixelSession()->targets(doc.layerAt(1)), "undo reorder preserves target");
+        doc.duplicateLayer(1);
+        CHECK(doc.floatingPixelSession()->isSuspended(), "duplicate materializes source before copying");
+        CHECK(doc.layerAt(1)->image() == doc.layerAt(2)->image(), "duplicate captures effective source");
+        doc.history().undo(); doc.history().undo();
+        CHECK(doc.floatingPixelSession() && !doc.floatingPixelSession()->isSuspended(),
+              "undo duplicate and Finish restores uninterrupted source");
+        doc.removeLayer(1);
+        CHECK(!doc.floatingPixelSession(), "remove target finishes before releasing layer");
+        doc.history().undo(); doc.history().undo();
+        CHECK(doc.floatingPixelSession() && doc.floatingPixelSession()->targets(doc.layerAt(1)),
+              "undo removal and Finish rebinds editable target");
+    }
+
+    SECTION("Stage 6 distant extent rejection is atomic");
+    {
+        Document doc(32,24);
+        QImage pixels(4,4,QImage::Format_ARGB32_Premultiplied); pixels.fill(Qt::green);
+        QImage mask(pixels.size(),QImage::Format_Grayscale8); mask.fill(255);
+        CHECK(doc.pasteFloatingPixels(pixels,mask,QPoint()), "extent fixture starts");
+        CHECK(doc.setFloatingPixelTransform(QTransform::fromTranslate(1e12,1e12)),
+              "off-canvas preview clips without allocating a giant bridge");
+        const QImage stored = doc.activeLayer()->image();
+        const int index = doc.history().currentIndex();
+        CHECK(!doc.finishFloatingPixels() && doc.floatingPixelSession()
+              && doc.activeLayer()->image() == stored && doc.history().currentIndex() == index,
+              "unrepresentable materialization fails without discarding pixels source or history");
+        CHECK(doc.setFloatingPixelTransform(QTransform::fromTranslate(5,6)) && doc.finishFloatingPixels(),
+              "rejected materialization leaves source recoverable by moving back");
+    }
+
+    SECTION("Copied placement preserves coordinates and follows the viewport direction");
+    {
+        ClipboardPixels clip;
+        clip.pixels = QImage(20,20,QImage::Format_ARGB32_Premultiplied);
+        const QSize canvas(1000,800);
+        const QRectF view(200,200,200,200);
+        clip.sourceOrigin = QPoint(240,260);
+        CHECK(clip.pasteOrigin(view,canvas) == clip.sourceOrigin, "visible copied coordinates are retained");
+        clip.sourceOrigin = QPoint(190,240);
+        CHECK(clip.pasteOrigin(view,canvas) == clip.sourceOrigin, "partly visible sample retains coordinates");
+        clip.sourceOrigin = QPoint(90,90);
+        CHECK(clip.pasteOrigin(view,canvas) == QPoint(200,200), "diagonal sample meets nearest inset corner along centre ray");
+        clip.sourceOrigin = QPoint(90,240);
+        CHECK(clip.pasteOrigin(view,canvas) == QPoint(200,268), "left edge placement preserves diagonal direction");
+        clip.sourceOrigin = QPoint(490,290);
+        CHECK(clip.pasteOrigin(view,canvas) == QPoint(380,290), "right edge fits whole sample");
+        clip.sourceOrigin = QPoint(290,490);
+        CHECK(clip.pasteOrigin(view,canvas) == QPoint(290,380), "bottom edge fits whole sample");
+        clip.sourceOrigin = QPoint(900,700);
+        CHECK(clip.pasteOrigin(QRectF(0,0,1000,800),canvas) == clip.sourceOrigin, "full view preserves source position");
+        CHECK(clip.pasteOrigin(QRectF(0,0,40,30),QSize(40,30)) == QPoint(16,10), "smaller destination follows direction within canvas");
+        clip.pixels = QImage(250,250,QImage::Format_ARGB32_Premultiplied);
+        CHECK(clip.pasteOrigin(view,canvas) == QPoint(175,175), "sample larger than viewport centres without shrinking");
     }
 
     // ---------- RESULT ----------

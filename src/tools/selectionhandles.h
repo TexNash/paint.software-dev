@@ -22,6 +22,7 @@ enum class Handle { None, TopLeft, Top, TopRight, Right, BottomRight, Bottom, Bo
 // of a small selection met in the middle and swallowed every press, leaving no
 // way to drag the selection itself.
 double radius(const QRect &rect, double zoom);
+double pivotRadius(const QRect &rect, double zoom);
 
 // The handle under `canvasPos`, or None. Drawing and hit-testing share radius(),
 // so the handle you see is the handle you can grab.
@@ -37,6 +38,11 @@ QRect resized(const QRect &rect, Handle handle, const QPointF &canvasPos);
 // so the un-modified drag keeps its exact pixel-for-pixel behaviour.
 QRect resized(const QRect &rect, Handle handle, const QPointF &canvasPos,
               Qt::KeyboardModifiers mods);
+
+// Signed resize: preserves reflection when a nub crosses its anchor. Unlike a
+// normalized QRect, this transform retains the orientation of both axes.
+QTransform resizeTransform(const QRect &rect, Handle handle, const QPointF &canvasPos,
+                           Qt::KeyboardModifiers mods);
 
 // True when `canvasPos` sits in the rotation "corridor": just outside the
 // bounding box (past the resize handles) but within a screen-space band of it.

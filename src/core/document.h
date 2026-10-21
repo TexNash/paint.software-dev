@@ -59,6 +59,8 @@ public:
 
     // Undoable structural operations
     void cropTo(const QRect &rect);
+    // Mask-aware UI crop. Floating content retains a separate Finish checkpoint.
+    bool cropToSelection();
     // Whole-image geometric transforms: rotate every layer and (for 90°/270°)
     // swap the document dimensions. quarterTurns is clockwise 90° steps.
     void rotate(int quarterTurns, const QString &description);
@@ -87,18 +89,22 @@ public:
     // Atomic, undoable paste initialization. Placement/canvas decisions are made
     // by the caller. A previous session is materialized in the same history entry.
     bool pasteFloatingPixels(const QImage &source, const QImage &coverage, QPoint origin,
-                             bool intoNewLayer = false, QSize canvasSize = QSize());
+                             bool intoNewLayer = false, QSize canvasSize = QSize(),
+                             FloatingPixelSession::Sampling sampling = FloatingPixelSession::Sampling::Bicubic);
     // Read-only access ensures transform previews cannot bypass cache invalidation.
     const FloatingPixelSession *floatingPixelSession() const;
     // Preview an absolute transform and synchronize visible selection coverage.
     // History callers capture before a gesture and after its final preview.
     bool setFloatingPixelTransform(const QTransform &transform);
+    bool setFloatingSampling(FloatingPixelSession::Sampling sampling);
+    bool setFloatingRotationPivot(QPointF documentPoint);
     // Context changes materialize pixels but preserve selection/editing intent.
     bool suspendFloatingPixels(bool recordHistory = true);
     bool finishFloatingPixels(bool clearSelection = true);
-    // Prepare a source from the current active layer after suspension, or a copy.
+    // Lift an ordinary selection, resume after suspension, or prepare a copy.
     // Caller owns the gesture's before/after history checkpoint.
-    bool prepareFloatingPixelGesture(bool copy = false);
+    bool prepareFloatingPixelGesture(bool copy = false,
+        FloatingPixelSession::Sampling sampling = FloatingPixelSession::Sampling::Bicubic);
     // Releases temporary state only; never rolls back or commits layer pixels.
     // Required before starting another session, including after target removal.
     void discardFloatingPixelSession();

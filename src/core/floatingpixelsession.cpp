@@ -45,9 +45,19 @@ bool FloatingPixelSession::setTransform(const QTransform &transform) {
     for (double value : {inverse.m11(), inverse.m12(), inverse.m21(),
                          inverse.m22(), inverse.dx(), inverse.dy()})
         if (!std::isfinite(value)) return false;
+    const QRectF bounds = transform.mapRect(QRectF(QPointF(), m_source.size()))
+                              .united(QRectF(m_baseOffset, m_base.size()));
+    for (double value : {bounds.x(), bounds.y(), bounds.width(), bounds.height(),
+                         bounds.right(), bounds.bottom()})
+        if (!std::isfinite(value)) return false;
     m_transform = transform;
     m_inverse = inverse;
     return true;
+}
+
+QRectF FloatingPixelSession::documentBounds() const {
+    return m_transform.mapRect(QRectF(QPointF(), m_source.size()))
+        .united(QRectF(m_baseOffset, m_base.size()));
 }
 
 bool FloatingPixelSession::sourcePoint(QPointF documentPoint, QPoint &sourcePoint) const {

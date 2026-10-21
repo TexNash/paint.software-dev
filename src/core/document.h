@@ -51,7 +51,8 @@ public:
     // Full-document snapshot support (for undo/redo of structural ops)
     std::vector<std::shared_ptr<Layer>> snapshotLayers() const;
     void restoreFromSnapshot(std::vector<std::shared_ptr<Layer>> layers,
-                             int width, int height, int activeLayer);
+                             int width, int height, int activeLayer,
+                             const FloatingPixelSession *session = nullptr, int sessionLayer = -1);
 
     // Undoable structural operations
     void cropTo(const QRect &rect);
@@ -74,15 +75,18 @@ public:
     Selection &selection() { return m_selection; }
     const Selection &selection() const { return m_selection; }
 
-    // Stage 1 infrastructure only: no UI, rendering, history or serialization hooks.
+    // Internal infrastructure: no UI activation or automatic history/serialization.
     // Captures a base snapshot; does not lift/erase pixels or mutate the selection.
     bool beginFloatingPixelSession(int layerIndex, const QImage &source,
                                    const QImage &coverage, QPoint sourceOrigin);
-    FloatingPixelSession *floatingPixelSession();
+    // Read-only access ensures transform previews cannot bypass cache invalidation.
     const FloatingPixelSession *floatingPixelSession() const;
+    // Preview an absolute transform and synchronize visible selection coverage.
+    // History callers capture before a gesture and after its final preview.
+    bool setFloatingPixelTransform(const QTransform &transform);
     // Releases temporary state only; never rolls back or commits layer pixels.
     // Required before starting another session, including after target removal.
-    void discardFloatingPixelSession() { m_floatingPixelSession.reset(); }
+    void discardFloatingPixelSession();
 
     // History
     HistoryManager &history() { return m_history; }
@@ -133,6 +137,9 @@ signals:
     void sizeChanged(int width, int height);
 
 private:
+    friend class FloatingPixelSessionCommand;
+    // Restores checkpoint state without signals; callers publish the complete state.
+    void restoreFloatingPixelSession(const FloatingPixelSession *session, int layerIndex);
     int m_width;
     int m_height;
     std::vector<std::shared_ptr<Layer>> m_layers;

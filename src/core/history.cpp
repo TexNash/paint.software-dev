@@ -3,6 +3,54 @@
 #include "layer.h"
 #include <algorithm>
 
+FloatingPixelSessionCommand::FloatingPixelSessionCommand(Document *doc, int layerIndex,
+                                                         const QString &description)
+    : m_doc(doc), m_layerIndex(layerIndex), m_description(description), m_before(capture()) {
+    if (m_before.valid) m_target = m_doc->m_layers[layerIndex];
+}
+
+FloatingPixelSessionCommand::State FloatingPixelSessionCommand::capture() const {
+    State state;
+    if (!m_doc) return state;
+    const auto *layer = m_doc->layerAt(m_layerIndex);
+    if (!layer) return state;
+    const auto *session = m_doc->floatingPixelSession();
+    // A checkpoint may start or end a session, but must not retarget one.
+    if (session && !session->targets(layer)) return state;
+    state.image = layer->image();
+    state.offset = layer->offset();
+    state.retained = layer->retainsOffCanvasPixels();
+    state.selection = m_doc->selection();
+    if (session) state.session = *session;
+    state.valid = true;
+    return state;
+}
+
+bool FloatingPixelSessionCommand::captureAfter() {
+    if (m_hasAfter || !m_before.valid || m_target.lock().get() != m_doc->layerAt(m_layerIndex)) return false;
+    State after = capture();
+    if (!after.valid) return false;
+    m_after = std::move(after);
+    m_hasAfter = true;
+    return true;
+}
+
+void FloatingPixelSessionCommand::apply(const State &state) {
+    auto *layer = m_doc->layerAt(m_layerIndex);
+    if (!state.valid || !layer) return;
+    layer->setImage(state.image);
+    layer->setOffset(state.offset);
+    layer->setRetainsOffCanvasPixels(state.retained);
+    m_doc->restoreFloatingPixelSession(state.session ? &*state.session : nullptr, m_layerIndex);
+    m_doc->selection() = state.selection;
+    m_doc->setModified(true);
+    emit m_doc->selectionChanged();
+    m_doc->notifyContentChanged();
+}
+
+void FloatingPixelSessionCommand::undo() { if (m_hasAfter) apply(m_before); }
+void FloatingPixelSessionCommand::redo() { if (m_hasAfter) apply(m_after); }
+
 MultiImageEditCommand::MultiImageEditCommand(Document *doc, std::vector<ImageEditState> edits, QString description)
     : m_doc(doc), m_edits(std::move(edits)), m_description(std::move(description)) {}
 void MultiImageEditCommand::apply(bool after) {
@@ -101,6 +149,11 @@ DocumentSnapshotCommand::State DocumentSnapshotCommand::capture(Document *doc) {
     s.activeLayer = doc->activeLayerIndex();
     s.layers = doc->snapshotLayers();
     s.selection = doc->selection();
+    if (const auto *session = doc->floatingPixelSession()) {
+        s.session = *session;
+        for (int i = 0; i < doc->layerCount(); ++i)
+            if (session->targets(doc->layerAt(i))) { s.sessionLayer = i; break; }
+    }
     return s;
 }
 
@@ -109,7 +162,8 @@ void DocumentSnapshotCommand::restore(Document *doc, const State &state) {
     copy.reserve(state.layers.size());
     for (const auto &l : state.layers)
         copy.push_back(std::make_shared<Layer>(*l));
-    doc->restoreFromSnapshot(std::move(copy), state.width, state.height, state.activeLayer);
+    doc->restoreFromSnapshot(std::move(copy), state.width, state.height, state.activeLayer,
+                             state.session ? &*state.session : nullptr, state.sessionLayer);
     doc->selection() = state.selection;
     emit doc->selectionChanged();
 }

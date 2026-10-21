@@ -31,6 +31,7 @@ bool Document::beginFloatingPixelSession(int layerIndex, const QImage &source,
     auto session = FloatingPixelSession::create(m_layers[layerIndex], source, coverage, sourceOrigin);
     if (!session) return false;
     m_floatingPixelSession = std::move(session);
+    emit documentChanged();
     return true;
 }
 
@@ -41,8 +42,33 @@ const FloatingPixelSession *Document::floatingPixelSession() const {
     return nullptr;
 }
 
-FloatingPixelSession *Document::floatingPixelSession() {
-    return const_cast<FloatingPixelSession *>(static_cast<const Document *>(this)->floatingPixelSession());
+bool Document::setFloatingPixelTransform(const QTransform &transform) {
+    const auto *session = floatingPixelSession();
+    if (!session) return false;
+    FloatingPixelSession preview = *session;
+    if (!preview.setTransform(transform)) return false;
+    const QImage mask = preview.renderCoverage(QRect(QPoint(), size()));
+    if (mask.isNull()) return false;
+    *m_floatingPixelSession = std::move(preview);
+    m_selection.setMaskImage(mask);
+    emit selectionChanged();
+    emit documentChanged();
+    return true;
+}
+
+void Document::discardFloatingPixelSession() {
+    if (!m_floatingPixelSession) return;
+    m_floatingPixelSession.reset();
+    emit documentChanged();
+}
+
+void Document::restoreFloatingPixelSession(const FloatingPixelSession *session, int layerIndex) {
+    std::unique_ptr<FloatingPixelSession> restored;
+    if (session && layerIndex >= 0 && layerIndex < layerCount()) {
+        restored = std::make_unique<FloatingPixelSession>(*session);
+        restored->m_target = m_layers[layerIndex];
+    }
+    m_floatingPixelSession = std::move(restored);
 }
 
 void Document::resize(int width, int height) {
@@ -447,6 +473,7 @@ QImage Document::compositeLayers(const std::vector<Layer> &layers, QSize size) {
 }
 
 QImage Document::flatten() const {
+    if (floatingPixelSession()) return flattenVisible(QRect(QPoint(), size()));
     QImage result(m_width, m_height, QImage::Format_ARGB32_Premultiplied);
     result.fill(Qt::transparent);
     for (const auto &layer : m_layers) {
@@ -465,8 +492,25 @@ QImage Document::flattenVisible(const QRect &region) const {
     if (tile.isEmpty()) return QImage();
     QImage result(tile.size(), QImage::Format_ARGB32_Premultiplied);
     result.fill(Qt::transparent);
+    const auto *session = floatingPixelSession();
     for (const auto &layer : m_layers) {
         if (!layer->isVisible() || layer->opacity() <= 0) continue;
+        if (session && session->targets(layer.get())) {
+            // Intersect in floating point before rounding to avoid overflowing
+            // QRect for distant transforms. Preserve the finite raster domain:
+            // Overwrite must not clear lower layers beyond these bounds.
+            const QRect effectiveRegion = session->documentBounds().intersected(QRectF(tile))
+                                              .toAlignedRect().intersected(tile);
+            if (effectiveRegion.isEmpty()) continue;
+            const QImage effective = session->render(effectiveRegion);
+            if (effective.isNull()) return {};
+            Layer part(effective);
+            part.setOffset(effectiveRegion.topLeft() - tile.topLeft());
+            part.setOpacity(layer->opacity());
+            part.setBlendMode(layer->blendMode());
+            result = part.composited(result);
+            continue;
+        }
         const QRect source = tile.translated(-layer->offset()).intersected(layer->image().rect());
         if (source.isEmpty()) continue;
         // Reuse the exact layer blend implementation, including custom modes,
@@ -646,8 +690,10 @@ std::vector<std::shared_ptr<Layer>> Document::snapshotLayers() const {
 }
 
 void Document::restoreFromSnapshot(std::vector<std::shared_ptr<Layer>> layers,
-                                   int width, int height, int activeLayer) {
+                                   int width, int height, int activeLayer,
+                                   const FloatingPixelSession *session, int sessionLayer) {
     m_layers = std::move(layers);
+    restoreFloatingPixelSession(session, sessionLayer);
     bool sizeChangedFlag = (width != m_width || height != m_height);
     m_width = width;
     m_height = height;

@@ -3838,7 +3838,7 @@ int main(int argc, char **argv) {
               "session initialization does not change history or dirty state");
         CHECK(doc.selection().mask() == selectionBefore && target->image() == layerBefore,
               "session initialization leaves selection and layer unchanged");
-        CHECK(doc.flatten() == flattenedBefore, "session is not wired into document rendering");
+        CHECK(doc.flatten() != flattenedBefore, "internal session contributes to document rendering");
         const QRect region(-2, 1, 8, 6);
         const QImage rendered = session->render(region);
         CHECK(rendered.pixel(1, 1) == 0, "fully transparent selected source clears destination");
@@ -3877,32 +3877,32 @@ int main(int argc, char **argv) {
               "raw aliases and COW getter edits cannot mutate snapshots");
 
         const QTransform initial = session->transform();
-        CHECK(session->setTransform(QTransform::fromTranslate(1000000, -1000000)),
+        CHECK(doc.setFloatingPixelTransform(QTransform::fromTranslate(1000000, -1000000)),
               "entirely off-canvas transform is accepted");
         CHECK(doc.floatingPixelSession() == session
               && session->renderCoverage(region).constScanLine(1)[1] == 0,
               "off-canvas session remains present with clipped visible coverage");
         CHECK(session->renderCoverage(QRect(1000000, -1000000, 1, 1)).constScanLine(0)[0] == 255,
               "off-canvas source geometry remains available");
-        CHECK(session->setTransform(QTransform::fromTranslate(-3, 2)), "partially clipped movement accepted");
+        CHECK(doc.setFloatingPixelTransform(QTransform::fromTranslate(-3, 2)), "partially clipped movement accepted");
         CHECK(session->renderCoverage(QRect(-2, 2, 1, 1)).constScanLine(0)[0] == 255,
               "partial off-canvas geometry maps correctly");
         QTransform rotated;
         rotated.translate(2, 2);
         rotated.rotate(90);
-        CHECK(session->setTransform(rotated), "affine rotation accepted");
+        CHECK(doc.setFloatingPixelTransform(rotated), "affine rotation accepted");
         CHECK(session->renderCoverage(QRect(1, 2, 1, 1)).constScanLine(0)[0] == 255,
               "rotation samples source geometry in document space");
-        CHECK(session->setTransform(QTransform::fromScale(2, 2)), "affine scale accepted");
+        CHECK(doc.setFloatingPixelTransform(QTransform::fromScale(2, 2)), "affine scale accepted");
         CHECK(session->renderCoverage(QRect(0, 0, 2, 2)).constScanLine(1)[1] == 255,
               "scale uses independent source coverage");
-        CHECK(session->setTransform(initial) && session->render(region) == rendered,
+        CHECK(doc.setFloatingPixelTransform(initial) && session->render(region) == rendered,
               "transform round trip renders immutable original without resampling damage");
-        CHECK(!session->setTransform(QTransform::fromScale(0, 1)), "singular transform rejected");
-        CHECK(!session->setTransform(QTransform(1, 0, 0.1, 0, 1, 0, 0, 0, 1)),
+        CHECK(!doc.setFloatingPixelTransform(QTransform::fromScale(0, 1)), "singular transform rejected");
+        CHECK(!doc.setFloatingPixelTransform(QTransform(1, 0, 0.1, 0, 1, 0, 0, 0, 1)),
               "projective transform rejected");
-        CHECK(!session->setTransform(QTransform::fromTranslate(std::numeric_limits<double>::infinity(), 0))
-              && !session->setTransform(QTransform::fromTranslate(std::numeric_limits<double>::quiet_NaN(), 0)),
+        CHECK(!doc.setFloatingPixelTransform(QTransform::fromTranslate(std::numeric_limits<double>::infinity(), 0))
+              && !doc.setFloatingPixelTransform(QTransform::fromTranslate(std::numeric_limits<double>::quiet_NaN(), 0)),
               "nonfinite transforms rejected");
         CHECK(session->transform() == initial, "invalid transforms preserve prior state");
         CHECK(session->render(QRect()).isNull() && session->renderCoverage(QRect()).isNull(),
@@ -3911,10 +3911,10 @@ int main(int argc, char **argv) {
               "second document initializes independent session with different dimensions");
         CHECK(other.floatingPixelSession() != session && other.floatingPixelSession()->transform().isIdentity(),
               "document sessions do not share mutable transform state");
-        session->setTransform(QTransform::fromTranslate(50, 60));
+        doc.setFloatingPixelTransform(QTransform::fromTranslate(50, 60));
         CHECK(other.floatingPixelSession()->transform().isIdentity(),
               "updating one document transform leaves the second unchanged");
-        session->setTransform(initial);
+        doc.setFloatingPixelTransform(initial);
         doc.addLayer("Other");
         CHECK(doc.floatingPixelSession()->targets(target), "active layer change does not retarget session");
         CHECK(!doc.beginFloatingPixelSession(1, sourceBefore, maskBefore, QPoint()),
@@ -3969,6 +3969,297 @@ int main(int argc, char **argv) {
               "transparent source with fractional geometry is valid");
         CHECK(doc.floatingPixelSession()->render(QRect(0, 0, 1, 1)).pixel(0, 0) == qRgba(127, 127, 127, 127),
               "fractionally selected transparent source attenuates destination by coverage not alpha");
+    }
+
+    SECTION("Floating session checkpoints and document history");
+    {
+        Document doc(9, 7), other(4, 4);
+        doc.activeLayer()->setOffset(QPoint(-1, 1));
+        doc.activeLayer()->setRetainsOffCanvasPixels(true);
+        doc.selection().selectRect(QRect(5, 4, 2, 2));
+        const QImage oldSelection = doc.selection().mask().copy();
+        const QImage oldRaster = doc.activeLayer()->image().copy();
+        QImage source(3, 2, QImage::Format_ARGB32_Premultiplied);
+        source.fill(QColor(210, 50, 80, 120));
+        source.setPixelColor(0, 0, Qt::transparent);
+        QImage mask(3, 2, QImage::Format_Grayscale8);
+        mask.fill(255);
+        mask.scanLine(0)[2] = 0;
+        mask.scanLine(1)[1] = 100;
+        int contentSignals = 0, selectionSignals = 0;
+        QObject::connect(&doc, &Document::documentChanged, &doc, [&]() { ++contentSignals; });
+        QObject::connect(&doc, &Document::selectionChanged, &doc, [&]() { ++selectionSignals; });
+        auto initial = std::make_unique<FloatingPixelSessionCommand>(&doc, 0, "Begin Floating Pixels");
+        CHECK(doc.beginFloatingPixelSession(0, source, mask, QPoint(1, 2)), "initialize history session");
+        CHECK(doc.setFloatingPixelTransform(doc.floatingPixelSession()->transform()),
+              "initial checkpoint synchronizes selection coverage");
+        CHECK(initial->captureAfter(), "initial checkpoint captures session creation");
+        doc.history().push(std::move(initial));
+        doc.setModified(true);
+        const QImage initialRaster = doc.flatten(), initialMask = doc.selection().mask().copy();
+        const QTransform initialTransform = doc.floatingPixelSession()->transform();
+        const uchar *immutableSource = doc.floatingPixelSession()->sourcePixels().constBits();
+        CHECK(doc.history().currentIndex() == 1, "session initialization is a distinct history operation");
+        CHECK(contentSignals >= 2 && selectionSignals == 1, "initial session invalidates canvas and selection");
+
+        auto gesture = [&](const QTransform &transform, const QString &description) {
+            auto command = std::make_unique<FloatingPixelSessionCommand>(&doc, 0, description);
+            CHECK(doc.setFloatingPixelTransform(transform), "preview transform accepted");
+            CHECK(command->captureAfter(), "gesture checkpoint captured");
+            doc.history().push(std::move(command));
+            doc.setModified(true);
+        };
+        auto move = std::make_unique<FloatingPixelSessionCommand>(&doc, 0, "Move Floating Pixels");
+        for (int x = 2; x <= 4; ++x)
+            CHECK(doc.setFloatingPixelTransform(QTransform::fromTranslate(x, 2)), "drag previews update state");
+        CHECK(doc.history().currentIndex() == 1, "drag previews do not generate history entries");
+        CHECK(move->captureAfter(), "move checkpoint captures final preview");
+        doc.history().push(std::move(move));
+        const QImage movedRaster = doc.flatten(), movedMask = doc.selection().mask().copy();
+        QTransform resized;
+        resized.translate(4, 2);
+        resized.scale(1.5, 2);
+        gesture(resized, "Scale Floating Pixels");
+        QTransform rotated = resized;
+        rotated.rotate(30);
+        gesture(rotated, "Rotate Floating Pixels");
+        const QImage finalRaster = doc.flatten(), finalMask = doc.selection().mask().copy();
+        CHECK(doc.history().currentIndex() == 4, "each completed transform has one checkpoint");
+        CHECK(doc.layerAt(0)->image() == oldRaster, "previews never alter committed target pixels");
+        doc.history().undo();
+        doc.history().undo();
+        CHECK(doc.flatten() == movedRaster && doc.selection().mask() == movedMask
+              && doc.floatingPixelSession()->transform() == QTransform::fromTranslate(4, 2),
+              "undo restores transform pixels and matching selection");
+        doc.history().redo();
+        doc.history().redo();
+        CHECK(doc.flatten() == finalRaster && doc.selection().mask() == finalMask,
+              "redo restores scale and rotation");
+        doc.history().goToIndex(0);
+        CHECK(!doc.floatingPixelSession() && doc.layerAt(0)->image() == oldRaster
+              && doc.selection().mask() == oldSelection && doc.layerAt(0)->offset() == QPoint(-1, 1)
+              && doc.layerAt(0)->retainsOffCanvasPixels(), "undo initialization restores original raster geometry and selection");
+        doc.history().goToIndex(1);
+        CHECK(doc.flatten() == initialRaster && doc.selection().mask() == initialMask
+              && doc.floatingPixelSession()->transform() == initialTransform,
+              "history navigation restores editable initial session");
+        doc.history().goToIndex(4);
+        doc.history().goToIndex(2);
+        gesture(QTransform::fromTranslate(-2, 3), "Replacement Branch");
+        CHECK(!doc.history().canRedo() && doc.history().currentIndex() == 3
+              && doc.history().undoDescription() == "Replacement Branch"
+              && doc.history().fullHistoryList().size() == 3,
+              "new checkpoint after undo discards abandoned redo branch");
+        CHECK(doc.floatingPixelSession()->sourcePixels() == source
+              && doc.floatingPixelSession()->sourceCoverage() == mask
+              && doc.floatingPixelSession()->sourcePixels().constBits() == immutableSource,
+              "history preserves immutable source pixels and independent geometry");
+        const int index = doc.history().currentIndex();
+        const QImage beforeInvalid = doc.flatten(), selectionInvalid = doc.selection().mask().copy();
+        CHECK(!doc.setFloatingPixelTransform(QTransform::fromScale(0, 1))
+              && doc.flatten() == beforeInvalid && doc.selection().mask() == selectionInvalid
+              && doc.history().currentIndex() == index, "invalid preview has no partial effects");
+        gesture(QTransform::fromTranslate(100, 100), "Off Canvas");
+        CHECK(doc.floatingPixelSession() && !doc.selection().hasSelection(),
+              "off-canvas preview preserves session independently of visible selection");
+        doc.history().undo();
+        CHECK(doc.flatten() == beforeInvalid && doc.selection().mask() == selectionInvalid,
+              "off-canvas undo restores pixels and selection");
+        CHECK(other.beginFloatingPixelSession(0, source, mask, QPoint()), "independent history document initializes");
+        const QImage otherRaster = other.flatten();
+        doc.history().goToIndex(0);
+        CHECK(other.floatingPixelSession() && other.flatten() == otherRaster,
+              "history navigation does not affect another document session");
+        doc.history().goToIndex(1);
+        doc.addLayer("Unrelated layer");
+        CHECK(doc.floatingPixelSession()->targets(doc.layerAt(0)), "active-layer switch preserves history target");
+        FloatingPixelSessionCommand wrongTarget(&doc, 1, "Wrong target");
+        CHECK(!wrongTarget.captureAfter(), "checkpoint rejects unrelated target layer");
+        FloatingPixelSessionCommand invalidIndex(&doc, -1, "Invalid target");
+        CHECK(!invalidIndex.captureAfter(), "checkpoint rejects invalid target index");
+    }
+
+    SECTION("Floating session raster checkpoints and snapshot rebinding");
+    {
+        Document doc(5, 4);
+        QImage source(2, 2, QImage::Format_ARGB32_Premultiplied);
+        source.fill(Qt::transparent);
+        QImage mask(2, 2, QImage::Format_Grayscale8);
+        mask.fill(255);
+        auto initialization = std::make_unique<FloatingPixelSessionCommand>(&doc, 0, "Initialize Checkpoint");
+        CHECK(doc.beginFloatingPixelSession(0, source, mask, QPoint(1, 1)), "raster checkpoint session initializes");
+        CHECK(doc.setFloatingPixelTransform(QTransform::fromTranslate(1, 1)), "raster checkpoint selection initializes");
+        CHECK(initialization->captureAfter(), "initialization checkpoint captured");
+        doc.history().push(std::move(initialization));
+        const QImage before = doc.flatten(), beforeSelection = doc.selection().mask().copy();
+        // Exercise reversible session -> raster state without implementing a Finish
+        // policy or hooking a user action. Stage 3 will choose that lifecycle.
+        auto raster = std::make_unique<FloatingPixelSessionCommand>(&doc, 0, "Raster Checkpoint");
+        doc.activeLayer()->setImage(doc.floatingPixelSession()->render(QRect(0, 0, 5, 4)));
+        doc.activeLayer()->setOffset(QPoint());
+        doc.activeLayer()->setRetainsOffCanvasPixels(true);
+        doc.discardFloatingPixelSession();
+        doc.selection().clear();
+        CHECK(raster->captureAfter(), "checkpoint captures raster with no session");
+        doc.history().push(std::move(raster));
+        CHECK(doc.flatten() == before && !doc.floatingPixelSession(), "materialized raster has identical appearance");
+        doc.history().undo();
+        CHECK(doc.floatingPixelSession() && doc.flatten() == before
+              && doc.selection().mask() == beforeSelection && !doc.activeLayer()->retainsOffCanvasPixels(),
+              "undo checkpoint restores session geometry and raster flags");
+        doc.history().redo();
+        CHECK(!doc.floatingPixelSession() && !doc.selection().hasSelection()
+              && doc.activeLayer()->retainsOffCanvasPixels(), "redo restores raster and absence of session");
+        doc.history().undo();
+        auto snapshot = std::make_unique<DocumentSnapshotCommand>(&doc, "Snapshot With Session");
+        doc.discardFloatingPixelSession();
+        doc.activeLayer()->clear(Qt::green);
+        snapshot->captureAfter();
+        doc.history().push(std::move(snapshot));
+        doc.history().undo();
+        CHECK(doc.floatingPixelSession() && doc.floatingPixelSession()->targets(doc.activeLayer())
+              && doc.flatten() == before && doc.selection().mask() == beforeSelection,
+              "full-document snapshot rebinds session to reconstructed layer");
+        // Walk the preceding command after snapshot restoration replaced layer objects.
+        doc.history().goToIndex(0);
+        doc.history().goToIndex(1);
+        CHECK(doc.floatingPixelSession() && doc.flatten() == before,
+              "session commands replay correctly after snapshot layer reconstruction");
+        doc.history().goToIndex(2);
+        CHECK(!doc.floatingPixelSession() && doc.flatten().pixelColor(0, 0) == QColor(Qt::green),
+              "snapshot redo clears obsolete session state");
+    }
+
+    SECTION("Floating session full and tiled layer composition");
+    {
+        Document doc(7, 5);
+        doc.activeLayer()->clear(QColor(60, 130, 180));
+        const int targetIndex = doc.addLayer("Target");
+        doc.activeLayer()->clear(QColor(200, 40, 20, 130));
+        doc.activeLayer()->setOffset(QPoint(-2, 1));
+        const int upperIndex = doc.addLayer("Upper");
+        doc.activeLayer()->clear(QColor(20, 220, 80, 90));
+        doc.activeLayer()->setOffset(QPoint(2, -1));
+        QImage source(4, 3, QImage::Format_ARGB32_Premultiplied);
+        source.fill(QColor(230, 60, 200, 110));
+        source.setPixelColor(0, 0, Qt::transparent);
+        QImage mask(4, 3, QImage::Format_Grayscale8);
+        mask.fill(255);
+        mask.scanLine(1)[1] = 0;
+        mask.scanLine(2)[2] = 100;
+        CHECK(doc.beginFloatingPixelSession(targetIndex, source, mask, QPoint(3, 1)), "middle-layer composition initializes");
+        const QImage committed = doc.layerAt(targetIndex)->image().copy();
+        const QRect canvas(QPoint(), doc.size());
+        for (BlendMode mode : {BlendMode::Normal, BlendMode::Multiply, BlendMode::Overwrite,
+                               BlendMode::Glow, BlendMode::Reflect, BlendMode::Negation, BlendMode::Xor}) {
+            doc.setLayerBlendMode(targetIndex, mode);
+            doc.setLayerOpacity(targetIndex, 0.6f);
+            std::vector<Layer> expected;
+            for (int i = 0; i < doc.layerCount(); ++i) {
+                expected.push_back(*doc.layerAt(i));
+                if (i == targetIndex) {
+                    const QRect bounds = doc.floatingPixelSession()->documentBounds()
+                                             .intersected(QRectF(canvas)).toAlignedRect();
+                    expected.back().setImage(doc.floatingPixelSession()->render(bounds));
+                    expected.back().setOffset(bounds.topLeft());
+                }
+            }
+            const QImage reference = Document::compositeLayers(expected, doc.size());
+            const QImage full = doc.flatten();
+            CHECK(full == reference && doc.flattenVisible() == full
+                  && doc.flattenVisible(canvas) == full, "effective raster uses existing layer-stack blend and opacity");
+            QImage stitched(doc.size(), QImage::Format_ARGB32_Premultiplied);
+            stitched.fill(Qt::transparent);
+            QPainter painter(&stitched);
+            painter.setCompositionMode(QPainter::CompositionMode_Source);
+            for (int y = 0; y < doc.height(); y += 2)
+                for (int x = 0; x < doc.width(); x += 3) {
+                    const QRect tile = QRect(x, y, 3, 2).intersected(canvas);
+                    painter.drawImage(tile.topLeft(), doc.flattenVisible(tile));
+                }
+            painter.end();
+            CHECK(stitched == full, "stitched dirty tiles match full composition including custom blend modes");
+        }
+        CHECK(doc.layerAt(targetIndex)->image() == committed
+              && doc.floatingPixelSession()->targets(doc.layerAt(targetIndex)),
+              "composition neither bakes pixels nor follows active upper layer");
+        doc.setLayerVisibility(targetIndex, false);
+        const QImage hidden = doc.flatten();
+        doc.setLayerVisibility(targetIndex, true);
+        doc.setLayerOpacity(targetIndex, 0);
+        CHECK(doc.flatten() == hidden, "hidden and zero-opacity session targets are excluded");
+        doc.setLayerOpacity(targetIndex, 1);
+        doc.setLayerBlendMode(targetIndex, BlendMode::Normal);
+        doc.layerAt(upperIndex)->clear(Qt::yellow);
+        doc.layerAt(upperIndex)->setOffset(QPoint());
+        CHECK(doc.flatten().pixelColor(3, 1) == QColor(Qt::yellow), "opaque upper layer occludes floating content");
+        CHECK(doc.flattenVisible(QRect(-2, -3, 4, 5)) == doc.flatten().copy(0, 0, 2, 2)
+              && doc.flattenVisible(QRect(100, 100, 2, 2)).isNull(), "tile clipping follows document bounds");
+    }
+    SECTION("Floating preview preserves finite offset-layer domain");
+    {
+        Document doc(5, 5);
+        doc.activeLayer()->clear(Qt::blue);
+        const int index = doc.addLayer("Small offset target");
+        QImage small(2, 2, QImage::Format_ARGB32_Premultiplied);
+        small.fill(Qt::red);
+        doc.activeLayer()->setImage(small);
+        doc.activeLayer()->setOffset(QPoint(1, 1));
+        doc.activeLayer()->setBlendMode(BlendMode::Overwrite);
+        const QImage original = doc.flatten();
+        QImage mask(2, 2, QImage::Format_Grayscale8);
+        mask.fill(255);
+        CHECK(doc.beginFloatingPixelSession(index, small, mask, QPoint(1, 1)), "finite-domain session initializes");
+        CHECK(doc.flatten() == original && doc.flattenVisible(QRect(0, 0, 2, 2)) == original.copy(0, 0, 2, 2),
+              "identity preview cannot clear pixels outside finite target domain in Overwrite mode");
+        CHECK(!doc.setFloatingPixelTransform(QTransform::fromScale(std::numeric_limits<double>::max(), 1)),
+              "transform with nonfinite raster extent is rejected");
+    }
+    SECTION("Floating session invalidates the existing canvas cache");
+    {
+        Document doc(20, 20);
+        CanvasWidget canvas;
+        canvas.resize(40, 40);
+        canvas.setDocument(&doc);
+        canvas.setShowRulers(false);
+        canvas.setPan(QPointF(5, 5));
+        auto sample = [&](QPoint documentPoint) {
+            QImage image(canvas.size(), QImage::Format_ARGB32_Premultiplied);
+            image.fill(Qt::transparent);
+            canvas.render(&image);
+            return image.pixelColor(canvas.canvasToWidget(documentPoint).toPoint());
+        };
+        CHECK(sample(QPoint(5, 5)) == QColor(Qt::white), "initial canvas caches committed raster");
+        QImage source(4, 4, QImage::Format_ARGB32_Premultiplied);
+        source.fill(Qt::red);
+        QImage mask(4, 4, QImage::Format_Grayscale8);
+        mask.fill(255);
+        auto initialization = std::make_unique<FloatingPixelSessionCommand>(&doc, 0, "Initialize Preview");
+        CHECK(doc.beginFloatingPixelSession(0, source, mask, QPoint(4, 4)), "cache-test session initializes");
+        CHECK(initialization->captureAfter(), "cache-test checkpoint captured");
+        doc.history().push(std::move(initialization));
+        CHECK(sample(QPoint(5, 5)) == QColor(Qt::red), "session creation invalidates cached composite");
+        auto move = std::make_unique<FloatingPixelSessionCommand>(&doc, 0, "Move Preview");
+        CHECK(doc.setFloatingPixelTransform(QTransform::fromTranslate(10, 10)), "cache-test preview updates");
+        CHECK(move->captureAfter(), "cache-test move captured");
+        doc.history().push(std::move(move));
+        CHECK(sample(QPoint(5, 5)) == QColor(Qt::white) && sample(QPoint(11, 11)) == QColor(Qt::red),
+              "transform invalidates cached composite at old and new location");
+        doc.history().undo();
+        CHECK(sample(QPoint(5, 5)) == QColor(Qt::red) && sample(QPoint(11, 11)) == QColor(Qt::white),
+              "history restoration invalidates cached composite");
+        doc.discardFloatingPixelSession();
+        CHECK(sample(QPoint(5, 5)) == QColor(Qt::white), "session release invalidates cached composite");
+    }
+    SECTION("Floating checkpoint rejects target replacement during capture");
+    {
+        Document doc(2, 2);
+        FloatingPixelSessionCommand pending(&doc, 0, "Pending");
+        doc.restoreFromSnapshot(doc.snapshotLayers(), 2, 2, 0);
+        CHECK(!pending.captureAfter(), "checkpoint cannot silently capture a replacement layer at the same index");
+        FloatingPixelSessionCommand nullDocument(nullptr, 0, "Invalid");
+        CHECK(!nullDocument.captureAfter(), "checkpoint rejects null document");
+        CHECK(!doc.setFloatingPixelTransform(QTransform()), "preview without a session is rejected");
     }
 
     // ---------- RESULT ----------

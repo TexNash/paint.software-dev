@@ -7,7 +7,7 @@
 
 class Layer;
 
-// Inactive infrastructure: neither modifies a layer nor participates in history.
+// Pixel state only: does not modify its target layer. Document/history own lifecycle.
 // Source pixels are UNMASKED premultiplied pixels; coverage is independent alpha.
 class FloatingPixelSession {
 public:
@@ -24,6 +24,9 @@ public:
     QTransform transform() const { return m_transform; }
     // Absolute source-local -> document transform. Invalid updates leave state intact.
     bool setTransform(const QTransform &transform);
+    // Finite raster domain enclosing the captured base and transformed source.
+    // Keep this domain when compositing modes where transparent pixels matter.
+    QRectF documentBounds() const;
 
     // Explicit document-space region, independent of canvas bounds. Nearest-neighbour
     // sampling is a foundation policy, not a Paint.NET resampling implementation.
@@ -31,6 +34,7 @@ public:
     QImage renderCoverage(const QRect &documentRegion) const;
 
 private:
+    friend class Document; // Rebind checkpoint copies to restored layer instances.
     FloatingPixelSession() = default;
     bool sourcePoint(QPointF documentPoint, QPoint &sourcePoint) const;
     static QRgb replaceCoveredPixel(QRgb destination, QRgb source, int coverage);

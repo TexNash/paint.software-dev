@@ -25,6 +25,26 @@ Document::Document(const QString &filePath, QObject *parent)
     load(filePath);
 }
 
+bool Document::beginFloatingPixelSession(int layerIndex, const QImage &source,
+                                         const QImage &coverage, QPoint sourceOrigin) {
+    if (m_floatingPixelSession || layerIndex < 0 || layerIndex >= layerCount()) return false;
+    auto session = FloatingPixelSession::create(m_layers[layerIndex], source, coverage, sourceOrigin);
+    if (!session) return false;
+    m_floatingPixelSession = std::move(session);
+    return true;
+}
+
+const FloatingPixelSession *Document::floatingPixelSession() const {
+    if (m_floatingPixelSession)
+        for (const auto &layer : m_layers)
+            if (m_floatingPixelSession->targets(layer.get())) return m_floatingPixelSession.get();
+    return nullptr;
+}
+
+FloatingPixelSession *Document::floatingPixelSession() {
+    return const_cast<FloatingPixelSession *>(static_cast<const Document *>(this)->floatingPixelSession());
+}
+
 void Document::resize(int width, int height) {
     if (width <= 0 || height <= 0 || (width == m_width && height == m_height)) return;
     auto cmd = std::make_unique<DocumentSnapshotCommand>(this, "Resize Image");

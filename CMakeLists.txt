@@ -21,6 +21,7 @@ endif()
 message(STATUS "paint.software version: ${PAINTSW_VERSION_STR}")
 
 set(CORE_SOURCES
+    src/core/floatingpixelsession.cpp
     src/core/adjustmentpreview.cpp
     src/core/imageoperation.cpp
     src/core/document.cpp

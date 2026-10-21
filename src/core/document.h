@@ -10,6 +10,7 @@
 #include "layer.h"
 #include "selection.h"
 #include "history.h"
+#include "floatingpixelsession.h"
 
 class Document : public QObject {
     Q_OBJECT
@@ -73,6 +74,16 @@ public:
     Selection &selection() { return m_selection; }
     const Selection &selection() const { return m_selection; }
 
+    // Stage 1 infrastructure only: no UI, rendering, history or serialization hooks.
+    // Captures a base snapshot; does not lift/erase pixels or mutate the selection.
+    bool beginFloatingPixelSession(int layerIndex, const QImage &source,
+                                   const QImage &coverage, QPoint sourceOrigin);
+    FloatingPixelSession *floatingPixelSession();
+    const FloatingPixelSession *floatingPixelSession() const;
+    // Releases temporary state only; never rolls back or commits layer pixels.
+    // Required before starting another session, including after target removal.
+    void discardFloatingPixelSession() { m_floatingPixelSession.reset(); }
+
     // History
     HistoryManager &history() { return m_history; }
     void pushImageEdit(int layerIndex, const QImage &before, const QString &desc);
@@ -127,6 +138,7 @@ private:
     std::vector<std::shared_ptr<Layer>> m_layers;
     int m_activeLayer = 0;
     Selection m_selection;
+    std::unique_ptr<FloatingPixelSession> m_floatingPixelSession;
     HistoryManager m_history;
     QString m_filePath;
     bool m_modified = false;

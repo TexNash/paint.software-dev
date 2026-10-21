@@ -15,6 +15,7 @@
 #include <cstdio>
 #include <functional>
 #include <climits>
+#include <limits>
 #include <tuple>
 
 #include "core/document.h"
@@ -3801,6 +3802,173 @@ int main(int argc, char **argv) {
               && SaveConfigDialog::supportsQuality("webp")
               && !SaveConfigDialog::supportsQuality("png"),
               "quality dialog is offered for JPEG/WebP, not PNG");
+    }
+
+    SECTION("Floating pixel session foundation (no UI integration)");
+    {
+        Document doc(8, 6), other(3, 2);
+        Layer *target = doc.activeLayer();
+        target->setOffset(QPoint(-2, 1));
+        target->setOpacity(0.25f);
+        target->setBlendMode(BlendMode::Multiply);
+        doc.selection().selectRect(QRect(0, 0, 2, 2));
+        const QImage selectionBefore = doc.selection().mask().copy();
+        const QImage layerBefore = target->image().copy();
+        const QImage flattenedBefore = doc.flatten();
+        const int historyBefore = doc.history().currentIndex();
+        QImage source(4, 1, QImage::Format_ARGB32_Premultiplied);
+        source.setPixelColor(0, 0, Qt::transparent);
+        source.setPixelColor(1, 0, QColor(200, 60, 20, 128));
+        source.setPixelColor(2, 0, QColor(80, 160, 240, 128));
+        source.setPixelColor(3, 0, Qt::red);
+        QImage coverage(4, 1, QImage::Format_Grayscale8);
+        coverage.fill(255);
+        coverage.scanLine(0)[2] = 128;
+        coverage.scanLine(0)[3] = 0;
+        const QImage sourceBefore = source.copy(), maskBefore = coverage.copy();
+        // Retain raw pointers BEFORE initialization: normal COW would not stop
+        // subsequent writes through these aliases from corrupting shared storage.
+        uchar *sourceBits = source.bits(), *maskBits = coverage.bits();
+        uchar *baseBits = target->image().bits();
+        CHECK(doc.beginFloatingPixelSession(0, source, coverage, QPoint(-1, 2)),
+              "valid floating session initializes");
+        auto *session = doc.floatingPixelSession();
+        CHECK(session && session->targets(target), "session binds to target layer identity");
+        CHECK(doc.history().currentIndex() == historyBefore && !doc.isModified(),
+              "session initialization does not change history or dirty state");
+        CHECK(doc.selection().mask() == selectionBefore && target->image() == layerBefore,
+              "session initialization leaves selection and layer unchanged");
+        CHECK(doc.flatten() == flattenedBefore, "session is not wired into document rendering");
+        const QRect region(-2, 1, 8, 6);
+        const QImage rendered = session->render(region);
+        CHECK(rendered.pixel(1, 1) == 0, "fully transparent selected source clears destination");
+        CHECK(rendered.pixel(2, 1) == sourceBefore.pixel(1, 0),
+              "partial source alpha replaces opaque destination without source-over");
+        auto covered = [](int src, int dst) { return (src * 128 + dst * 127 + 127) / 255; };
+        const QRgb softSource = sourceBefore.pixel(2, 0);
+        const QRgb expected = qRgba(covered(qRed(softSource), 255),
+                                    covered(qGreen(softSource), 255),
+                                    covered(qBlue(softSource), 255),
+                                    covered(qAlpha(softSource), 255));
+        CHECK(rendered.pixel(3, 1) == expected, "fractional coverage is applied exactly once");
+        CHECK(rendered.pixel(4, 1) == qRgb(255, 255, 255), "zero coverage preserves destination");
+        CHECK(session->render(QRect(-3, 0, 1, 1)).pixel(0, 0) == 0,
+              "base outside offset layer is transparent");
+        const QImage geometry = session->renderCoverage(region);
+        CHECK(geometry.constScanLine(1)[1] == 255 && geometry.constScanLine(1)[2] == 255
+              && geometry.constScanLine(1)[3] == 128 && geometry.constScanLine(1)[4] == 0,
+              "geometry is independent of source alpha and layer opacity/blend mode");
+        CHECK(session->render(QRect(-1, 2, 2, 1)) == rendered.copy(1, 1, 2, 1),
+              "region rendering agrees with full render");
+        for (int y = 0; y < rendered.height(); ++y)
+            for (int x = 0; x < rendered.width(); ++x) {
+                const QRgb p = rendered.pixel(x, y);
+                CHECK(qRed(p) <= qAlpha(p) && qGreen(p) <= qAlpha(p) && qBlue(p) <= qAlpha(p),
+                      "replacement preserves premultiplied channel invariants");
+            }
+        sourceBits[0] ^= 255;
+        maskBits[0] = 0;
+        baseBits[0] = 0;
+        QImage exportedSource = session->sourcePixels(), exportedMask = session->sourceCoverage();
+        exportedSource.fill(Qt::green);
+        exportedMask.fill(0);
+        CHECK(session->sourcePixels() == sourceBefore && session->sourceCoverage() == maskBefore
+              && session->basePixels() == layerBefore && session->render(region) == rendered,
+              "raw aliases and COW getter edits cannot mutate snapshots");
+
+        const QTransform initial = session->transform();
+        CHECK(session->setTransform(QTransform::fromTranslate(1000000, -1000000)),
+              "entirely off-canvas transform is accepted");
+        CHECK(doc.floatingPixelSession() == session
+              && session->renderCoverage(region).constScanLine(1)[1] == 0,
+              "off-canvas session remains present with clipped visible coverage");
+        CHECK(session->renderCoverage(QRect(1000000, -1000000, 1, 1)).constScanLine(0)[0] == 255,
+              "off-canvas source geometry remains available");
+        CHECK(session->setTransform(QTransform::fromTranslate(-3, 2)), "partially clipped movement accepted");
+        CHECK(session->renderCoverage(QRect(-2, 2, 1, 1)).constScanLine(0)[0] == 255,
+              "partial off-canvas geometry maps correctly");
+        QTransform rotated;
+        rotated.translate(2, 2);
+        rotated.rotate(90);
+        CHECK(session->setTransform(rotated), "affine rotation accepted");
+        CHECK(session->renderCoverage(QRect(1, 2, 1, 1)).constScanLine(0)[0] == 255,
+              "rotation samples source geometry in document space");
+        CHECK(session->setTransform(QTransform::fromScale(2, 2)), "affine scale accepted");
+        CHECK(session->renderCoverage(QRect(0, 0, 2, 2)).constScanLine(1)[1] == 255,
+              "scale uses independent source coverage");
+        CHECK(session->setTransform(initial) && session->render(region) == rendered,
+              "transform round trip renders immutable original without resampling damage");
+        CHECK(!session->setTransform(QTransform::fromScale(0, 1)), "singular transform rejected");
+        CHECK(!session->setTransform(QTransform(1, 0, 0.1, 0, 1, 0, 0, 0, 1)),
+              "projective transform rejected");
+        CHECK(!session->setTransform(QTransform::fromTranslate(std::numeric_limits<double>::infinity(), 0))
+              && !session->setTransform(QTransform::fromTranslate(std::numeric_limits<double>::quiet_NaN(), 0)),
+              "nonfinite transforms rejected");
+        CHECK(session->transform() == initial, "invalid transforms preserve prior state");
+        CHECK(session->render(QRect()).isNull() && session->renderCoverage(QRect()).isNull(),
+              "invalid render regions return null");
+        CHECK(other.beginFloatingPixelSession(0, sourceBefore, maskBefore, QPoint()),
+              "second document initializes independent session with different dimensions");
+        CHECK(other.floatingPixelSession() != session && other.floatingPixelSession()->transform().isIdentity(),
+              "document sessions do not share mutable transform state");
+        session->setTransform(QTransform::fromTranslate(50, 60));
+        CHECK(other.floatingPixelSession()->transform().isIdentity(),
+              "updating one document transform leaves the second unchanged");
+        session->setTransform(initial);
+        doc.addLayer("Other");
+        CHECK(doc.floatingPixelSession()->targets(target), "active layer change does not retarget session");
+        CHECK(!doc.beginFloatingPixelSession(1, sourceBefore, maskBefore, QPoint()),
+              "initialization cannot silently replace existing session");
+        // Native format remains layer-only even with an internal session present.
+        QTemporaryDir dir;
+        const QString path = dir.filePath("session-foundation.psw");
+        CHECK(doc.saveNative(path), "native save accepts document with inactive session");
+        Document loaded(1, 1);
+        CHECK(loaded.loadNative(path) && !loaded.floatingPixelSession()
+              && loaded.layerAt(0)->image() == doc.layerAt(0)->image(),
+              "native roundtrip preserves ordinary raster and does not serialize session");
+        doc.removeLayer(0);
+        CHECK(!doc.floatingPixelSession(), "removed target cannot be accessed through session API");
+        doc.discardFloatingPixelSession();
+        CHECK(other.floatingPixelSession(), "releasing one session leaves other document intact");
+    }
+    SECTION("Floating session invalid input and ownership");
+    {
+        Document doc(2, 2);
+        QImage source(1, 1, QImage::Format_ARGB32);
+        source.fill(QColor(120, 80, 40, 128));
+        QImage coverage(1, 1, QImage::Format_Grayscale8);
+        coverage.fill(255);
+        QImage wrongSize(2, 1, QImage::Format_Grayscale8);
+        wrongSize.fill(255);
+        CHECK(!doc.beginFloatingPixelSession(-1, source, coverage, QPoint())
+              && !doc.beginFloatingPixelSession(2, source, coverage, QPoint()), "invalid layer indices rejected");
+        CHECK(!doc.beginFloatingPixelSession(0, QImage(), coverage, QPoint())
+              && !doc.beginFloatingPixelSession(0, source, QImage(), QPoint())
+              && !doc.beginFloatingPixelSession(0, source, wrongSize, QPoint())
+              && !doc.beginFloatingPixelSession(0, source, source, QPoint()),
+              "null mismatched and non-coverage masks rejected");
+        coverage.fill(0);
+        CHECK(!doc.beginFloatingPixelSession(0, source, coverage, QPoint()) && !doc.floatingPixelSession(),
+              "empty coverage fails without installing session");
+        coverage.fill(255);
+        CHECK(doc.beginFloatingPixelSession(0, source, coverage, QPoint()), "valid input succeeds after failures");
+        CHECK(doc.floatingPixelSession()->sourcePixels().format() == QImage::Format_ARGB32_Premultiplied
+              && doc.floatingPixelSession()->render(QRect(0, 0, 1, 1)).pixel(0, 0) == qPremultiply(source.pixel(0, 0)),
+              "straight-alpha input is normalized once");
+        auto layer = std::make_shared<Layer>(2, 2);
+        std::weak_ptr<Layer> weak = layer;
+        auto detached = FloatingPixelSession::create(layer, source, coverage, QPoint());
+        layer.reset();
+        CHECK(weak.expired() && !detached->targets(nullptr), "session does not retain target layer lifetime");
+        CHECK(!detached->render(QRect(0, 0, 1, 1)).isNull(), "snapshot render needs no live target pointer");
+        doc.discardFloatingPixelSession();
+        source.fill(Qt::transparent);
+        coverage.fill(128);
+        CHECK(doc.beginFloatingPixelSession(0, source, coverage, QPoint()),
+              "transparent source with fractional geometry is valid");
+        CHECK(doc.floatingPixelSession()->render(QRect(0, 0, 1, 1)).pixel(0, 0) == qRgba(127, 127, 127, 127),
+              "fractionally selected transparent source attenuates destination by coverage not alpha");
     }
 
     // ---------- RESULT ----------

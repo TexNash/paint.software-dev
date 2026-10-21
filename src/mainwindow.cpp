@@ -201,6 +201,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     connect(m_document, &Document::documentChanged, this, &MainWindow::updateTitle);
     connect(m_document, &Document::documentChanged, this, &MainWindow::updateImageList);
     connect(m_document, &Document::floatingPixelsChanged, this, &MainWindow::updateImageList);
+    connect(m_document, &Document::layerAppearanceChanged, this, &MainWindow::updateImageList);
     connect(m_document, &Document::sizeChanged, this, [this](int w, int h) {
         m_sizeLabel->setText(QString("%1 × %2").arg(w).arg(h));
     });
@@ -1068,9 +1069,7 @@ void MainWindow::adjustCurrentToolBrushSize(int delta) {
 void MainWindow::toggleActiveLayerVisibility() {
     auto *layer = m_document ? m_document->activeLayer() : nullptr;
     if (!layer) return;
-    layer->setVisible(!layer->isVisible());
-    emit m_document->layersChanged();
-    emit m_document->documentChanged();
+    m_document->setLayerVisibility(m_document->activeLayerIndex(), !layer->isVisible());
 }
 
 void MainWindow::showLayerPropertiesDialog() {
@@ -1091,8 +1090,7 @@ void MainWindow::showLayerPropertiesDialog() {
         layer->setVisible(visible);
         if (blendIdx >= 0 && blendIdx < modes.size())
             layer->setBlendMode(modes[blendIdx]);
-        emit m_document->documentChanged();
-        emit m_document->layersChanged();
+        m_document->notifyLayerAppearanceChanged(m_document->activeLayerIndex());
     });
 
     if (dlg.exec() == QDialog::Accepted) {
@@ -1118,8 +1116,7 @@ void MainWindow::showLayerPropertiesDialog() {
         layer->setOpacity(origOpacity);
         layer->setVisible(origVisible);
         layer->setBlendMode(origBlend);
-        emit m_document->documentChanged();
-        emit m_document->layersChanged();
+        m_document->notifyLayerAppearanceChanged(m_document->activeLayerIndex());
     }
 }
 
@@ -1689,6 +1686,7 @@ void MainWindow::wireDocumentSignals() {
     connect(m_document, &Document::documentChanged, this, &MainWindow::updateTitle);
     connect(m_document, &Document::documentChanged, this, &MainWindow::updateImageList);
     connect(m_document, &Document::floatingPixelsChanged, this, &MainWindow::updateImageList);
+    connect(m_document, &Document::layerAppearanceChanged, this, &MainWindow::updateImageList);
     connect(m_document, &Document::sizeChanged, this, [this](int w, int h) {
         m_sizeLabel->setText(QString("%1 × %2").arg(w).arg(h));
     });

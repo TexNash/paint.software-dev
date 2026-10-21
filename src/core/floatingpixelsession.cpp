@@ -101,7 +101,7 @@ QRgb FloatingPixelSession::replaceCoveredPixel(QRgb destination, QRgb source, in
                  channel(qAlpha(destination), qAlpha(source)));
 }
 
-QImage FloatingPixelSession::render(const QRect &documentRegion) const {
+QImage FloatingPixelSession::renderBase(const QRect &documentRegion) const {
     if (documentRegion.isEmpty()) return {};
     QImage result(documentRegion.size(), QImage::Format_ARGB32_Premultiplied);
     if (result.isNull()) return {};
@@ -114,7 +114,12 @@ QImage FloatingPixelSession::render(const QRect &documentRegion) const {
         painter.drawImage(QPointF(double(m_baseOffset.x()) - documentRegion.x(),
                                  double(m_baseOffset.y()) - documentRegion.y()), base);
     }
-    if (originalLiftPose) return result;
+    return result;
+}
+
+QImage FloatingPixelSession::render(const QRect &documentRegion) const {
+    QImage result = renderBase(documentRegion);
+    if (result.isNull() || (!m_liftOriginal.isNull() && m_transform == m_liftTransform)) return result;
     // Intersect before narrowing to QRect: distant off-canvas transforms need
     // no sampling and must not overflow integer coordinates.
     const QRect affected = sourceBounds().intersected(QRectF(documentRegion)).toAlignedRect().intersected(documentRegion);
@@ -189,17 +194,31 @@ QImage FloatingPixelSession::render(const QRect &documentRegion) const {
 }
 
 QImage FloatingPixelSession::renderCoverage(const QRect &documentRegion) const {
+    return sample(documentRegion, nullptr);
+}
+
+QImage FloatingPixelSession::sample(const QRect &documentRegion, QImage *pixels) const {
     if (documentRegion.isEmpty()) return {};
     QImage result(documentRegion.size(), QImage::Format_Grayscale8);
     if (result.isNull()) return {};
     result.fill(0);
+    if (pixels) {
+        *pixels = QImage(documentRegion.size(), QImage::Format_ARGB32_Premultiplied);
+        if (pixels->isNull()) return {};
+        pixels->fill(0);
+    }
+    const auto *sourcePixels = reinterpret_cast<const QRgb *>(m_source.constBits());
+    const qsizetype pixelStride = m_source.bytesPerLine() / 4;
     const QRect affected = sourceBounds().intersected(QRectF(documentRegion)).toAlignedRect().intersected(documentRegion);
     if (!affected.isEmpty() && integerTranslation(m_transform)) {
         const int sx = int(double(affected.x()) - m_transform.dx());
         const int sy = int(double(affected.y()) - m_transform.dy());
-        for (int y = 0; y < affected.height(); ++y)
+        for (int y = 0; y < affected.height(); ++y) {
+            if (pixels) std::memcpy(pixels->scanLine(affected.y() - documentRegion.y() + y) + qsizetype(affected.x() - documentRegion.x()) * 4,
+                                    m_source.constScanLine(sy + y) + qsizetype(sx) * 4, size_t(affected.width()) * 4);
             std::memcpy(result.scanLine(affected.y() - documentRegion.y() + y) + affected.x() - documentRegion.x(),
                         m_coverage.constScanLine(sy + y) + sx, size_t(affected.width()));
+        }
         return result;
     }
     const uchar *mask = m_coverage.constBits();
@@ -225,6 +244,11 @@ QImage FloatingPixelSession::renderCoverage(const QRect &documentRegion) const {
             if (!(sy >= 0 && sy < sourceHeight)) continue;
             auto *destination = result.scanLine(affected.y() - documentRegion.y() + y) + affected.x() - documentRegion.x();
             const auto *source = mask + int(sy) * stride;
+            if (pixels) {
+                auto *out = reinterpret_cast<QRgb *>(pixels->scanLine(affected.y() - documentRegion.y() + y)) + affected.x() - documentRegion.x();
+                const auto *in = sourcePixels + int(sy) * pixelStride;
+                for (int x = first; x <= last; ++x) out[x] = in[columns[x]];
+            }
             if (m_fullCoverage && last >= first) std::memset(destination + first, 255, size_t(last - first + 1));
             else for (int x = first; x <= last; ++x) destination[x] = source[columns[x]];
         }
@@ -232,12 +256,15 @@ QImage FloatingPixelSession::renderCoverage(const QRect &documentRegion) const {
     }
     for (int y = 0; y < affected.height(); ++y) {
         uchar *line = result.scanLine(affected.y() - documentRegion.y() + y);
+        auto *out = pixels ? reinterpret_cast<QRgb *>(pixels->scanLine(affected.y() - documentRegion.y() + y)) : nullptr;
         const double py = double(affected.y()) + y + 0.5, yc = py * c, yd = py * d;
         for (int x = 0; x < affected.width(); ++x) {
             const double px = double(affected.x()) + x + 0.5;
             const double sx = px * a + yc + tx, sy = px * b + yd + ty;
-            if (sx >= 0 && sy >= 0 && sx < sourceWidth && sy < sourceHeight)
+            if (sx >= 0 && sy >= 0 && sx < sourceWidth && sy < sourceHeight) {
                 line[affected.x() - documentRegion.x() + x] = mask[int(sy) * stride + int(sx)];
+                if (out) out[affected.x() - documentRegion.x() + x] = sourcePixels[int(sy) * pixelStride + int(sx)];
+            }
         }
     }
     return result;

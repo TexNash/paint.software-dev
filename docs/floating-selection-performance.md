@@ -1,5 +1,8 @@
 # Stage 3 floating-selection performance correction
 
+The subsequent [Stage 4A report](floating-selection-stage4a.md) covers bounded caching,
+layer-opacity responsiveness and current benchmark/test results.
+
 ## Cause and correction
 
 The regression ran several full-resolution operations for every pointer update,

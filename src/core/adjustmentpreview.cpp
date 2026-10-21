@@ -19,6 +19,7 @@ AdjustmentPreview::AdjustmentPreview(Document *doc, CanvasWidget *canvas,
     connect(&m_timer, &QTimer::timeout, this, &AdjustmentPreview::start);
     // A modal dialog prevents ordinary edits; invalidate on any external mutation.
     connect(doc, &Document::documentChanged, this, &AdjustmentPreview::cancel);
+    connect(doc, &Document::layerAppearanceChanged, this, &AdjustmentPreview::cancel);
     connect(doc, &Document::selectionChanged, this, &AdjustmentPreview::cancel);
     connect(doc, &Document::layersChanged, this, &AdjustmentPreview::cancel);
     connect(doc, &QObject::destroyed, this, &AdjustmentPreview::cancel);

@@ -1,0 +1,49 @@
+build,case,operation,samples,before_mean_ms,before_max_ms,after_mean_ms,after_max_ms
+default,300x200,move,8,21.8329,24.6526,21.7129,24.1309
+default,300x200,resize,3,23.6856,25.0250,23.4858,25.5210
+default,300x200,rotate,3,33.3591,35.3138,32.0441,34.2511
+default,2000x1500,move,8,68.5145,71.8468,57.4939,64.1310
+default,2000x1500,resize,3,123.9480,127.4370,121.7920,124.9780
+default,2000x1500,rotate,3,287.1040,300.5940,233.7080,242.0770
+default,1 layers / rectangle,source_sampling,12,146.5560,149.2300,148.8970,152.7210
+default,1 layers / rectangle,mask_generation,12,133.9740,136.1880,136.1030,137.2570
+default,1 layers / rectangle,marquee_geometry,12,106.2480,108.1940,109.0830,110.9860
+default,1 layers / rectangle,compositing_only,12,38.4789,40.8932,38.2278,40.6454
+default,1 layers / rectangle,document_thumbnail,12,0.2777,2.5468,0.2670,2.4256
+default,1 layers / rectangle,layer_thumbnail,12,0.0974,0.1746,0.0914,0.1445
+default,1 layers / rectangle,opacity_invalidation,12,0.3156,0.6910,0.0845,0.1331
+default,1 layers / rectangle,opacity_frame,12,226.9440,274.1920,118.0960,135.3320
+default,1 layers / rectangle,transform_frame,12,444.1990,510.3820,247.3170,278.6520
+default,3 layers / ellipse,source_sampling,12,144.6610,154.0010,148.0670,150.0070
+default,3 layers / ellipse,mask_generation,12,132.4440,138.9330,136.6980,138.8380
+default,3 layers / ellipse,marquee_geometry,12,70.6903,71.6407,74.2533,76.1003
+default,3 layers / ellipse,compositing_only,12,82.5231,85.5673,89.1028,98.6072
+default,3 layers / ellipse,document_thumbnail,12,0.3973,3.2463,0.3523,2.7221
+default,3 layers / ellipse,layer_thumbnail,12,0.0971,0.1529,0.0906,0.1545
+default,3 layers / ellipse,opacity_invalidation,12,6.5558,7.0295,0.1400,0.2453
+default,3 layers / ellipse,opacity_frame,12,304.3970,329.4470,205.7510,211.5060
+default,3 layers / ellipse,transform_frame,12,400.1450,473.0440,262.3440,299.9590
+release,300x200,move,8,21.1607,23.3641,21.2576,22.5309
+release,300x200,resize,3,20.6858,22.5504,20.7843,22.6342
+release,300x200,rotate,3,24.8279,26.2044,24.1896,25.5460
+release,2000x1500,move,8,39.6843,40.7053,37.1273,43.2522
+release,2000x1500,resize,3,41.1592,42.0985,37.2067,39.3611
+release,2000x1500,rotate,3,85.7035,91.7023,75.6826,77.8414
+release,1 layers / rectangle,source_sampling,12,34.9879,38.4166,33.5984,36.1510
+release,1 layers / rectangle,mask_generation,12,28.5210,28.9060,29.8790,32.7726
+release,1 layers / rectangle,marquee_geometry,12,102.2820,104.7300,92.5894,93.7239
+release,1 layers / rectangle,compositing_only,12,36.1170,38.3841,36.9410,38.3740
+release,1 layers / rectangle,document_thumbnail,12,0.1821,1.8425,0.3718,4.0809
+release,1 layers / rectangle,layer_thumbnail,12,0.0302,0.0920,0.0313,0.0923
+release,1 layers / rectangle,opacity_invalidation,12,0.1917,0.3747,0.0372,0.0953
+release,1 layers / rectangle,opacity_frame,12,89.1825,90.3404,69.4645,72.3935
+release,1 layers / rectangle,transform_frame,12,179.7450,222.7910,66.9380,80.5603
+release,3 layers / ellipse,source_sampling,12,32.9802,35.2946,33.7508,36.3574
+release,3 layers / ellipse,mask_generation,12,28.0333,30.0158,30.0024,31.2199
+release,3 layers / ellipse,marquee_geometry,12,65.6703,66.0170,63.9849,64.8711
+release,3 layers / ellipse,compositing_only,12,90.7840,130.3120,82.8104,84.8422
+release,3 layers / ellipse,document_thumbnail,12,0.2698,2.7358,0.2672,2.6980
+release,3 layers / ellipse,layer_thumbnail,12,0.0285,0.0866,0.0291,0.0856
+release,3 layers / ellipse,opacity_invalidation,12,5.8512,6.2735,0.0499,0.0987
+release,3 layers / ellipse,opacity_frame,12,191.1420,206.9240,146.3170,156.4150
+release,3 layers / ellipse,transform_frame,12,165.5660,215.5870,79.8250,93.6203

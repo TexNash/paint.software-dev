@@ -1,5 +1,7 @@
 #include "document.h"
 #include "clipboardpixels.h"
+#include "floatingrendercache.h"
+#include <cstring>
 #include <QPainter>
 #include <QImageReader>
 #include <QImageWriter>
@@ -150,7 +152,7 @@ bool Document::setFloatingPixelTransform(const QTransform &transform) {
     QRegion dirty(clipped(session->sourceBounds()));
     dirty += clipped(preview.sourceBounds());
     dirty += QRegion(clipped(session->documentBounds())).xored(QRegion(clipped(preview.documentBounds())));
-    QImage mask = preview.renderCoverage(canvas);
+    QImage mask = floatingCoverage(preview, canvas);
     if (mask.isNull()) return false;
     m_selection.setMaskImage(std::move(mask), clipped(preview.sourceBounds()));
     m_floatingSelectionKey = m_selection.mask().cacheKey();
@@ -810,7 +812,7 @@ QImage Document::flattenVisible(const QRect &region) const {
             const QRect effectiveRegion = session->documentBounds().intersected(QRectF(tile))
                                               .toAlignedRect().intersected(tile);
             if (effectiveRegion.isEmpty()) continue;
-            const QImage effective = session->render(effectiveRegion);
+            const QImage effective = floatingRaster(*session, effectiveRegion);
             if (effective.isNull()) return {};
             Layer part(effective);
             part.setOffset(effectiveRegion.topLeft() - tile.topLeft());
@@ -829,6 +831,127 @@ QImage Document::flattenVisible(const QRect &region) const {
         part.setBlendMode(layer->blendMode());
         result = part.composited(result);
     }
+    return result;
+}
+
+bool Document::visitFloatingTiles(const FloatingPixelSession &session, const QRect &region,
+                                  const FloatingTileVisitor &visitor) const {
+    const QRect canvas(QPoint(), size());
+    const QRect area = session.sourceBounds().intersected(QRectF(region.intersected(canvas)))
+                              .toAlignedRect().intersected(region).intersected(canvas);
+    if (area.isEmpty()) return true;
+    QByteArray identity;
+    QDataStream stream(&identity, QIODevice::WriteOnly);
+    stream.setVersion(QDataStream::Qt_6_0);
+    // Destination-independent keys: property changes reuse samples; new source,
+    // mask or transform values cannot alias an old tile. No images are retained
+    // by keys, and session/history copies share only their immutable inputs.
+    stream << quint8(0) << session.m_source.cacheKey() << session.m_coverage.cacheKey() << session.m_transform;
+    constexpr int tileSize = 256;
+    for (int row = area.top()/tileSize; row <= area.bottom()/tileSize; ++row) {
+        for (int column = area.left()/tileSize; column <= area.right()/tileSize; ++column) {
+            const QRect tileRect = QRectF(column * double(tileSize), row * double(tileSize), tileSize, tileSize)
+                .intersected(QRectF(canvas)).intersected(session.sourceBounds()).toAlignedRect().intersected(canvas);
+            QByteArray key = identity;
+            QDataStream keyStream(&key, QIODevice::Append);
+            keyStream.setVersion(QDataStream::Qt_6_0); keyStream << tileRect;
+            auto tile = FloatingRenderCache::shared().find(key);
+            if (tile.isNull()) {
+                tile.coverage = session.sample(tileRect, &tile.pixels);
+                if (tile.isNull() || tile.coverage.isNull()) return false;
+                const auto &transform = session.m_transform;
+                const bool integerFull = session.m_fullCoverage && transform.type() <= QTransform::TxTranslate
+                    && transform.dx() == std::floor(transform.dx()) && transform.dy() == std::floor(transform.dy());
+                tile.opaqueCoverage = true;
+                for (int y = 0; !integerFull && y < tile.coverage.height() && tile.opaqueCoverage; ++y) {
+                    const uchar *mask = tile.coverage.constScanLine(y);
+                    for (int x = 0; x < tile.coverage.width(); ++x)
+                        if (mask[x] != 255) { tile.opaqueCoverage = false; break; }
+                }
+                FloatingRenderCache::shared().insert(key, tile);
+            }
+            visitor(tileRect, tile.pixels, tile.coverage, tile.opaqueCoverage);
+        }
+    }
+    return true;
+}
+
+static bool floatingCacheFits(const QRect &area, int bytesPerPixel) {
+    // Do not churn the shared cache with a pose larger than its entire budget.
+    // Leave conservative room for edge-row padding, keys and tile bookkeeping.
+    const double tiles = (double(area.width())/256 + 2) * (double(area.height())/256 + 2);
+    return double(area.width()) * area.height() * bytesPerPixel + tiles * 2048
+        <= double(FloatingRenderCache::shared().stats().limitKiB) * 1024;
+}
+
+QImage Document::floatingCoverage(const FloatingPixelSession &session, const QRect &region) const {
+    // Axis-aligned coverage uses fast row copies/gathers; eager sampled tiles
+    // would add more allocation/copy work than this path saves during a drag.
+    if (session.m_transform.type() <= QTransform::TxScale) return session.renderCoverage(region);
+    const QRect footprint = session.sourceBounds().intersected(QRectF(region)).toAlignedRect().intersected(region);
+    if (!floatingCacheFits(footprint, 5)) return session.renderCoverage(region);
+    QImage result(region.size(), QImage::Format_Grayscale8);
+    if (result.isNull()) return {};
+    result.fill(0);
+    if (!visitFloatingTiles(session, region, [&](QRect tile, const QImage &, const QImage &mask, bool) {
+        const QRect copy = tile.intersected(region);
+        for (int y = 0; y < copy.height(); ++y)
+            std::memcpy(result.scanLine(copy.y() - region.y() + y) + copy.x() - region.x(),
+                        mask.constScanLine(copy.y() - tile.y() + y) + copy.x() - tile.x(), size_t(copy.width()));
+    })) return {};
+    return result;
+}
+
+QImage Document::floatingRaster(const FloatingPixelSession &session, const QRect &region) const {
+    const QRect footprint = session.sourceBounds().intersected(QRectF(region)).toAlignedRect().intersected(region);
+    const bool axisAligned = session.m_transform.type() <= QTransform::TxScale;
+    if (!floatingCacheFits(footprint, axisAligned ? 4 : 5)) return session.render(region);
+    if (!session.m_liftOriginal.isNull() && session.m_transform == session.m_liftTransform) return session.renderBase(region);
+    if (axisAligned) {
+        if (footprint.isEmpty()) return session.renderBase(region);
+        QByteArray key; QDataStream stream(&key, QIODevice::WriteOnly); stream.setVersion(QDataStream::Qt_6_0);
+        // This entry contains replacement against a captured base, unlike the
+        // destination-independent source tiles. Include every base/pose input.
+        stream << quint8(1) << session.m_source.cacheKey() << session.m_coverage.cacheKey() << session.m_transform
+               << session.m_base.cacheKey() << session.m_baseOffset << session.m_liftOriginal.cacheKey()
+               << session.m_liftTransform << footprint;
+        auto cached = FloatingRenderCache::shared().find(key);
+        if (cached.isNull()) {
+            // A moving source usually covers almost the entire dirty rectangle.
+            // Retain that already-needed render directly rather than copying its
+            // footprint into a second image. Do not retain a large empty base for
+            // a small source; those requests cache only the footprint instead.
+            const bool retainRegion = double(region.width()) * region.height()
+                <= double(footprint.width()) * footprint.height() * 2 && floatingCacheFits(region, 4);
+            const QRect sampled = retainRegion ? region : footprint;
+            cached.pixels = session.render(sampled); cached.origin = sampled.topLeft();
+            if (cached.isNull()) return {};
+            FloatingRenderCache::shared().insert(key, cached);
+            if (retainRegion) return cached.pixels;
+        }
+        if (cached.origin == region.topLeft() && cached.pixels.size() == region.size()) return cached.pixels;
+        QImage result = session.renderBase(region);
+        if (result.isNull()) return {};
+        QPainter painter(&result); painter.setCompositionMode(QPainter::CompositionMode_Source);
+        painter.drawImage(QRect(footprint.topLeft() - region.topLeft(), footprint.size()), cached.pixels,
+                          QRect(footprint.topLeft() - cached.origin, footprint.size()));
+        return result;
+    }
+    QImage result = session.renderBase(region);
+    if (result.isNull()) return {};
+    if (!visitFloatingTiles(session, region, [&](QRect tile, const QImage &pixels, const QImage &mask, bool opaque) {
+        const QRect copy = tile.intersected(region);
+        for (int y = 0; y < copy.height(); ++y) {
+            auto *destination = reinterpret_cast<QRgb *>(result.scanLine(copy.y() - region.y() + y)) + copy.x() - region.x();
+            const auto *source = reinterpret_cast<const QRgb *>(pixels.constScanLine(copy.y() - tile.y() + y)) + copy.x() - tile.x();
+            const uchar *coverage = mask.constScanLine(copy.y() - tile.y() + y) + copy.x() - tile.x();
+            if (opaque) std::memcpy(destination, source, size_t(copy.width()) * 4);
+            else for (int x = 0; x < copy.width(); ++x) {
+                if (coverage[x] == 255) destination[x] = source[x];
+                else if (coverage[x]) destination[x] = FloatingPixelSession::replaceCoveredPixel(destination[x], source[x], coverage[x]);
+            }
+        }
+    })) return {};
     return result;
 }
 
@@ -1199,30 +1322,32 @@ void Document::reorderLayers(const std::vector<int> &newOrder, int keepActiveOri
     emit documentChanged();
 }
 
+void Document::notifyLayerAppearanceChanged(int index) {
+    if (layerAt(index)) emit layerAppearanceChanged(index);
+}
+
 void Document::setLayerOpacity(int index, float opacity) {
-    if (auto *l = layerAt(index)) {
-        l->setOpacity(opacity);
+    if (auto *layer = layerAt(index)) {
+        const float before = layer->opacity(); layer->setOpacity(opacity);
+        if (layer->opacity() == before) return;
         m_modified = true;
-        emit documentChanged();
-        emit layersChanged();
+        notifyLayerAppearanceChanged(index);
     }
 }
 
 void Document::setLayerVisibility(int index, bool visible) {
-    if (auto *l = layerAt(index)) {
-        l->setVisible(visible);
-        m_modified = true;
-        emit documentChanged();
-        emit layersChanged();
+    if (auto *layer = layerAt(index)) {
+        if (layer->isVisible() == visible) return;
+        layer->setVisible(visible); m_modified = true;
+        notifyLayerAppearanceChanged(index);
     }
 }
 
 void Document::setLayerBlendMode(int index, BlendMode mode) {
-    if (auto *l = layerAt(index)) {
-        l->setBlendMode(mode);
-        m_modified = true;
-        emit documentChanged();
-        emit layersChanged();
+    if (auto *layer = layerAt(index)) {
+        if (layer->blendMode() == mode) return;
+        layer->setBlendMode(mode); m_modified = true;
+        notifyLayerAppearanceChanged(index);
     }
 }
 

@@ -21,9 +21,13 @@ ImageListBar::ImageListBar(QWidget *parent) : QWidget(parent) {
 }
 
 void ImageListBar::setDocuments(const QVector<Document*> &docs, int activeIndex) {
+    const bool sameDocuments = m_docs == docs && m_layout->count() == docs.size();
     m_docs = docs;
     m_active = activeIndex;
-    rebuild();
+    if (sameDocuments) {
+        for (int i = 0; i < m_docs.size(); ++i)
+            if (auto *button = qobject_cast<QToolButton *>(m_layout->itemAt(i)->widget())) updateButton(button, m_docs[i], i);
+    } else rebuild();
 }
 
 void ImageListBar::rebuild() {
@@ -43,34 +47,41 @@ void ImageListBar::rebuild() {
         btn->setChecked(i == m_active);
         btn->setAutoRaise(true);
 
-        // Render the flattened image onto a checkerboard, scaled to fit.
-        QPixmap pm(kImage, kImage);
-        pm.fill(Qt::transparent);
-        {
-            QPainter p(&pm);
-            for (int y = 0; y < kImage; y += 6)
-                for (int x = 0; x < kImage; x += 6)
-                    p.fillRect(x, y, 6, 6,
-                               ((x / 6 + y / 6) % 2 == 0) ? QColor(255, 255, 255) : QColor(205, 205, 205));
-            QImage thumb = doc->thumbnail(QSize(kImage, kImage));
-            p.drawImage((kImage - thumb.width()) / 2, (kImage - thumb.height()) / 2, thumb);
-            p.setPen(QPen(QColor(120, 120, 120), 1));
-            p.drawRect(0, 0, kImage - 1, kImage - 1);
-        }
-        btn->setIcon(QIcon(pm));
-        btn->setIconSize(QSize(kImage, kImage));
-
-        QString name = doc->filePath().isEmpty() ? TR("Sans titre")
-                                                 : QFileInfo(doc->filePath()).fileName();
-        if (doc->isModified()) name += " *";
-        btn->setToolTip(QString(TR("%1\n%2 × %3\n(clic milieu pour fermer)"))
-                            .arg(name).arg(doc->width()).arg(doc->height()));
+        updateButton(btn, doc, i);
 
         connect(btn, &QToolButton::clicked, this, [this, i]() { emit imageSelected(i); });
         btn->setProperty("imageIndex", i);
         btn->installEventFilter(this);   // middle-click closes the image
         m_layout->addWidget(btn);
     }
+}
+
+void ImageListBar::updateButton(QToolButton *button, Document *document, int index) {
+    if (!document) return;
+    button->setChecked(index == m_active);
+    // Render the flattened image onto a checkerboard, scaled to fit.
+    QPixmap pm(kImage, kImage);
+    pm.fill(Qt::transparent);
+    {
+        QPainter p(&pm);
+        for (int y = 0; y < kImage; y += 6)
+            for (int x = 0; x < kImage; x += 6)
+                p.fillRect(x, y, 6, 6,
+                           ((x / 6 + y / 6) % 2 == 0) ? QColor(255, 255, 255) : QColor(205, 205, 205));
+        QImage thumb = document->thumbnail(QSize(kImage, kImage));
+        p.drawImage((kImage - thumb.width()) / 2, (kImage - thumb.height()) / 2, thumb);
+        p.setPen(QPen(QColor(120, 120, 120), 1));
+        p.drawRect(0, 0, kImage - 1, kImage - 1);
+    }
+    button->setIcon(QIcon(pm));
+    button->setIconSize(QSize(kImage, kImage));
+
+    QString name = document->filePath().isEmpty() ? TR("Sans titre")
+                                             : QFileInfo(document->filePath()).fileName();
+    if (document->isModified()) name += " *";
+    button->setToolTip(QString(TR("%1\n%2 × %3\n(clic milieu pour fermer)"))
+                        .arg(name).arg(document->width()).arg(document->height()));
+
 }
 
 bool ImageListBar::eventFilter(QObject *obj, QEvent *event) {

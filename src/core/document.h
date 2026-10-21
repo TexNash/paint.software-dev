@@ -6,6 +6,7 @@
 #include <QSize>
 #include <memory>
 #include <vector>
+#include <functional>
 
 #include "layer.h"
 #include "selection.h"
@@ -67,6 +68,8 @@ public:
     void reorderLayers(const std::vector<int> &newOrder, int keepActiveOriginalIndex);
 
     // Layer property mutation (emits documentChanged so the canvas repaints)
+    // Publish property-only changes without rebuilding the layer stack.
+    void notifyLayerAppearanceChanged(int index);
     void setLayerOpacity(int index, float opacity);
     void setLayerVisibility(int index, bool visible);
     void setLayerBlendMode(int index, BlendMode mode);
@@ -143,6 +146,7 @@ signals:
     // Finalize a pending gesture before checkpointing a context transition.
     void floatingContextChanging();
     void layersChanged();
+    void layerAppearanceChanged(int index);
     void activeLayerChanged(int index);
     void selectionChanged();
     void documentChanged();
@@ -159,6 +163,10 @@ private:
     // Restores checkpoint state without signals; callers publish the complete state.
     void restoreFloatingPixelSession(const FloatingPixelSession *session, int layerIndex);
     std::optional<Layer> floatingPixelRaster() const;
+    using FloatingTileVisitor = std::function<void(QRect, const QImage &, const QImage &, bool)>;
+    bool visitFloatingTiles(const FloatingPixelSession &session, const QRect &region, const FloatingTileVisitor &visitor) const;
+    QImage floatingCoverage(const FloatingPixelSession &session, const QRect &region) const;
+    QImage floatingRaster(const FloatingPixelSession &session, const QRect &region) const;
     int m_width;
     int m_height;
     std::vector<std::shared_ptr<Layer>> m_layers;

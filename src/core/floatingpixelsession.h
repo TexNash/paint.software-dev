@@ -41,6 +41,8 @@ public:
 private:
     friend class Document; // Rebind checkpoint copies to restored layer instances.
     FloatingPixelSession() = default;
+    QImage renderBase(const QRect &documentRegion) const;
+    QImage sample(const QRect &documentRegion, QImage *pixels) const;
     bool sourcePoint(QPointF documentPoint, QPoint &sourcePoint) const;
     static QRgb replaceCoveredPixel(QRgb destination, QRgb source, int coverage);
 

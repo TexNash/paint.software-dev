@@ -15,6 +15,7 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QApplication>
+#include <QSignalBlocker>
 
 namespace {
 QImage thumbnailPixels(Document *document, const Layer *layer) {
@@ -226,6 +227,21 @@ void LayersPanel::setDocument(Document *doc) {
     m_document = doc;
     if (doc) {
         connect(doc, &Document::layersChanged, this, &LayersPanel::updateLayerList);
+        connect(doc, &Document::layerAppearanceChanged, this, [this](int index) {
+            const auto *layer = m_document->layerAt(index);
+            if (!layer) return;
+            const int row = m_document->layerCount() - 1 - index;
+            auto *item = m_layerList->item(row);
+            if (!item || item->data(Qt::UserRole).toInt() != index) { updateLayerList(); return; }
+            const QSignalBlocker listBlock(m_layerList);
+            item->setCheckState(layer->isVisible() ? Qt::Checked : Qt::Unchecked);
+            item->setForeground(layer->isVisible() ? QBrush() : QBrush(Qt::gray));
+            if (index == m_document->activeLayerIndex()) {
+                const QSignalBlocker opacityBlock(m_opacitySlider), blendBlock(m_blendModeCombo);
+                m_opacitySlider->setValue(qRound(layer->opacity() * 100));
+                m_blendModeCombo->setCurrentIndex(int(layer->blendMode()));
+            }
+        });
         // Keep thumbnails live on every content change (brush, bucket, effect...),
         // debounced so a continuous stroke doesn't rebuild them on every pixel.
         connect(doc, &Document::floatingPixelsChanged, this, [this]() { m_thumbRefreshTimer->start(); });

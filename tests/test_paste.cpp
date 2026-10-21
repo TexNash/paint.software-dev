@@ -1,6 +1,14 @@
 #include <QApplication>
+#include "core/floatingrendercache.h"
+#include "panels/imagelistbar.h"
+#include "panels/layerspanel.h"
+#include "dialogs/layerpropertiesdialog.h"
+#include "core/adjustmentpreview.h"
+#include <QListWidget>
+#include <QToolButton>
 #include <QElapsedTimer>
 #include <algorithm>
+#include <numeric>
 #include <QClipboard>
 #include <QMimeData>
 #include <QTemporaryDir>
@@ -909,6 +917,54 @@ static void floatingNativeAndDocumentSwitch() {
     CHECK(doc->floatingPixelSession());
 }
 
+static void floatingLayerAppearance() {
+    MainWindow window;
+    auto *canvas = window.findChild<CanvasWidget *>(); fullCanvasView(canvas);
+    auto *doc = canvas->document(); doc->activeLayer()->clear(Qt::green);
+    doc->addLayer("Offset");
+    QImage base(100, 80, QImage::Format_ARGB32_Premultiplied); base.fill(Qt::blue);
+    doc->activeLayer()->setImage(base); doc->activeLayer()->setOffset(QPoint(160, 140));
+    QApplication::clipboard()->setImage(fixture(80, 60)); noPrompt(window, "paste");
+    QImage incremental(canvas->size(), QImage::Format_ARGB32_Premultiplied), full = incremental;
+    canvas->render(&incremental);
+    auto *list = window.findChild<LayersPanel *>()->findChild<QListWidget *>();
+    auto *row = list->item(0);
+    auto *tab = window.findChild<ImageListBar *>()->findChild<QToolButton *>();
+    int structural = 0;
+    QObject::connect(doc, &Document::layersChanged, doc, [&]() { ++structural; });
+    const auto warm = FloatingRenderCache::shared().stats();
+    for (BlendMode mode : {BlendMode::Normal, BlendMode::Multiply, BlendMode::Overwrite, BlendMode::Reflect}) {
+        for (float opacity : {0.0f, 0.25f, 1.0f}) {
+            doc->setLayerBlendMode(1, mode); doc->setLayerOpacity(1, opacity);
+            canvas->render(&incremental); canvas->updateCanvas(); canvas->render(&full);
+            CHECK(incremental == full); // full layer domain, including the bridge beyond the source
+            CHECK(list->item(0) == row && window.findChild<ImageListBar *>()->findChild<QToolButton *>() == tab);
+        }
+    }
+    CHECK(structural == 0 && FloatingRenderCache::shared().stats().misses == warm.misses);
+    doc->setLayerVisibility(1, false); canvas->render(&incremental); canvas->updateCanvas(); canvas->render(&full);
+    CHECK(incremental == full && row->checkState() == Qt::Unchecked);
+    doc->setLayerVisibility(1, true);
+    doc->setLayerBlendMode(1, BlendMode::Normal); doc->setLayerOpacity(1, 0.7f);
+    const QImage before = doc->flatten(); const QImage mask = doc->selection().mask();
+    const int history = doc->history().currentIndex();
+    QTimer::singleShot(0, [&]() {
+        auto *dialog = qobject_cast<LayerPropertiesDialog *>(QApplication::activeModalWidget()); CHECK(dialog);
+        if (!dialog) return;
+        CHECK(QMetaObject::invokeMethod(dialog, "previewChanged", Qt::DirectConnection,
+              Q_ARG(int, 80), Q_ARG(bool, false), Q_ARG(int, int(BlendMode::Multiply))));
+        canvas->render(&incremental); canvas->updateCanvas(); canvas->render(&full); CHECK(incremental == full);
+        dialog->reject();
+    });
+    CHECK(QMetaObject::invokeMethod(window.findChild<LayersPanel *>(), "layerDoubleClicked", Qt::DirectConnection, Q_ARG(int, 1)));
+    CHECK(doc->flatten() == before && doc->selection().mask() == mask && doc->history().currentIndex() == history);
+    CHECK(!doc->floatingPixelSession()->isSuspended() && FloatingRenderCache::shared().stats().misses == warm.misses);
+    AdjustmentPreview preview(doc, canvas, {1});
+    doc->setLayerOpacity(1, 0.4f);
+    CHECK(!preview.commit([](const QImage &image) { QImage changed = image; changed.fill(Qt::red); return changed; }, "stale"));
+    CHECK(doc->history().currentIndex() == history); // property changes invalidate worker snapshots too
+}
+
 static void pasteDialogStyles() {
     const QString originalStyle = QApplication::style()->objectName();
     const QString originalSheet = qApp->styleSheet();
@@ -1045,7 +1101,7 @@ static void benchmarkFloating() {
         send(QEvent::MouseButtonRelease, start + QPointF(120, 80), Qt::LeftButton, Qt::NoButton);
         std::sort(frames.begin(), frames.end());
         std::cout << "BENCH 4000x3000 patch=" << patch.width() << 'x' << patch.height()
-                  << " press_ms=" << press << " frame_median_ms=" << frames[frames.size()/2]
+                  << " press_ms=" << press << " frame_mean_ms=" << std::accumulate(frames.begin(), frames.end(), 0.0) / frames.size() << " frame_median_ms=" << frames[frames.size()/2]
                   << " frame_max_ms=" << frames.back() << " stationary_20_ms=" << stationary << std::endl;
         auto measure = [&](const char *operation, QPointF anchor, QPointF delta, Qt::MouseButton button) {
             send(QEvent::MouseButtonPress, anchor, button, button);
@@ -1060,11 +1116,60 @@ static void benchmarkFloating() {
             send(QEvent::MouseButtonRelease, anchor + delta * 3, button, Qt::NoButton);
             std::sort(times.begin(), times.end());
             std::cout << "BENCH " << operation << " patch=" << patch.width() << 'x' << patch.height()
-                      << " median_ms=" << times[1] << " max_ms=" << times.back() << std::endl;
+                      << " mean_ms=" << std::accumulate(times.begin(), times.end(), 0.0) / times.size() << " median_ms=" << times[1] << " max_ms=" << times.back() << std::endl;
         };
         measure("resize", doc->floatingPixelSession()->sourceBounds().toAlignedRect().bottomRight(), QPointF(20, 15), Qt::LeftButton);
         const QRectF bounds = doc->floatingPixelSession()->sourceBounds();
         measure("rotate", bounds.center() + QPointF(bounds.width()/3, 0), QPointF(-4, 12), Qt::RightButton);
+    }
+}
+
+// Phase timings complement the event/render benchmark; kept opt-in so CI has
+// no wall-clock pass/fail thresholds. Use identical builds for comparisons.
+static void benchmarkStage4A() {
+    for (bool layered : {false, true}) {
+        MainWindow window;
+        auto *canvas = window.findChild<CanvasWidget *>(); auto *doc = canvas->document();
+        doc->resize(4000, 3000); fullCanvasView(canvas); canvas->setZoom(0.2);
+        if (layered) {
+            doc->addLayer("Target"); doc->activeLayer()->setOffset(QPoint(-25, 17));
+            doc->addLayer("Upper"); doc->activeLayer()->clear(QColor(30, 120, 90, 70));
+            doc->activeLayer()->setBlendMode(BlendMode::Multiply); doc->setActiveLayer(1);
+        }
+        QImage coverage(2000, 1500, QImage::Format_Grayscale8); coverage.fill(255);
+        if (layered) { Selection shape(2000, 1500); shape.selectEllipse(QRect(0, 0, 1999, 1499)); coverage = shape.mask(); }
+        auto mime = ClipboardPixels{fixture(2000, 1500), coverage, QPoint()}.mimeData();
+        QApplication::clipboard()->setMimeData(mime.release()); noPrompt(window, "paste");
+        doc->setFloatingPixelTransform(QTransform().rotate(17) * QTransform::fromTranslate(700, 250));
+        QImage screen(canvas->size(), QImage::Format_ARGB32_Premultiplied); canvas->render(&screen);
+        const auto *session = doc->floatingPixelSession(); const QRect canvasRect(QPoint(), doc->size());
+        const QRect footprint = session->sourceBounds().intersected(QRectF(canvasRect)).toAlignedRect();
+        auto measure = [&](const char *phase, auto operation) {
+            std::vector<double> samples;
+            for (int i = 0; i < 12; ++i) { QElapsedTimer timer; timer.start(); operation(i); samples.push_back(timer.nsecsElapsed()/1e6); }
+            const double mean = std::accumulate(samples.begin(), samples.end(), 0.0)/samples.size();
+            std::sort(samples.begin(), samples.end());
+            std::cout << "PROFILE layers=" << doc->layerCount() << " shape=" << (layered ? "ellipse" : "rectangle")
+                      << " phase=" << phase << " mean_ms=" << mean << " p95_ms=" << samples.back()
+                      << " max_ms=" << samples.back() << std::endl;
+        };
+        QImage result;
+        measure("source_sampling", [&](int) { result = session->render(footprint); });
+        measure("mask_generation", [&](int) { result = session->renderCoverage(canvasRect); });
+        measure("marquee_geometry", [&](int) { QPainterPath path; path.addRegion(doc->selection().region()); path = path.simplified(); });
+        const auto effective = doc->snapshotEffectiveLayers(); std::vector<Layer> layers;
+        for (const auto &layer : effective) layers.push_back(*layer);
+        measure("compositing_only", [&](int) { result = Document::compositeLayers(layers, doc->size()); });
+        measure("document_thumbnail", [&](int) { result = doc->thumbnail(QSize(30, 30)); });
+        measure("layer_thumbnail", [&](int) { result = session->renderScaled(canvasRect, QSize(40, 30)); });
+        measure("opacity_invalidation", [&](int i) { doc->setLayerOpacity(doc->activeLayerIndex(), 0.2f + i*0.05f); });
+        const auto opacityStart = FloatingRenderCache::shared().stats();
+        measure("opacity_frame", [&](int i) { doc->setLayerOpacity(doc->activeLayerIndex(), 0.2f + i*0.05f); canvas->render(&screen); });
+        const auto cacheBefore = FloatingRenderCache::shared().stats();
+        std::cout << "CACHE opacity hits=" << cacheBefore.hits - opacityStart.hits << " misses=" << cacheBefore.misses - opacityStart.misses
+                  << " cost_kib=" << cacheBefore.costKiB << " limit_kib=" << cacheBefore.limitKiB << std::endl;
+        const QTransform original = session->transform();
+        measure("transform_frame", [&](int i) { doc->setFloatingPixelTransform(original * QTransform::fromTranslate(i*9, i*3)); canvas->render(&screen); });
     }
 }
 
@@ -1083,6 +1188,7 @@ int main(int argc, char **argv) {
     QSettings("PaintDali", "PaintDali").setValue("ui/language", "en");
     I18n::setLanguage(I18n::Lang::English);
     if (app.arguments().contains("--benchmark-floating")) { benchmarkFloating(); return failures ? 1 : 0; }
+    if (app.arguments().contains("--benchmark-stage4a")) { benchmarkStage4A(); return failures ? 1 : 0; }
     pasteDialogStyles();
     utilityPanelPreferences();
     paths();
@@ -1103,6 +1209,7 @@ int main(int argc, char **argv) {
     floatingContextAndClipboard();
     floatingNativeAndDocumentSwitch();
     floatingCoalescing();
+    floatingLayerAppearance();
     std::cout << checks << " paste checks, " << failures << " failures\n";
     return failures ? 1 : 0;
 }

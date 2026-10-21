@@ -2,6 +2,7 @@
 // Exercises the real code paths: tools, effects, adjustments, layers,
 // selection, undo/redo, save/load, i18n and theming.
 #include <QApplication>
+#include "core/floatingrendercache.h"
 #include "dialogs/previewdialog.h"
 #include <QDialogButtonBox>
 #include <QImage>
@@ -4637,6 +4638,98 @@ int main(int argc, char **argv) {
             }
             CHECK(doc.thumbnail(QSize(30, 30)).size() == QSize(30, 21), "document thumbnail stays bounded");
         }
+    }
+
+    SECTION("Bounded floating sample cache ownership and eviction");
+    {
+        FloatingRenderCache cache(16);
+        FloatingRenderCache::Tile tile;
+        tile.pixels = QImage(32, 32, QImage::Format_ARGB32_Premultiplied); tile.pixels.fill(Qt::red);
+        tile.coverage = QImage(32, 32, QImage::Format_Grayscale8); tile.coverage.fill(255); tile.opaqueCoverage = true;
+        for (int i = 0; i < 100; ++i) cache.insert(QByteArray::number(i), tile);
+        CHECK(cache.stats().costKiB <= 16 && cache.stats().entries <= 2, "LRU respects total image and key budget");
+        CHECK(cache.find("0").isNull() && !cache.find("99").isNull(), "old tiles evict before recently inserted samples");
+        auto returned = cache.find("99"); returned.pixels.fill(Qt::blue); returned.coverage.fill(0);
+        CHECK(cache.find("99").pixels.pixelColor(0, 0) == QColor(Qt::red)
+              && cache.find("99").coverage.constScanLine(0)[0] == 255, "returned tile values detach on mutation");
+        cache.clear();
+        CHECK(cache.stats().costKiB == 0 && cache.stats().entries == 0 && returned.pixels.pixelColor(0, 0) == QColor(Qt::blue),
+              "eviction releases cache ownership without invalidating callers");
+        FloatingRenderCache disabled(0); disabled.insert("tile", tile);
+        CHECK(disabled.stats().entries == 0, "oversized entries are rejected without exceeding budget");
+    }
+
+    SECTION("Floating cached rendering equals uncached composition through mutations");
+    {
+        auto &cache = FloatingRenderCache::shared(); cache.clear();
+        Document doc(640, 480); doc.activeLayer()->clear(QColor(25, 130, 190, 200));
+        doc.addLayer("Offset target");
+        QImage base(120, 85, QImage::Format_ARGB32_Premultiplied); base.fill(QColor(190, 35, 60, 120));
+        doc.activeLayer()->setImage(base); doc.activeLayer()->setOffset(QPoint(-13, 11));
+        QImage source(307, 281, QImage::Format_ARGB32_Premultiplied); source.fill(QColor(60, 90, 200, 120)); source.setPixel(10, 20, 0);
+        QImage mask(source.size(), QImage::Format_Grayscale8); mask.fill(255);
+        for (int y = 0; y < mask.height(); ++y) for (int x = 0; x < mask.width(); ++x)
+            if ((x+y)%5 == 0) mask.scanLine(y)[x] = 100; else if ((x+y)%7 == 0) mask.scanLine(y)[x] = 0;
+        CHECK(doc.pasteFloatingPixels(source, mask, QPoint(200, 30))
+              && doc.setFloatingPixelTransform(QTransform().rotate(13.5) * QTransform::fromTranslate(200.25, 30.5)),
+              "cached fixture crosses tile boundaries with fractional alpha and geometry");
+        auto uncached = [](Document &document) {
+            std::vector<Layer> layers;
+            const auto *session = document.floatingPixelSession();
+            for (int i = 0; i < document.layerCount(); ++i) {
+                Layer layer(*document.layerAt(i));
+                if (session && !session->isSuspended() && session->targets(document.layerAt(i))) {
+                    const QRect domain = session->documentBounds().intersected(QRectF(QPointF(), document.size())).toAlignedRect();
+                    if (!domain.isEmpty()) { layer.setImage(session->render(domain)); layer.setOffset(domain.topLeft()); }
+                    else layer.setVisible(false);
+                }
+                layers.push_back(layer);
+            }
+            return Document::compositeLayers(layers, document.size());
+        };
+        CHECK(doc.flatten() == uncached(doc), "first cache population preserves full-resolution reference");
+        const auto warm = cache.stats();
+        CHECK(doc.flatten() == uncached(doc) && cache.stats().misses == warm.misses && cache.stats().hits > warm.hits,
+              "unchanged rendering reuses sampled pixels and coverage");
+        for (BlendMode mode : Layer::allBlendModes()) for (float opacity : {0.0f, 0.3f, 1.0f}) {
+            doc.setLayerBlendMode(1, mode); doc.setLayerOpacity(1, opacity);
+            CHECK(doc.flatten() == uncached(doc), "cached samples preserve blend/opacity composition including Overwrite");
+            CHECK(cache.stats().misses == warm.misses, "layer properties do not resample unchanged source geometry");
+        }
+        doc.setLayerVisibility(1, false); CHECK(doc.flatten() == uncached(doc), "hidden source does not leave cached pixels");
+        doc.setLayerVisibility(1, true); doc.setLayerBlendMode(1, BlendMode::Normal);
+        CHECK(doc.setFloatingPixelTransform(QTransform().rotate(-27) * QTransform::fromTranslate(-100, 80))
+              && doc.flatten() == uncached(doc) && cache.stats().misses > warm.misses, "transform change invalidates samples and handles off-canvas clipping");
+        CHECK(doc.setFloatingPixelTransform(QTransform::fromScale(1.2, 0.8) * QTransform::fromTranslate(30.5, 40.25))
+              && doc.flatten() == uncached(doc), "axis-aligned footprint cache matches replacement reference");
+        const auto axisWarm = cache.stats(); doc.setLayerOpacity(1, 0.6f);
+        CHECK(doc.flatten() == uncached(doc) && cache.stats().misses == axisWarm.misses,
+              "axis-aligned property updates reuse rendered footprint without resampling");
+        const QRect partial(31, 29, 283, 297);
+        CHECK(doc.flattenVisible(partial) == uncached(doc).copy(partial), "unaligned subregions reuse correctly clipped tiles");
+        QImage changed(70, 90, QImage::Format_ARGB32_Premultiplied); changed.fill(Qt::yellow);
+        QImage changedMask(changed.size(), QImage::Format_Grayscale8); changedMask.fill(128);
+        CHECK(doc.pasteFloatingPixels(changed, changedMask, QPoint(50, 40)) && doc.flatten() == uncached(doc),
+              "replacement source and independent geometry never reuse stale tiles");
+        doc.history().undo(); CHECK(doc.flatten() == uncached(doc), "history restores matching source cache identity");
+        CHECK(doc.suspendFloatingPixels(), "cached source suspends safely");
+        doc.activeLayer()->image().setPixelColor(1, 1, Qt::black);
+        CHECK(doc.prepareFloatingPixelGesture() && doc.setFloatingPixelTransform(QTransform::fromTranslate(120, 90))
+              && doc.flatten() == uncached(doc), "edited raster and resumed lift use fresh source samples");
+        QTemporaryDir dir; const QString native = dir.filePath("cached.psw");
+        CHECK(doc.saveNative(native), "cached editable source saves");
+        Document reopened; CHECK(reopened.loadNative(native) && reopened.flatten() == doc.flatten(), "native reopen is independent of in-memory cache identity");
+        const auto misses = cache.stats().misses;
+        FloatingRenderCache::Tile eviction;
+        eviction.pixels = QImage(256, 256, QImage::Format_ARGB32_Premultiplied); eviction.pixels.fill(0);
+        eviction.coverage = QImage(256, 256, QImage::Format_Grayscale8); eviction.coverage.fill(255);
+        for (int i = 0; i < 1000; ++i) cache.insert("evict:" + QByteArray::number(i), eviction);
+        CHECK(cache.stats().costKiB <= cache.stats().limitKiB, "shared budget stays bounded under cross-document-style pressure");
+        CHECK(doc.flatten() == uncached(doc) && reopened.flatten() == doc.flatten() && cache.stats().misses > misses,
+              "eviction rebuilds correct results for independent documents");
+        const QImage before = doc.flatten(); const auto beforeStats = cache.stats();
+        CHECK(!doc.setFloatingPixelTransform(QTransform::fromScale(0, 1)) && doc.flatten() == before
+              && cache.stats().misses == beforeStats.misses, "invalid transforms do not corrupt or invalidate good samples");
     }
 
     // ---------- RESULT ----------

@@ -117,6 +117,8 @@ private:
     int m_marchingOffset = 0;
     qint64 m_selectionOutlineKey = -1;
     QPainterPath m_selectionOutline;
+    QImage m_outlineMask;
+    QRect m_outlineBounds;
 
     QTimer m_floatingMoveTimer;
     bool m_pendingFloatingMove = false;

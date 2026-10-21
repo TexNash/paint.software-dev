@@ -9,6 +9,7 @@
 #include <QTabletEvent>
 #include <QSettings>
 #include <cmath>
+#include <cstring>
 
 bool CanvasWidget::event(QEvent *event)
 {
@@ -58,6 +59,8 @@ void CanvasWidget::setDocument(Document *doc) {
         m_currentTool->deactivate(*this);
     if (m_document) disconnect(m_document, nullptr, this, nullptr);
     m_previewImage = QImage();
+    m_outlineMask = QImage();
+    m_selectionOutlineKey = -1;
     m_document = doc;
     if (doc) {
         connect(&doc->history(), &HistoryManager::historyChanged, this, [this]() {
@@ -71,6 +74,16 @@ void CanvasWidget::setDocument(Document *doc) {
         connect(doc, &Document::floatingContextChanging, this, [this]() {
             flushFloatingMove();
             if (m_currentTool && m_currentTool->type() == ToolType::Move) m_currentTool->deactivate(*this);
+        });
+        connect(doc, &Document::layerAppearanceChanged, this, [this](int index) {
+            const auto *layer = m_document->layerAt(index);
+            if (!layer) return;
+            const auto *session = m_document->floatingPixelSession();
+            const QRectF domain = session && !session->isSuspended() && session->targets(layer)
+                ? session->documentBounds() : QRectF(layer->offset(), layer->image().size());
+            // Visibility/blend/opacity affect the whole finite layer domain,
+            // including transparent pixels in Overwrite, not just the source.
+            updateCanvasRegion(domain.intersected(QRectF(QPointF(), m_document->size())).toAlignedRect());
         });
         connect(doc, &Document::documentChanged, this, [this]() {
             m_cacheValid = false;
@@ -434,9 +447,25 @@ void CanvasWidget::drawSelectionMarching(QPainter &painter) {
     // Rebuilding it on every paint scans the full canvas and simplifies thousands
     // of scanline rectangles, overwhelming otherwise-local brush updates.
     if (m_selectionOutlineKey != sel.mask().cacheKey()) {
-        QPainterPath path;
-        path.addRegion(sel.region());
-        m_selectionOutline = path.simplified();
+        const auto *session = m_document->floatingPixelSession();
+        const QRect bounds = sel.boundingRect();
+        const QPoint delta = bounds.topLeft() - m_outlineBounds.topLeft();
+        bool translated = session && !session->isSuspended() && !m_outlineMask.isNull()
+            && bounds.size() == m_outlineBounds.size() && m_outlineBounds.translated(delta) == bounds;
+        // Compare raster coverage rather than assuming floating-point affine
+        // translations produce identical boundary pixels. This preserves the
+        // exact clipped marching outline while avoiding costly path rebuilding.
+        for (int y = 0; translated && y < bounds.height(); ++y)
+            translated = std::memcmp(sel.mask().constScanLine(bounds.y() + y) + bounds.x(),
+                                      m_outlineMask.constScanLine(m_outlineBounds.y() + y) + m_outlineBounds.x(),
+                                      size_t(bounds.width())) == 0;
+        if (translated) m_selectionOutline.translate(delta);
+        else {
+            QPainterPath path; path.addRegion(sel.region());
+            m_selectionOutline = path.simplified();
+        }
+        m_outlineBounds = bounds;
+        m_outlineMask = sel.mask(); // COW reference, not another full raster copy
         m_selectionOutlineKey = sel.mask().cacheKey();
     }
     if (m_selectionOutline.isEmpty()) return;

@@ -15,6 +15,10 @@ double radius(const QRect &rect, double zoom) {
 }
 
 // The eight anchors, in the same order as the Handle enum values below.
+double pivotRadius(const QRect &rect, double zoom) {
+    return std::min({5.0 / std::max(zoom, 0.01), rect.width() / 8.0, rect.height() / 8.0});
+}
+
 static QVector<QPointF> anchors(const QRect &rect) {
     return {
         rect.topLeft(),
@@ -128,6 +132,45 @@ QRect resized(const QRect &rect, Handle handle, const QPointF &canvasPos,
     if (out.width() < 2) out.setWidth(2);
     if (out.height() < 2) out.setHeight(2);
     return out;
+}
+
+QTransform resizeTransform(const QRect &rect, Handle handle, const QPointF &pos,
+                           Qt::KeyboardModifiers mods) {
+    if (rect.isEmpty()) return {};
+    int sx = 0, sy = 0;
+    switch (handle) {
+    case Handle::TopLeft: sx = -1; sy = -1; break;
+    case Handle::Top: sy = -1; break;
+    case Handle::TopRight: sx = 1; sy = -1; break;
+    case Handle::Right: sx = 1; break;
+    case Handle::BottomRight: sx = 1; sy = 1; break;
+    case Handle::Bottom: sy = 1; break;
+    case Handle::BottomLeft: sx = -1; sy = 1; break;
+    case Handle::Left: sx = -1; break;
+    default: return {};
+    }
+    const QRectF r(rect);
+    const bool symmetric = mods & Qt::AltModifier;
+    const QPointF anchor(symmetric || !sx ? r.center().x() : (sx > 0 ? r.left() : r.right()),
+                         symmetric || !sy ? r.center().y() : (sy > 0 ? r.top() : r.bottom()));
+    // Unmodified handles use QRect's inclusive right/bottom pixel coordinates.
+    const bool inclusive = !(mods & (Qt::AltModifier | Qt::ShiftModifier));
+    double x = sx ? (pos.x() + (inclusive && sx > 0 ? 1 : 0) - anchor.x())
+                         / (sx * r.width() / (symmetric ? 2 : 1)) : 1;
+    double y = sy ? (pos.y() + (inclusive && sy > 0 ? 1 : 0) - anchor.y())
+                         / (sy * r.height() / (symmetric ? 2 : 1)) : 1;
+    if ((mods & Qt::ShiftModifier) && sx && sy) {
+        const double magnitude = std::max({std::abs(x), std::abs(y), 2.0/r.width(), 2.0/r.height()});
+        x = std::copysign(magnitude, x);
+        y = std::copysign(magnitude, y);
+    }
+    if (sx) x = std::copysign(std::max(std::abs(x), 2.0 / r.width()), x);
+    if (sy) y = std::copysign(std::max(std::abs(y), 2.0 / r.height()), y);
+    QTransform result;
+    result.translate(anchor.x(), anchor.y());
+    result.scale(x, y);
+    result.translate(-anchor.x(), -anchor.y());
+    return result;
 }
 
 bool inRotationZone(const QRect &rect, const QPointF &canvasPos, double zoom) {

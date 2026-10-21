@@ -9,13 +9,17 @@ AdjustmentPreview::AdjustmentPreview(Document *doc, CanvasWidget *canvas,
     if (canvas) connect(canvas, &QObject::destroyed, this, &AdjustmentPreview::cancel);
     m_snapshot.size = doc->size();
     m_snapshot.selection = doc->selection();
+    m_snapshot.emptyFloatingSelection = doc->floatingPixelSession() && !doc->selection().hasSelection();
     m_snapshot.targets = targets;
-    for (int i = 0; i < doc->layerCount(); ++i) m_snapshot.layers.push_back(*doc->layerAt(i));
+    const auto layers = doc->snapshotEffectiveLayers();
+    if (layers.empty()) { m_active = false; return; }
+    for (const auto &layer : layers) m_snapshot.layers.push_back(*layer);
     m_timer.setSingleShot(true);
     m_timer.setInterval(16);
     connect(&m_timer, &QTimer::timeout, this, &AdjustmentPreview::start);
     // A modal dialog prevents ordinary edits; invalidate on any external mutation.
     connect(doc, &Document::documentChanged, this, &AdjustmentPreview::cancel);
+    connect(doc, &Document::layerAppearanceChanged, this, &AdjustmentPreview::cancel);
     connect(doc, &Document::selectionChanged, this, &AdjustmentPreview::cancel);
     connect(doc, &Document::layersChanged, this, &AdjustmentPreview::cancel);
     connect(doc, &QObject::destroyed, this, &AdjustmentPreview::cancel);
@@ -39,6 +43,7 @@ AdjustmentPreview::Result AdjustmentPreview::render(const Snapshot &snapshot,
     auto layers = snapshot.layers;
     for (int index : snapshot.targets) {
         if (cancelled->load()) return {};
+        if (snapshot.emptyFloatingSelection) continue;
         if (index < 0 || index >= static_cast<int>(layers.size())) continue;
         auto &layer = layers[index];
         layer.setImage(adjustedImage(layer.image(), layer.offset(), snapshot.selection, operation));

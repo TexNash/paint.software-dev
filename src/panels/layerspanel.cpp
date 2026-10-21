@@ -15,8 +15,15 @@
 #include <QMenu>
 #include <QMessageBox>
 #include <QApplication>
+#include <QSignalBlocker>
 
 namespace {
+QImage thumbnailPixels(Document *document, const Layer *layer) {
+    const auto *session = document->floatingPixelSession();
+    if (session && !session->isSuspended() && session->targets(layer))
+        return session->renderScaled(QRect(QPoint(), document->size()), document->size().scaled(40, 30, Qt::KeepAspectRatio));
+    return layer->image();
+}
 // Neutral "ink" colour and layer-fill colour that adapt to the active theme so
 // the icons stay visible on both light and dark panels.
 static QColor inkColor()    { return Theme::isDark() ? QColor(210, 210, 210) : QColor(60, 60, 60); }
@@ -220,8 +227,24 @@ void LayersPanel::setDocument(Document *doc) {
     m_document = doc;
     if (doc) {
         connect(doc, &Document::layersChanged, this, &LayersPanel::updateLayerList);
+        connect(doc, &Document::layerAppearanceChanged, this, [this](int index) {
+            const auto *layer = m_document->layerAt(index);
+            if (!layer) return;
+            const int row = m_document->layerCount() - 1 - index;
+            auto *item = m_layerList->item(row);
+            if (!item || item->data(Qt::UserRole).toInt() != index) { updateLayerList(); return; }
+            const QSignalBlocker listBlock(m_layerList);
+            item->setCheckState(layer->isVisible() ? Qt::Checked : Qt::Unchecked);
+            item->setForeground(layer->isVisible() ? QBrush() : QBrush(Qt::gray));
+            if (index == m_document->activeLayerIndex()) {
+                const QSignalBlocker opacityBlock(m_opacitySlider), blendBlock(m_blendModeCombo);
+                m_opacitySlider->setValue(qRound(layer->opacity() * 100));
+                m_blendModeCombo->setCurrentIndex(int(layer->blendMode()));
+            }
+        });
         // Keep thumbnails live on every content change (brush, bucket, effect...),
         // debounced so a continuous stroke doesn't rebuild them on every pixel.
+        connect(doc, &Document::floatingPixelsChanged, this, [this]() { m_thumbRefreshTimer->start(); });
         connect(doc, &Document::documentChanged, this, [this]() {
             m_thumbRefreshTimer->start();
         });
@@ -281,7 +304,7 @@ void LayersPanel::updateLayerList() {
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
         item->setData(Qt::UserRole, i);  // remember which layer this row shows
         item->setCheckState(layer->isVisible() ? Qt::Checked : Qt::Unchecked);
-        item->setIcon(makeThumbnail(layer->image()));
+        item->setIcon(makeThumbnail(thumbnailPixels(m_document, layer)));
         if (!layer->isVisible())
             item->setForeground(Qt::gray);
         m_layerList->addItem(item);
@@ -303,7 +326,7 @@ void LayersPanel::refreshThumbnails() {
         auto *item = m_layerList->item(row);
         const int idx = item->data(Qt::UserRole).toInt();
         if (auto *layer = m_document->layerAt(idx))
-            item->setIcon(makeThumbnail(layer->image()));
+            item->setIcon(makeThumbnail(thumbnailPixels(m_document, layer)));
     }
 }
 

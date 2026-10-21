@@ -5,10 +5,13 @@
 #include <QString>
 #include <QStringList>
 #include "selection.h"
+#include "floatingpixelsession.h"
 #include <memory>
+#include <optional>
 #include <vector>
 
 class Document;
+class Layer;
 
 class HistoryCommand {
 public:
@@ -16,6 +19,36 @@ public:
     virtual void undo() = 0;
     virtual void redo() = 0;
     virtual QString description() const = 0;
+};
+
+// Capture before an internal session operation, captureAfter() after its last
+// preview, then push onto the document's existing timeline. No per-mouse-move
+// entries. Immutable session images are shared by checkpoint copies. Only push
+// after captureAfter() succeeds; caller marks the completed edit modified.
+class FloatingPixelSessionCommand : public HistoryCommand {
+public:
+    FloatingPixelSessionCommand(Document *doc, int layerIndex, const QString &description);
+    bool captureAfter();
+    void undo() override;
+    void redo() override;
+    QString description() const override { return m_description; }
+private:
+    struct State {
+        QImage image;
+        QPoint offset;
+        bool retained = false;
+        Selection selection;
+        std::optional<FloatingPixelSession> session;
+        bool valid = false;
+    };
+    State capture() const;
+    void apply(const State &state);
+    Document *m_doc;
+    int m_layerIndex;
+    std::weak_ptr<Layer> m_target;
+    QString m_description;
+    State m_before, m_after;
+    bool m_hasAfter = false;
 };
 
 struct ImageEditState { int index; QImage before, after; };
@@ -117,6 +150,8 @@ private:
         int activeLayer = 0;
         Selection selection;
         std::vector<std::shared_ptr<class Layer>> layers;
+        std::optional<FloatingPixelSession> session;
+        int sessionLayer = -1;
     };
     static State capture(Document *doc);
     static void restore(Document *doc, const State &state);

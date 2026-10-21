@@ -126,6 +126,7 @@ private slots:
     void updateImageThumbnail();
 
 private:
+    void pastePixels(bool intoNewLayer);
     void createMenus();
     // Loads external effect plugins and fills the Effects ▸ Plugins submenu.
     void populatePluginsMenu(QMenu *pluginsMenu);
@@ -194,6 +195,7 @@ private:
 
     Document *m_document = nullptr;   // == m_documents[m_activeDocIndex]
     QVector<Document*> m_documents;
+    QMap<Document *, ToolType> m_floatingDocumentTools;
     int m_activeDocIndex = -1;
     class ImageListBar *m_imageListBar = nullptr;
 

@@ -4,6 +4,7 @@
 #include "i18n.h"
 #include "theme.h"
 #include "core/document.h"
+#include "core/clipboardpixels.h"
 #include "core/adjustmentpreview.h"
 #include "canvas/canvaswidget.h"
 #include "panels/layerspanel.h"
@@ -199,6 +200,8 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
     });
     connect(m_document, &Document::documentChanged, this, &MainWindow::updateTitle);
     connect(m_document, &Document::documentChanged, this, &MainWindow::updateImageList);
+    connect(m_document, &Document::floatingPixelsChanged, this, &MainWindow::updateImageList);
+    connect(m_document, &Document::layerAppearanceChanged, this, &MainWindow::updateImageList);
     connect(m_document, &Document::sizeChanged, this, [this](int w, int h) {
         m_sizeLabel->setText(QString("%1 × %2").arg(w).arg(h));
     });
@@ -670,7 +673,8 @@ void MainWindow::populatePluginsMenu(QMenu *pluginsMenu) {
 
 void MainWindow::runPluginEffect(PluginEffect *effect) {
     if (!effect || !m_document) return;
-    auto *layer = m_document->activeLayer();
+    const auto effective = m_document->snapshotEffectiveLayers();
+    auto *layer = effective.empty() ? nullptr : effective[m_document->activeLayerIndex()].get();
     if (!layer) return;
 
     if (effect->paramCount() == 0) {
@@ -1065,9 +1069,7 @@ void MainWindow::adjustCurrentToolBrushSize(int delta) {
 void MainWindow::toggleActiveLayerVisibility() {
     auto *layer = m_document ? m_document->activeLayer() : nullptr;
     if (!layer) return;
-    layer->setVisible(!layer->isVisible());
-    emit m_document->layersChanged();
-    emit m_document->documentChanged();
+    m_document->setLayerVisibility(m_document->activeLayerIndex(), !layer->isVisible());
 }
 
 void MainWindow::showLayerPropertiesDialog() {
@@ -1088,8 +1090,7 @@ void MainWindow::showLayerPropertiesDialog() {
         layer->setVisible(visible);
         if (blendIdx >= 0 && blendIdx < modes.size())
             layer->setBlendMode(modes[blendIdx]);
-        emit m_document->documentChanged();
-        emit m_document->layersChanged();
+        m_document->notifyLayerAppearanceChanged(m_document->activeLayerIndex());
     });
 
     if (dlg.exec() == QDialog::Accepted) {
@@ -1115,14 +1116,13 @@ void MainWindow::showLayerPropertiesDialog() {
         layer->setOpacity(origOpacity);
         layer->setVisible(origVisible);
         layer->setBlendMode(origBlend);
-        emit m_document->documentChanged();
-        emit m_document->layersChanged();
+        m_document->notifyLayerAppearanceChanged(m_document->activeLayerIndex());
     }
 }
 
 void MainWindow::createKeyboardShortcuts() {
     addShortcutAction("Desélectionner", {QKeySequence("Return"), QKeySequence("Enter")}, [this]() {
-        if (!m_document || !m_document->selection().hasSelection()) return;
+        if (!m_document || (!m_document->selection().hasSelection() && !m_document->floatingPixelSession())) return;
         if (m_currentTool && m_currentTool->type() == ToolType::Text) return;
         deselectAll();
     });
@@ -1476,6 +1476,18 @@ void MainWindow::createDockPanels() {
             this, &MainWindow::selectTool);
     connect(m_toolOptionsPanel, &ToolOptionsPanel::toolOptionsChanged,
             this, [this]() { if (m_canvas) m_canvas->update(); });
+    connect(m_toolOptionsPanel,&ToolOptionsPanel::resamplingChanged,this,[this](int mode) {
+        if (!m_document || !m_canvas || !m_document->floatingPixelSession()) return;
+        m_canvas->flushFloatingMove();
+        if (m_currentTool) m_currentTool->deactivate(*m_canvas);
+        if (!m_document->floatingPixelSession()) return;
+        if (!m_document->setFloatingSampling(static_cast<FloatingPixelSession::Sampling>(mode))) {
+            if (auto *move=dynamic_cast<MoveTool *>(m_currentTool)) {
+                move->setSampling(m_document->floatingPixelSession()->sampling());
+                m_toolOptionsPanel->setTool(move);
+            }
+        }
+    });
     auto *optionsBar = new QToolBar("Barre d'outils variable", this);
     optionsBar->setObjectName("VariableToolbar");
     optionsBar->setMovable(false);
@@ -1685,6 +1697,8 @@ void MainWindow::wireDocumentSignals() {
 
     connect(m_document, &Document::documentChanged, this, &MainWindow::updateTitle);
     connect(m_document, &Document::documentChanged, this, &MainWindow::updateImageList);
+    connect(m_document, &Document::floatingPixelsChanged, this, &MainWindow::updateImageList);
+    connect(m_document, &Document::layerAppearanceChanged, this, &MainWindow::updateImageList);
     connect(m_document, &Document::sizeChanged, this, [this](int w, int h) {
         m_sizeLabel->setText(QString("%1 × %2").arg(w).arg(h));
     });
@@ -1711,12 +1725,18 @@ void MainWindow::addDocument(Document *doc) {
 
 void MainWindow::setActiveDocument(int index) {
     if (index < 0 || index >= m_documents.size()) return;
+    if (m_document && m_document->floatingPixelSession() && m_currentTool)
+        m_floatingDocumentTools[m_document] = m_currentTool->type();
     // Drop the previous document's connections so stale signals don't fire.
     if (m_document) disconnect(m_document, nullptr, this, nullptr);
 
     m_activeDocIndex = index;
     m_document = m_documents[index];
     wireDocumentSignals();
+    if (m_document->floatingPixelSession()) {
+        m_canvas->setCurrentTool(nullptr);
+        selectTool(m_floatingDocumentTools.value(m_document, ToolType::Move));
+    }
 
     // Refresh undo/redo enablement for the newly active document.
     const bool canUndo = m_document->history().canUndo();
@@ -1736,6 +1756,7 @@ void MainWindow::closeDocument(int index) {
 
     if (m_document == doc) disconnect(m_document, nullptr, this, nullptr);
     m_documents.removeAt(index);
+    m_floatingDocumentTools.remove(doc);
     doc->deleteLater();
 
     if (m_documents.isEmpty()) {
@@ -1755,12 +1776,22 @@ void MainWindow::closeCurrentDocument() {
 }
 
 void MainWindow::updateImageList() {
+    if (m_document && m_document->floatingPixelSession()) {
+        if (auto *move=dynamic_cast<MoveTool *>(m_currentTool)) {
+            const auto mode=m_document->floatingPixelSession()->sampling();
+            if (move->sampling() != mode) {
+                move->setSampling(mode);
+                m_toolOptionsPanel->setTool(move);
+            }
+        }
+    }
     if (m_imageListBar)
         m_imageListBar->setDocuments(m_documents, m_activeDocIndex);
     updateTitle();
 }
 
 bool MainWindow::maybeSaveDocument(Document *doc) {
+    if (doc && doc->floatingPixelSession()) emit doc->floatingContextChanging();
     if (!doc || !doc->isModified()) return true;
     // Make sure the user is looking at the document they're being asked about.
     int idx = m_documents.indexOf(doc);
@@ -1997,8 +2028,14 @@ bool MainWindow::saveDocumentAs() {
 
 // ---- Edit operations ----
 
-void MainWindow::undo() { m_document->history().undo(); m_canvas->updateCanvas(); }
-void MainWindow::redo() { m_document->history().redo(); m_canvas->updateCanvas(); }
+void MainWindow::undo() {
+    if (m_currentTool && m_currentTool->type() == ToolType::Move) m_currentTool->deactivate(*m_canvas);
+    m_document->history().undo(); m_canvas->updateCanvas();
+}
+void MainWindow::redo() {
+    if (m_currentTool && m_currentTool->type() == ToolType::Move) m_currentTool->deactivate(*m_canvas);
+    m_document->history().redo(); m_canvas->updateCanvas();
+}
 
 void MainWindow::cut() {
     copy();
@@ -2007,20 +2044,30 @@ void MainWindow::cut() {
 
 void MainWindow::copy() {
     if (!m_document->activeLayer()) return;
-    QImage img = m_document->activeLayer()->image();
-    if (m_document->selection().hasSelection()) {
-        img = m_document->selection().getMaskedImage(img, m_document->activeLayer()->offset());
+    std::optional<ClipboardPixels> pixels;
+    const auto *session = m_document->floatingPixelSession();
+    if (session && !m_document->selection().hasSelection()) return;
+    if (session && !session->isSuspended() && session->targets(m_document->activeLayer())) {
+        const QRect bounds = m_document->selection().boundingRect();
+        pixels = ClipboardPixels{session->transformedSource(bounds), session->renderCoverage(bounds), bounds.topLeft()};
+    } else {
+        pixels = ClipboardPixels::capture(m_document->activeLayer()->image(), m_document->activeLayer()->offset(), m_document->selection());
     }
-    QApplication::clipboard()->setImage(img);
+    if (pixels) {
+        auto mime = pixels->mimeData();
+        if (mime) QApplication::clipboard()->setMimeData(mime.release());
+    }
 }
 
 void MainWindow::copyMerged() {
     if (!m_document) return;
     // Copy the flattened (all visible layers) image, cropped to the selection.
-    QImage img = m_document->flatten();
-    if (m_document->selection().hasSelection())
-        img = m_document->selection().getMaskedImage(img);
-    QApplication::clipboard()->setImage(img);
+    if (m_document->floatingPixelSession() && !m_document->selection().hasSelection()) return;
+    const auto pixels = ClipboardPixels::capture(m_document->flatten(), QPoint(), m_document->selection());
+    if (pixels) {
+        auto mime = pixels->mimeData();
+        if (mime) QApplication::clipboard()->setMimeData(mime.release());
+    }
 }
 
 // Clipboard image data wins over file references. Only absolute local files are
@@ -2066,8 +2113,19 @@ void MainWindow::paste() {
             return;
         }
     }
-    QImage img = clipboardImage();
+    pastePixels(false);
+}
+
+void MainWindow::pastePixels(bool intoNewLayer) {
+    if (!m_document || !m_document->activeLayer()
+        || (!intoNewLayer && m_document->activeLayer()->isLocked())) return;
+    const auto *mime = QApplication::clipboard()->mimeData();
+    auto pixels = mime ? ClipboardPixels::decode(*mime) : std::optional<ClipboardPixels>();
+    const bool hasSourceOrigin = pixels.has_value();
+    QImage img = pixels ? pixels->pixels : clipboardImage();
     if (img.isNull()) return;
+    if (!pixels) pixels = ClipboardPixels::capture(img, QPoint(), Selection());
+    if (!pixels) return;
     bool expand = false;
     if (img.width() > m_document->width() || img.height() > m_document->height()) {
         PasteDialog dialog(img, this);
@@ -2077,15 +2135,36 @@ void MainWindow::paste() {
     }
     // Finish any pending Line/Shape edit on its original layer, not the newly
     // pasted layer. This must remain after the dialog's cancellation boundary.
+    if (m_currentTool) m_currentTool->deactivate(*m_canvas);
+    // Internal clipboard pixels retain their document-space source position.
+    // External images retain the established visible-top-left fallback.
+    QPoint origin;
+    const QRect view = m_canvas->rect().adjusted(m_canvas->rulerSize(), m_canvas->rulerSize(), 0, 0);
+    const QRectF visible(m_canvas->widgetToCanvas(view.topLeft()), m_canvas->widgetToCanvas(view.bottomRight()));
+    if (hasSourceOrigin && !expand) {
+        origin = pixels->pasteOrigin(visible, m_document->size());
+    } else if (!expand && !visible.contains(QRectF(QPointF(), m_document->size()))) {
+        origin = visible.topLeft().toPoint();
+        origin.setX(qBound(0, origin.x(), qMax(0, m_document->width() - img.width())));
+        origin.setY(qBound(0, origin.y(), qMax(0, m_document->height() - img.height())));
+    }
+    const QSize canvas = expand ? m_document->size().expandedTo(img.size()) : m_document->size();
+    // Bypass a context suspension: a newly pasted session starts in Move.
+    m_canvas->setCurrentTool(nullptr);
+    auto sampling=FloatingPixelSession::Sampling::Bicubic;
+    for (const auto &tool:m_tools)
+        if (auto *move=dynamic_cast<MoveTool *>(tool.get())) sampling=move->sampling();
+    if (!m_document->pasteFloatingPixels(pixels->pixels, pixels->coverage, origin, intoNewLayer, canvas,sampling)) {
+        m_canvas->setCurrentTool(m_currentTool);
+        statusBar()->showMessage(TR("Unable to allocate the pasted image."), 5000);
+        return;
+    }
     selectTool(ToolType::Move);
-    m_document->pasteImage(img, TR("Calque collé"), expand);
     m_canvas->updateCanvas();
 }
 
 void MainWindow::pasteIntoNewLayer() {
-    // In this implementation regular paste already lands on a new layer; this
-    // menu item makes the intent explicit and is what paint.net users expect.
-    paste();
+    pastePixels(true);
 }
 
 void MainWindow::pasteIntoNewImage() {
@@ -2103,6 +2182,13 @@ void MainWindow::fillSelection() {
     // Paint.NET's "Fill Selection" (Backspace): flood the selected region — or the
     // whole active layer when nothing is selected — with the primary colour.
     if (!m_document) return;
+    if (!m_document->activeLayer() || m_document->activeLayer()->isLocked()) return;
+    if (m_document->floatingPixelSession() && !m_document->selection().hasSelection()) return;
+    if (m_document->floatingPixelSession()) emit m_document->floatingContextChanging();
+    const bool wasModified = m_document->isModified();
+    auto checkpoint = m_document->floatingPixelSession()
+        ? std::make_unique<DocumentSnapshotCommand>(m_document, "Fill Selection") : nullptr;
+    if (checkpoint && !m_document->suspendFloatingPixels(false)) return;
     auto *layer = m_document->activeLayer();
     if (!layer || layer->isLocked()) return;
 
@@ -2121,24 +2207,38 @@ void MainWindow::fillSelection() {
     p.end();
 
     if (layer->image() != before) {
-        m_document->pushImageEdit(m_document->activeLayerIndex(), before, "Remplir la selection");
+        if (checkpoint) {
+            checkpoint->captureAfter();
+            m_document->history().push(std::move(checkpoint));
+            m_document->setModified(true);
+            m_document->notifyContentChanged();
+        } else m_document->pushImageEdit(m_document->activeLayerIndex(), before, "Remplir la selection");
         m_canvas->updateCanvas();
+    } else if (checkpoint) {
+        checkpoint->captureAfter(); checkpoint->undo(); m_document->setModified(wasModified);
     }
 }
 
 void MainWindow::selectAll() {
+    if (!m_document->finishFloatingPixels(false)) return;
     m_document->selection().selectAll();
     emit m_document->selectionChanged();
     m_canvas->update();
 }
 
 void MainWindow::deselectAll() {
+    if (m_document->floatingPixelSession()) {
+        if (m_currentTool) m_currentTool->deactivate(*m_canvas);
+        m_document->finishFloatingPixels();
+        return;
+    }
     m_document->selection().clear();
     emit m_document->selectionChanged();
     m_canvas->update();
 }
 
 void MainWindow::invertSelection() {
+    if (!m_document->finishFloatingPixels(false)) return;
     m_document->selection().invert();
     emit m_document->selectionChanged();
     m_canvas->update();
@@ -2180,6 +2280,8 @@ void MainWindow::flipActiveLayerHorizontal() {
     if (!m_document) return;
     auto *layer = m_document->activeLayer();
     if (!layer || layer->isLocked()) return;
+    if (!m_document->finishFloatingPixels(false)) return;
+    layer = m_document->activeLayer();
     QImage before = layer->image().copy();
     layer->setImage(layer->image().mirrored(true, false));
     m_document->pushImageEdit(m_document->activeLayerIndex(), before, "Retourner le calque");
@@ -2190,6 +2292,8 @@ void MainWindow::flipActiveLayerVertical() {
     if (!m_document) return;
     auto *layer = m_document->activeLayer();
     if (!layer || layer->isLocked()) return;
+    if (!m_document->finishFloatingPixels(false)) return;
+    layer = m_document->activeLayer();
     QImage before = layer->image().copy();
     layer->setImage(layer->image().mirrored(false, true));
     m_document->pushImageEdit(m_document->activeLayerIndex(), before, "Retourner le calque");
@@ -2238,6 +2342,8 @@ void MainWindow::showRotateZoomLayerDialog() {
     const double angle = angleSlider->value();
     const double scale = scaleSlider->value() / 100.0;
     if (angle == 0.0 && scale == 1.0) return;   // nothing to do
+    if (!m_document->finishFloatingPixels(false)) return;
+    layer = m_document->activeLayer();
 
     const QImage before = layer->image().copy();
     const QSize sz = before.size();
@@ -2267,6 +2373,7 @@ void MainWindow::growSelection() {
     const int px = QInputDialog::getInt(this, TR("Agrandir la sélection"),
                                         TR("Agrandir de (pixels) :"), 1, 1, 500, 1, &ok);
     if (!ok) return;
+    if (!m_document->finishFloatingPixels(false)) return;
     m_document->selection().expand(px);
     emit m_document->selectionChanged();
     m_canvas->update();
@@ -2278,6 +2385,7 @@ void MainWindow::shrinkSelection() {
     const int px = QInputDialog::getInt(this, TR("Rétrécir la sélection"),
                                         TR("Rétrécir de (pixels) :"), 1, 1, 500, 1, &ok);
     if (!ok) return;
+    if (!m_document->finishFloatingPixels(false)) return;
     m_document->selection().contract(px);
     emit m_document->selectionChanged();
     m_canvas->update();
@@ -2289,6 +2397,7 @@ void MainWindow::featherSelection() {
     const int px = QInputDialog::getInt(this, TR("Adoucir la sélection"),
                                         TR("Rayon d'adoucissement (pixels) :"), 2, 1, 200, 1, &ok);
     if (!ok) return;
+    if (!m_document->finishFloatingPixels(false)) return;
     m_document->selection().feather(px);
     emit m_document->selectionChanged();
     m_canvas->update();
@@ -2335,6 +2444,22 @@ void MainWindow::applyImageOperationToTargetLayers(const std::function<QImage(co
     if (m_repeatEffectAction) {
         m_repeatEffectAction->setEnabled(true);
         m_repeatEffectAction->setText(TR("Répéter : ") + description);
+    }
+
+    if (m_document->floatingPixelSession()) {
+        if (!m_document->selection().hasSelection()) return;
+        const auto layers = m_document->snapshotEffectiveLayers();
+        if (layers.empty()) return;
+        std::vector<ImageEditState> edits;
+        for (int index : targetLayerIndices()) {
+            const auto &layer = layers[index];
+            if (layer->isLocked()) continue;
+            const QImage before = layer->image();
+            const QImage after = adjustedImage(before, layer->offset(), m_document->selection(), operation);
+            if (after != before) edits.push_back({index, before, after});
+        }
+        m_document->commitImageEdits(edits, description);
+        return;
     }
 
     // When a selection is active, confine the effect to it (paint.net behaviour).
@@ -2442,6 +2567,28 @@ void MainWindow::transformSelectionContents(const std::function<QImage(const QIm
 
 void MainWindow::deleteSelectionContents() {
     if (!m_document || !m_document->selection().hasSelection()) return;
+
+    if (m_document->floatingPixelSession()) {
+        bool editable = false;
+        for (int index : targetLayerIndices())
+            if (auto *layer = m_document->layerAt(index)) editable |= !layer->isLocked();
+        if (!editable) return;
+        emit m_document->floatingContextChanging();
+        auto command = std::make_unique<DocumentSnapshotCommand>(m_document, "Erase Selection");
+        if (!m_document->suspendFloatingPixels(false)) return;
+        for (int index : targetLayerIndices()) {
+            auto *layer = m_document->layerAt(index);
+            if (layer && !layer->isLocked()) m_document->selection().eraseFromImage(layer->image(), layer->offset());
+        }
+        m_document->discardFloatingPixelSession();
+        m_document->selection().clear();
+        command->captureAfter();
+        m_document->history().push(std::move(command));
+        m_document->setModified(true);
+        emit m_document->selectionChanged();
+        m_document->notifyContentChanged();
+        return;
+    }
 
     bool changed = false;
     for (int index : targetLayerIndices()) {
@@ -2569,14 +2716,13 @@ void MainWindow::flipVertical() {
 }
 
 void MainWindow::cropToSelection() {
+    if (!m_document) return;
+    if (m_currentTool) m_currentTool->deactivate(*m_canvas);
     if (!m_document->selection().hasSelection()) return;
-    QRect rect = m_document->selection().boundingRect();
-    if (rect.isEmpty()) return;
 
     // Undoable crop that also updates the document dimensions (keeps canvas and
     // document size in sync).
-    m_document->cropTo(rect);
-    emit m_document->selectionChanged();
+    if (!m_document->cropToSelection()) return;
     m_canvas->updateCanvas();
     m_sizeLabel->setText(QString("%1 × %2").arg(m_document->width()).arg(m_document->height()));
 }
@@ -2605,8 +2751,15 @@ void MainWindow::toggleGrid() { m_canvas->setShowGrid(!m_canvas->showGrid()); }
 void MainWindow::selectTool(ToolType type) {
     for (auto &tool : m_tools) {
         if (tool->type() == type) {
+            if (!m_canvas->setCurrentTool(tool.get())) {
+                if (m_currentTool && m_toolActions.value(m_currentTool->type()))
+                    m_toolActions.value(m_currentTool->type())->setChecked(true);
+                statusBar()->showMessage(TR("Unable to finish the selection within the image memory limit."), 5000);
+                return;
+            }
             m_currentTool = tool.get();
-            m_canvas->setCurrentTool(m_currentTool);
+            if (auto *move=dynamic_cast<MoveTool *>(m_currentTool))
+                if (m_document->floatingPixelSession()) move->setSampling(m_document->floatingPixelSession()->sampling());
             m_canvas->setCursor(m_currentTool->cursor());
             m_toolOptionsPanel->setTool(m_currentTool);
             if (m_toolLabel) m_toolLabel->setText(TR(m_currentTool->name()));
@@ -2686,7 +2839,8 @@ void MainWindow::selectTool(ToolType type) {
 // ---- Effects ----
 
 void MainWindow::applyEffect(int effectIndex) {
-    auto *layer = m_document->activeLayer();
+    const auto effective = m_document->snapshotEffectiveLayers();
+    auto *layer = effective.empty() ? nullptr : effective[m_document->activeLayerIndex()].get();
     if (!layer) return;
 
     std::unique_ptr<Effect> effect;
@@ -3180,16 +3334,18 @@ void MainWindow::applyEffect(int effectIndex) {
     }
 
     if (effect) {
-        applyImageOperationToTargetLayers([effectPtr = effect.get()](const QImage &image) {
+        const std::shared_ptr<Effect> effectPtr(std::move(effect));
+        applyImageOperationToTargetLayers([effectPtr](const QImage &image) {
             return effectPtr->apply(image);
-        }, effect->name());
+        }, effectPtr->name());
     }
 }
 
 // ---- Adjustments ----
 
 void MainWindow::applyAdjustment(int adjustmentIndex) {
-    auto *layer = m_document->activeLayer();
+    const auto effective = m_document->snapshotEffectiveLayers();
+    auto *layer = effective.empty() ? nullptr : effective[m_document->activeLayerIndex()].get();
     if (!layer) return;
 
     switch (adjustmentIndex) {

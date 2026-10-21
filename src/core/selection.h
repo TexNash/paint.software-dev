@@ -53,6 +53,8 @@ public:
     void selectPath(const QPainterPath &path, SelectionMode mode = SelectionMode::Replace);
     void selectByColor(const QImage &image, const QPoint &pos, int tolerance, SelectionMode mode = SelectionMode::Replace);
     void setMaskImage(const QImage &mask);
+    // Internally generated mask: all coverage is within coverageBounds.
+    void setMaskImage(QImage &&mask, const QRect &coverageBounds);
 
     void feather(int radius);
     void expand(int pixels);
@@ -78,4 +80,6 @@ private:
 
     QImage m_mask;
     bool m_empty = true;
+    mutable qint64 m_boundsKey = -1;
+    mutable QRect m_bounds;
 };

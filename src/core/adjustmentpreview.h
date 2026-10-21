@@ -24,6 +24,7 @@ private:
         std::vector<Layer> layers;
         std::vector<int> targets;
         Selection selection;
+        bool emptyFloatingSelection = false;
     };
     struct Result { std::vector<QImage> images; QImage composite; };
     static Result render(const Snapshot &, const ImageOperation &, const std::shared_ptr<std::atomic_bool> &, bool composite = true);

@@ -6,10 +6,12 @@
 #include <QSize>
 #include <memory>
 #include <vector>
+#include <functional>
 
 #include "layer.h"
 #include "selection.h"
 #include "history.h"
+#include "floatingpixelsession.h"
 
 class Document : public QObject {
     Q_OBJECT
@@ -49,11 +51,16 @@ public:
 
     // Full-document snapshot support (for undo/redo of structural ops)
     std::vector<std::shared_ptr<Layer>> snapshotLayers() const;
+    // Value snapshots for preview/export workers, including the effective target.
+    std::vector<std::shared_ptr<Layer>> snapshotEffectiveLayers() const;
     void restoreFromSnapshot(std::vector<std::shared_ptr<Layer>> layers,
-                             int width, int height, int activeLayer);
+                             int width, int height, int activeLayer,
+                             const FloatingPixelSession *session = nullptr, int sessionLayer = -1);
 
     // Undoable structural operations
     void cropTo(const QRect &rect);
+    // Mask-aware UI crop. Floating content retains a separate Finish checkpoint.
+    bool cropToSelection();
     // Whole-image geometric transforms: rotate every layer and (for 90°/270°)
     // swap the document dimensions. quarterTurns is clockwise 90° steps.
     void rotate(int quarterTurns, const QString &description);
@@ -63,6 +70,8 @@ public:
     void reorderLayers(const std::vector<int> &newOrder, int keepActiveOriginalIndex);
 
     // Layer property mutation (emits documentChanged so the canvas repaints)
+    // Publish property-only changes without rebuilding the layer stack.
+    void notifyLayerAppearanceChanged(int index);
     void setLayerOpacity(int index, float opacity);
     void setLayerVisibility(int index, bool visible);
     void setLayerBlendMode(int index, BlendMode mode);
@@ -72,6 +81,33 @@ public:
     // Selection
     Selection &selection() { return m_selection; }
     const Selection &selection() const { return m_selection; }
+
+    // Low-level initialization: no UI activation or automatic history entry.
+    // Captures a base snapshot; does not lift/erase pixels or mutate the selection.
+    bool beginFloatingPixelSession(int layerIndex, const QImage &source,
+                                   const QImage &coverage, QPoint sourceOrigin);
+    // Atomic, undoable paste initialization. Placement/canvas decisions are made
+    // by the caller. A previous session is materialized in the same history entry.
+    bool pasteFloatingPixels(const QImage &source, const QImage &coverage, QPoint origin,
+                             bool intoNewLayer = false, QSize canvasSize = QSize(),
+                             FloatingPixelSession::Sampling sampling = FloatingPixelSession::Sampling::Bicubic);
+    // Read-only access ensures transform previews cannot bypass cache invalidation.
+    const FloatingPixelSession *floatingPixelSession() const;
+    // Preview an absolute transform and synchronize visible selection coverage.
+    // History callers capture before a gesture and after its final preview.
+    bool setFloatingPixelTransform(const QTransform &transform);
+    bool setFloatingSampling(FloatingPixelSession::Sampling sampling);
+    bool setFloatingRotationPivot(QPointF documentPoint);
+    // Context changes materialize pixels but preserve selection/editing intent.
+    bool suspendFloatingPixels(bool recordHistory = true);
+    bool finishFloatingPixels(bool clearSelection = true);
+    // Lift an ordinary selection, resume after suspension, or prepare a copy.
+    // Caller owns the gesture's before/after history checkpoint.
+    bool prepareFloatingPixelGesture(bool copy = false,
+        FloatingPixelSession::Sampling sampling = FloatingPixelSession::Sampling::Bicubic);
+    // Releases temporary state only; never rolls back or commits layer pixels.
+    // Required before starting another session, including after target removal.
+    void discardFloatingPixelSession();
 
     // History
     HistoryManager &history() { return m_history; }
@@ -83,6 +119,7 @@ public:
     static QImage compositeLayers(const std::vector<Layer> &layers, QSize size);
     bool commitImageEdits(const std::vector<ImageEditState> &edits, const QString &description);
     QImage flatten() const;
+    QImage thumbnail(QSize maximumSize) const;
     QImage flattenVisible() const;
     // Same composition as flattenVisible(), restricted to a document-space tile.
     QImage flattenVisible(const QRect &region) const;
@@ -112,21 +149,36 @@ public:
     void swapColors();
 
 signals:
+    // Finalize a pending gesture before checkpointing a context transition.
+    void floatingContextChanging();
     void layersChanged();
+    void layerAppearanceChanged(int index);
     void activeLayerChanged(int index);
     void selectionChanged();
     void documentChanged();
+    // Transform-only preview: raster dirtiness is confined to these canvas regions.
+    void floatingPixelsChanged(const QRegion &regions);
     void editScopeChanged(bool editAllLayers);
     void primaryColorChanged(const QColor &color);
     void secondaryColorChanged(const QColor &color);
     void sizeChanged(int width, int height);
 
 private:
+    qint64 m_floatingSelectionKey = -1;
+    friend class FloatingPixelSessionCommand;
+    // Restores checkpoint state without signals; callers publish the complete state.
+    void restoreFloatingPixelSession(const FloatingPixelSession *session, int layerIndex);
+    std::optional<Layer> floatingPixelRaster() const;
+    using FloatingTileVisitor = std::function<void(QRect, const QImage &, const QImage &, bool)>;
+    bool visitFloatingTiles(const FloatingPixelSession &session, const QRect &region, const FloatingTileVisitor &visitor) const;
+    QImage floatingCoverage(const FloatingPixelSession &session, const QRect &region) const;
+    QImage floatingRaster(const FloatingPixelSession &session, const QRect &region) const;
     int m_width;
     int m_height;
     std::vector<std::shared_ptr<Layer>> m_layers;
     int m_activeLayer = 0;
     Selection m_selection;
+    std::unique_ptr<FloatingPixelSession> m_floatingPixelSession;
     HistoryManager m_history;
     QString m_filePath;
     bool m_modified = false;

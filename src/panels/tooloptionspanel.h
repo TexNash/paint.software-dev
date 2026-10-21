@@ -33,6 +33,7 @@ public:
 signals:
     void toolOptionsChanged();
     void toolChangeRequested(ToolType type);
+    void resamplingChanged(int mode);
 
 private slots:
     void onBrushSizeChanged();
@@ -128,6 +129,8 @@ private:
     // Sampling source (Fill / Magic Wand): Image (composite) vs Layer (active).
     QLabel *m_samplingLabel;
     QComboBox *m_samplingCombo;
+    QLabel *m_resamplingLabel;
+    QComboBox *m_resamplingCombo;
 
     // Recolor target (Paint.NET "Sampling"): clicked pixel vs secondary colour.
     QLabel *m_recolorTargetLabel;

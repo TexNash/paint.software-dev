@@ -4,13 +4,127 @@
 #include <QPainter>
 #include <QTransform>
 #include <cmath>
+#include <limits>
+
+MoveTool::MoveTool() = default;
+MoveTool::~MoveTool() { QObject::disconnect(m_historyConnection); }
+
+static QRect floatingFrame(const FloatingPixelSession *session) {
+    const QRectF bounds = session->sourceBounds();
+    const double left = std::floor(bounds.left()), top = std::floor(bounds.top());
+    const double right = std::ceil(bounds.right()), bottom = std::ceil(bounds.bottom());
+    if (!std::isfinite(left) || !std::isfinite(top) || !std::isfinite(right) || !std::isfinite(bottom)
+        || left < std::numeric_limits<int>::min() || top < std::numeric_limits<int>::min()
+        || right > std::numeric_limits<int>::max() || bottom > std::numeric_limits<int>::max()
+        || right <= left || bottom <= top || right - left > std::numeric_limits<int>::max()
+        || bottom - top > std::numeric_limits<int>::max()) return {};
+    return QRect(int(left), int(top), int(right - left), int(bottom - top));
+}
+
+void MoveTool::finishSessionGesture() {
+    if (!m_sessionGesture) return;
+    QObject::disconnect(m_historyConnection);
+    m_sessionGesture = false;
+    m_moving = m_resizing = m_rotating = false;
+    auto command = std::move(m_sessionCommand);
+    auto *doc = m_sessionDocument.data();
+    m_sessionDocument.clear();
+    if (!doc || !command) return;
+    command->captureAfter();
+    const auto *session = doc->floatingPixelSession();
+    if (session && session->transform() != m_sessionStartTransform) {
+        doc->history().push(std::move(command));
+        doc->setModified(true);
+        // The final preview already invalidated its footprints. Closing a
+        // gesture changes history/overlay state, not the entire layer raster.
+        emit doc->floatingPixelsChanged(QRegion());
+    } else {
+        // A click is not a lift/duplicate or a new history branch.
+        command->undo();
+        doc->setModified(m_sessionWasModified);
+    }
+}
+
+void MoveTool::deactivate(CanvasWidget &canvas) {
+    canvas.flushFloatingMove();
+    if (m_sessionGesture) finishSessionGesture();
+    else if (m_moving && canvas.document()) mouseReleaseEvent(QPointF(), nullptr, canvas);
+}
+
+void MoveTool::keyPressEvent(QKeyEvent *event, CanvasWidget &canvas) {
+    auto *doc = canvas.document();
+    if (!doc || !doc->floatingPixelSession()) return;
+    QPoint delta;
+    switch (event->key()) {
+    case Qt::Key_Left: delta = QPoint(-1, 0); break;
+    case Qt::Key_Right: delta = QPoint(1, 0); break;
+    case Qt::Key_Up: delta = QPoint(0, -1); break;
+    case Qt::Key_Down: delta = QPoint(0, 1); break;
+    default: return;
+    }
+    finishSessionGesture();
+    if (event->modifiers() & Qt::ControlModifier) delta *= 10;
+    const bool wasModified = doc->isModified();
+    auto command = std::make_unique<DocumentSnapshotCommand>(doc, "Move Selected Pixels");
+    if (!doc->prepareFloatingPixelGesture()) return;
+    const QTransform moved = doc->floatingPixelSession()->transform() * QTransform::fromTranslate(delta.x(), delta.y());
+    if (!doc->setFloatingPixelTransform(moved)) {
+        command->captureAfter(); command->undo(); doc->setModified(wasModified);
+        return;
+    }
+    command->captureAfter();
+    doc->history().push(std::move(command));
+    doc->setModified(true);
+    event->accept();
+}
 
 void MoveTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, CanvasWidget &canvas) {
+    finishSessionGesture();
     // Left drags move/resize; a right drag rotates the lifted content (Paint.NET).
     if (event->button() != Qt::LeftButton && event->button() != Qt::RightButton) return;
     auto *doc = canvas.document();
     auto *layer = doc->activeLayer();
     if (!layer || layer->isLocked()) return;
+
+    if (doc->floatingPixelSession()) {
+        const QRect beforeFrame = floatingFrame(doc->floatingPixelSession());
+        const auto handle = SelHandles::at(beforeFrame, canvasPos, canvas.zoom());
+        const bool rotation = event->button() == Qt::RightButton
+            || (handle == SelHandles::Handle::None && SelHandles::inRotationZone(beforeFrame, canvasPos, canvas.zoom()));
+        auto command = std::make_unique<DocumentSnapshotCommand>(doc, rotation ? "Rotate Selection"
+            : (handle != SelHandles::Handle::None ? "Resize Selected Pixels" : "Move Selected Pixels"));
+        const bool wasModified = doc->isModified();
+        if (!doc->prepareFloatingPixelGesture(event->modifiers() & Qt::ControlModifier)) return;
+        const auto *session = doc->floatingPixelSession();
+        const QRect frame = floatingFrame(session);
+        if (frame.isEmpty()) {
+            command->captureAfter(); command->undo(); doc->setModified(wasModified);
+            return;
+        }
+        m_sessionCommand = std::move(command);
+        m_sessionDocument = doc;
+        m_sessionWasModified = wasModified;
+        m_sessionStartTransform = session->transform();
+        m_sessionGesture = m_moving = true;
+        m_startPos = canvasPos;
+        m_originalRect = m_previewRect = frame;
+        m_rotCenter = QRectF(frame).center();
+        m_angle = 0;
+        m_handle = SelHandles::at(frame, canvasPos, canvas.zoom());
+        m_rotating = event->button() == Qt::RightButton
+            || (m_handle == SelHandles::Handle::None && SelHandles::inRotationZone(frame, canvasPos, canvas.zoom()));
+        m_resizing = !m_rotating && m_handle != SelHandles::Handle::None;
+        m_rotStartAngle = std::atan2(canvasPos.y() - m_rotCenter.y(), canvasPos.x() - m_rotCenter.x()) * 180.0 / M_PI;
+        m_historyConnection = QObject::connect(&doc->history(), &HistoryManager::historyChanged, &canvas, [this]() {
+            // Undo/history navigation has already restored the authoritative state.
+            // Do not let a later mouse release write a stale preview over it.
+            QObject::disconnect(m_historyConnection);
+            m_sessionGesture = m_moving = m_resizing = m_rotating = false;
+            m_sessionCommand.reset();
+            m_sessionDocument.clear();
+        });
+        return;
+    }
 
     m_moving = true;
     m_startPos = canvasPos;
@@ -58,6 +172,26 @@ void MoveTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, Can
 }
 
 void MoveTool::mouseMoveEvent(const QPointF &canvasPos, QMouseEvent *event, CanvasWidget &canvas) {
+    if (m_sessionGesture) {
+        auto *doc = m_sessionDocument.data();
+        if (!doc || doc != canvas.document() || !doc->floatingPixelSession()) { finishSessionGesture(); return; }
+        QTransform change;
+        if (m_rotating) {
+            m_angle = std::atan2(canvasPos.y() - m_rotCenter.y(), canvasPos.x() - m_rotCenter.x()) * 180.0 / M_PI - m_rotStartAngle;
+            if (event->modifiers() & Qt::ShiftModifier) m_angle = std::round(m_angle / 15.0) * 15.0;
+            change = SelHandles::rotationAbout(m_rotCenter, m_angle);
+        } else if (m_resizing) {
+            m_previewRect = SelHandles::resized(m_originalRect, m_handle, canvasPos, event->modifiers());
+            change.translate(m_previewRect.x(), m_previewRect.y());
+            change.scale(double(m_previewRect.width()) / m_originalRect.width(), double(m_previewRect.height()) / m_originalRect.height());
+            change.translate(-m_originalRect.x(), -m_originalRect.y());
+        } else {
+            const QPoint delta = (canvasPos - m_startPos).toPoint();
+            change.translate(delta.x(), delta.y());
+        }
+        doc->setFloatingPixelTransform(m_sessionStartTransform * change);
+        return;
+    }
     if (!m_moving) return;
     auto *doc = canvas.document();
     auto *layer = doc->activeLayer();
@@ -134,6 +268,7 @@ void MoveTool::mouseMoveEvent(const QPointF &canvasPos, QMouseEvent *event, Canv
 }
 
 void MoveTool::mouseReleaseEvent(const QPointF &, QMouseEvent *, CanvasWidget &canvas) {
+    if (m_sessionGesture) { finishSessionGesture(); return; }
     if (!m_moving) return;
     m_moving = false;
     auto *doc = canvas.document();
@@ -237,7 +372,7 @@ void MoveTool::mouseReleaseEvent(const QPointF &, QMouseEvent *, CanvasWidget &c
 
 void MoveTool::drawOverlay(QPainter &painter, const CanvasWidget &canvas) {
     auto *doc = canvas.document();
-    if (!doc || !doc->selection().hasSelection()) return;
+    if (!doc || (!doc->selection().hasSelection() && !doc->floatingPixelSession())) return;
 
     if (m_rotating) {
         // Draw the original box rotated about its centre, so the pivot and current
@@ -261,7 +396,8 @@ void MoveTool::drawOverlay(QPainter &painter, const CanvasWidget &canvas) {
         return;
     }
 
-    const QRect rect = m_resizing ? m_previewRect : doc->selection().boundingRect();
+    const QRect rect = m_resizing ? m_previewRect : (doc->floatingPixelSession()
+        ? floatingFrame(doc->floatingPixelSession()) : doc->selection().boundingRect());
     if (rect.isEmpty()) return;
 
     // Show the same handles as Move Selection, so it is visible that a corner can

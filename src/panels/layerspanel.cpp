@@ -17,6 +17,12 @@
 #include <QApplication>
 
 namespace {
+QImage thumbnailPixels(Document *document, const Layer *layer) {
+    const auto *session = document->floatingPixelSession();
+    if (session && !session->isSuspended() && session->targets(layer))
+        return session->renderScaled(QRect(QPoint(), document->size()), document->size().scaled(40, 30, Qt::KeepAspectRatio));
+    return layer->image();
+}
 // Neutral "ink" colour and layer-fill colour that adapt to the active theme so
 // the icons stay visible on both light and dark panels.
 static QColor inkColor()    { return Theme::isDark() ? QColor(210, 210, 210) : QColor(60, 60, 60); }
@@ -222,6 +228,7 @@ void LayersPanel::setDocument(Document *doc) {
         connect(doc, &Document::layersChanged, this, &LayersPanel::updateLayerList);
         // Keep thumbnails live on every content change (brush, bucket, effect...),
         // debounced so a continuous stroke doesn't rebuild them on every pixel.
+        connect(doc, &Document::floatingPixelsChanged, this, [this]() { m_thumbRefreshTimer->start(); });
         connect(doc, &Document::documentChanged, this, [this]() {
             m_thumbRefreshTimer->start();
         });
@@ -281,7 +288,7 @@ void LayersPanel::updateLayerList() {
         item->setFlags(item->flags() | Qt::ItemIsUserCheckable);
         item->setData(Qt::UserRole, i);  // remember which layer this row shows
         item->setCheckState(layer->isVisible() ? Qt::Checked : Qt::Unchecked);
-        item->setIcon(makeThumbnail(layer->image()));
+        item->setIcon(makeThumbnail(thumbnailPixels(m_document, layer)));
         if (!layer->isVisible())
             item->setForeground(Qt::gray);
         m_layerList->addItem(item);
@@ -303,7 +310,7 @@ void LayersPanel::refreshThumbnails() {
         auto *item = m_layerList->item(row);
         const int idx = item->data(Qt::UserRole).toInt();
         if (auto *layer = m_document->layerAt(idx))
-            item->setIcon(makeThumbnail(layer->image()));
+            item->setIcon(makeThumbnail(thumbnailPixels(m_document, layer)));
     }
 }
 

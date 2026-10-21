@@ -13,45 +13,56 @@ Selection::Selection(int width, int height)
     m_mask.fill(0);
 }
 
-QRegion Selection::region() const {
-    if (m_empty) return QRegion();
-    QRegion reg;
-    const int w = m_mask.width();
-    for (int y = 0; y < m_mask.height(); ++y) {
-        const uchar *line = m_mask.constScanLine(y);
-        int start = -1;
-        for (int x = 0; x < w; ++x) {
-            bool sel = line[x] > 127;
-            if (sel && start == -1) {
-                start = x;
-            } else if (!sel && start != -1) {
-                reg += QRect(start, y, x - start, 1);
-                start = -1;
+namespace {
+QRect coverageBounds(const QImage &mask, QRect area) {
+    area = area.intersected(mask.rect());
+    int minX = mask.width(), minY = mask.height(), maxX = -1, maxY = -1;
+    for (int y = area.top(); !area.isEmpty() && y <= area.bottom(); ++y) {
+        const uchar *line = mask.constScanLine(y);
+        for (int x = area.left(); x <= area.right(); ++x) {
+            if (line[x]) {
+                minX = std::min(minX, x); minY = std::min(minY, y);
+                maxX = std::max(maxX, x); maxY = std::max(maxY, y);
             }
         }
-        // Flush a run that reaches (or starts at) the last column.
-        if (start != -1)
-            reg += QRect(start, y, w - start, 1);
+    }
+    return maxX < minX ? QRect() : QRect(minX, minY, maxX - minX + 1, maxY - minY + 1);
+}
+}
+
+QRegion Selection::region() const {
+    const QRect bounds = boundingRect();
+    QRegion reg;
+    for (int y = bounds.top(); !bounds.isEmpty() && y <= bounds.bottom(); ++y) {
+        const uchar *line = m_mask.constScanLine(y);
+        int start = -1;
+        for (int x = bounds.left(); x <= bounds.right(); ++x) {
+            const bool sel = line[x] > 127;
+            if (sel && start == -1) start = x;
+            else if (!sel && start != -1) {
+                reg += QRect(start, y, x - start, 1); start = -1;
+            }
+        }
+        if (start != -1) reg += QRect(start, y, bounds.right() - start + 1, 1);
     }
     return reg;
 }
 
 QRect Selection::boundingRect() const {
-    if (m_empty) return QRect();
-    int minX = m_mask.width(), minY = m_mask.height(), maxX = 0, maxY = 0;
-    for (int y = 0; y < m_mask.height(); ++y) {
-        const uchar *line = m_mask.constScanLine(y);
-        for (int x = 0; x < m_mask.width(); ++x) {
-            if (line[x] > 0) {
-                minX = std::min(minX, x);
-                minY = std::min(minY, y);
-                maxX = std::max(maxX, x);
-                maxY = std::max(maxY, y);
-            }
-        }
+    if (m_empty) return {};
+    if (m_boundsKey != m_mask.cacheKey()) {
+        m_bounds = coverageBounds(m_mask, m_mask.rect());
+        m_boundsKey = m_mask.cacheKey();
     }
-    if (maxX < minX) return QRect();
-    return QRect(minX, minY, maxX - minX + 1, maxY - minY + 1);
+    return m_bounds;
+}
+
+void Selection::setMaskImage(QImage &&mask, const QRect &bounds) {
+    if (mask.format() != QImage::Format_Grayscale8) { setMaskImage(mask); return; }
+    m_mask = std::move(mask);
+    m_bounds = coverageBounds(m_mask, bounds);
+    m_boundsKey = m_mask.cacheKey();
+    m_empty = m_bounds.isEmpty();
 }
 
 void Selection::clear() {

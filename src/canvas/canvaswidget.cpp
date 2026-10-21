@@ -28,7 +28,8 @@ bool CanvasWidget::event(QEvent *event)
         auto *ke = static_cast<QKeyEvent *>(event);
         const bool ctrlAlt = ke->modifiers() & (Qt::ControlModifier | Qt::AltModifier | Qt::MetaModifier);
         if ((m_currentTool->wantsKeyInput() && !ctrlAlt)
-            || m_currentTool->wantsCommitKey(ke->key())) {
+            || m_currentTool->wantsCommitKey(ke->key())
+            || (m_document && m_document->floatingPixelSession() && ke->key() == Qt::Key_Escape)) {
             event->accept();
             return true;
         }
@@ -45,12 +46,32 @@ CanvasWidget::CanvasWidget(QWidget *parent)
 
     connect(&m_marchingTimer, &QTimer::timeout, this, &CanvasWidget::updateMarchingAnts);
     m_marchingTimer.start(150);
+    m_floatingMoveTimer.setSingleShot(true);
+    m_floatingMoveTimer.setInterval(16);
+    connect(&m_floatingMoveTimer, &QTimer::timeout, this, &CanvasWidget::flushFloatingMove);
 }
 
 void CanvasWidget::setDocument(Document *doc) {
+    flushFloatingMove();
+    if (m_document) disconnect(&m_document->history(), nullptr, this, nullptr);
+    if (m_document && m_document != doc && m_currentTool)
+        m_currentTool->deactivate(*this);
+    if (m_document) disconnect(m_document, nullptr, this, nullptr);
     m_previewImage = QImage();
     m_document = doc;
     if (doc) {
+        connect(&doc->history(), &HistoryManager::historyChanged, this, [this]() {
+            m_floatingMoveTimer.stop();
+            m_pendingFloatingMove = false;
+        });
+        connect(doc, &Document::floatingPixelsChanged, this, [this](const QRegion &regions) {
+            for (const QRect &region : regions) updateCanvasRegion(region);
+            update(); // overlay/handles can also extend beyond the canvas
+        });
+        connect(doc, &Document::floatingContextChanging, this, [this]() {
+            flushFloatingMove();
+            if (m_currentTool && m_currentTool->type() == ToolType::Move) m_currentTool->deactivate(*this);
+        });
         connect(doc, &Document::documentChanged, this, [this]() {
             m_cacheValid = false;
             update();
@@ -65,10 +86,14 @@ void CanvasWidget::setDocument(Document *doc) {
     update();
 }
 
-void CanvasWidget::setCurrentTool(Tool *tool) {
-    if (m_currentTool && m_currentTool != tool)
+bool CanvasWidget::setCurrentTool(Tool *tool) {
+    flushFloatingMove();
+    if (m_currentTool && m_currentTool != tool) {
         m_currentTool->deactivate(*this);   // commit any pending edit before switching
+        if (tool && m_document && !m_document->suspendFloatingPixels()) return false;
+    }
     m_currentTool = tool;
+    return true;
 }
 
 void CanvasWidget::setZoom(double zoom) {
@@ -447,6 +472,7 @@ void CanvasWidget::updateMarchingAnts() {
 }
 
 void CanvasWidget::mousePressEvent(QMouseEvent *event) {
+    flushFloatingMove();
     // Pan with the middle button, or with the left button while Space is held —
     // Paint.NET's shortcut. Alt is deliberately NOT a pan modifier: it is the
     // selection-subtract key and the two would collide.
@@ -462,7 +488,8 @@ void CanvasWidget::mousePressEvent(QMouseEvent *event) {
     // Ctrl+right are selection-combine gestures (intersect / invert) and must
     // reach the active tool instead.
     if (event->button() == Qt::RightButton && event->modifiers() == Qt::NoModifier
-        && m_document && m_document->selection().hasSelection()) {
+        && m_document && m_document->selection().hasSelection()
+        && !(m_currentTool && m_currentTool->type() == ToolType::Move)) {
         QPoint canvasPos = widgetToCanvas(event->position()).toPoint();
         if (m_document->selection().isSelected(canvasPos.x(), canvasPos.y())) {
             emit selectionContextMenuRequested(event->globalPosition().toPoint());
@@ -481,6 +508,15 @@ void CanvasWidget::mousePressEvent(QMouseEvent *event) {
         return;
 
     if (m_currentTool && m_document) {
+        const auto type = m_currentTool->type();
+        const bool selecting = type == ToolType::RectSelection || type == ToolType::EllipseSelection
+            || type == ToolType::LassoSelection || type == ToolType::MagicWand || type == ToolType::MoveSelection;
+        if (selecting && !m_document->finishFloatingPixels(false)) return;
+        if (type != ToolType::Move && !selecting && m_document->floatingPixelSession()) {
+            if (!m_document->suspendFloatingPixels()) return;
+            if (!m_document->selection().hasSelection() && type != ToolType::Pan && type != ToolType::Zoom
+                && type != ToolType::ColorPicker) return;
+        }
         setFocus(Qt::MouseFocusReason);   // so Enter/Escape reach the tool (Line/Curve commit)
         // A real mouse press (not synthesised from a stylus) always means full
         // pressure. Without this, a low-pressure stylus stroke left m_pressure
@@ -496,7 +532,8 @@ void CanvasWidget::mousePressEvent(QMouseEvent *event) {
         }
         QPointF canvasPos = widgetToCanvas(event->position());
         m_currentTool->mousePressEvent(canvasPos, event, *this);
-        if (!m_currentTool->updatesCanvasRegion()) m_cacheValid = false;
+        if (!m_currentTool->updatesCanvasRegion()
+            && !(m_currentTool->type() == ToolType::Move && m_document->floatingPixelSession())) m_cacheValid = false;
         update();
     }
 }
@@ -521,14 +558,47 @@ void CanvasWidget::mouseMoveEvent(QMouseEvent *event) {
     if (fromPen && !m_penInContact)
         return;
 
+    if (m_currentTool && m_document && m_currentTool->type() == ToolType::Move && m_document->floatingPixelSession()) {
+        if (event->buttons() != Qt::NoButton) {
+            m_floatingMovePosition = canvasPos;
+            m_floatingMoveButtons = event->buttons();
+            m_floatingMoveModifiers = event->modifiers();
+            m_pendingFloatingMove = true;
+            // Never restart: bound latency while replacing stale queued positions.
+            if (!m_floatingMoveTimer.isActive()) m_floatingMoveTimer.start();
+        }
+        return;
+    }
     if (m_currentTool && m_document) {
         m_currentTool->mouseMoveEvent(canvasPos, event, *this);
-        if (!m_currentTool->updatesCanvasRegion()) m_cacheValid = false;
+        if (!m_currentTool->updatesCanvasRegion()
+            && !(m_currentTool->type() == ToolType::Move && m_document->floatingPixelSession())) m_cacheValid = false;
         update();
     }
 }
 
+void CanvasWidget::flushFloatingMove() {
+    m_floatingMoveTimer.stop();
+    if (!m_pendingFloatingMove) return;
+    m_pendingFloatingMove = false;
+    if (!m_document || !m_document->floatingPixelSession() || !m_currentTool || m_currentTool->type() != ToolType::Move) return;
+    const QPointF widget = canvasToWidget(m_floatingMovePosition);
+    QMouseEvent event(QEvent::MouseMove, widget, widget, Qt::NoButton, m_floatingMoveButtons, m_floatingMoveModifiers);
+    m_currentTool->mouseMoveEvent(m_floatingMovePosition, &event, *this);
+}
+
 void CanvasWidget::mouseReleaseEvent(QMouseEvent *event) {
+    if (m_currentTool && m_document && m_currentTool->type() == ToolType::Move
+        && m_document->floatingPixelSession()
+        && (event->button() == Qt::LeftButton || event->button() == Qt::RightButton)) {
+        // The release position is authoritative even if the last native move
+        // was compressed or the frame timer has not fired yet.
+        m_floatingMovePosition = widgetToCanvas(event->position());
+        m_floatingMoveButtons = event->button();
+        m_floatingMoveModifiers = event->modifiers();
+        m_pendingFloatingMove = true;
+    }
+    flushFloatingMove();
     if (m_isPanning && (event->button() == Qt::MiddleButton || event->button() == Qt::LeftButton)) {
         m_isPanning = false;
         setCursor(Qt::ArrowCursor);
@@ -537,7 +607,8 @@ void CanvasWidget::mouseReleaseEvent(QMouseEvent *event) {
 
     if (m_currentTool && m_document) {
         m_currentTool->mouseReleaseEvent(widgetToCanvas(event->position()), event, *this);
-        if (!m_currentTool->updatesCanvasRegion()) m_cacheValid = false;
+        if (!m_currentTool->updatesCanvasRegion()
+            && !(m_currentTool->type() == ToolType::Move && m_document->floatingPixelSession())) m_cacheValid = false;
         update();
         emit canvasModified();
     }
@@ -555,6 +626,14 @@ void CanvasWidget::wheelEvent(QWheelEvent *event) {
 }
 
 void CanvasWidget::keyPressEvent(QKeyEvent *event) {
+    if (m_document && m_document->floatingPixelSession()
+        && (event->key() == Qt::Key_Escape || event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)
+        && !(m_currentTool && m_currentTool->wantsKeyInput())) {
+        if (m_currentTool) m_currentTool->deactivate(*this);
+        m_document->finishFloatingPixels();
+        event->accept();
+        return;
+    }
     // Space arms pan-drag for any tool (unless the Text tool is capturing keys).
     if (event->key() == Qt::Key_Space && !event->isAutoRepeat()
         && !(m_currentTool && m_currentTool->wantsKeyInput())) {

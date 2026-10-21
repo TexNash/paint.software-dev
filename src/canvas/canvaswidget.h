@@ -18,7 +18,7 @@ public:
     void setDocument(Document *doc);
     Document *document() const { return m_document; }
 
-    void setCurrentTool(Tool *tool);
+    bool setCurrentTool(Tool *tool);
     Tool *currentTool() const { return m_currentTool; }
 
     // View
@@ -45,6 +45,8 @@ public:
     void clearPreviewImage() { m_previewImage = QImage(); updateCanvas(); }
     void updateCanvas();
     void updateCanvasRegion(const QRect &documentRect);
+    // Flush the latest coalesced floating pointer position before history/context changes.
+    void flushFloatingMove();
     void setShowGrid(bool show) { m_showGrid = show; update(); }
     bool showGrid() const { return m_showGrid; }
     void setShowRulers(bool show);
@@ -115,6 +117,12 @@ private:
     int m_marchingOffset = 0;
     qint64 m_selectionOutlineKey = -1;
     QPainterPath m_selectionOutline;
+
+    QTimer m_floatingMoveTimer;
+    bool m_pendingFloatingMove = false;
+    QPointF m_floatingMovePosition;
+    Qt::MouseButtons m_floatingMoveButtons;
+    Qt::KeyboardModifiers m_floatingMoveModifiers;
 
     // Cached render
     QImage m_previewImage;

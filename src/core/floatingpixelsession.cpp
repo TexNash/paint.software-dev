@@ -1,6 +1,20 @@
 #include "floatingpixelsession.h"
 #include "layer.h"
 #include <cmath>
+#include <QPainter>
+#include <cstring>
+#include <limits>
+#include <vector>
+
+namespace {
+bool integerTranslation(const QTransform &transform) {
+    return transform.type() <= QTransform::TxTranslate
+        && transform.dx() == std::floor(transform.dx()) && transform.dy() == std::floor(transform.dy())
+        && transform.dx() >= std::numeric_limits<int>::min() && transform.dx() <= std::numeric_limits<int>::max()
+        && transform.dy() >= std::numeric_limits<int>::min() && transform.dy() <= std::numeric_limits<int>::max();
+}
+}
+
 
 std::unique_ptr<FloatingPixelSession> FloatingPixelSession::create(
     const std::shared_ptr<Layer> &target, const QImage &source,
@@ -23,6 +37,10 @@ std::unique_ptr<FloatingPixelSession> FloatingPixelSession::create(
     session->m_base = target->image().copy();
     if (session->m_source.isNull() || session->m_coverage.isNull() || session->m_base.isNull())
         return nullptr;
+    session->m_fullCoverage = true;
+    for (int y = 0; y < coverage.height() && session->m_fullCoverage; ++y)
+        for (int x = 0; x < coverage.width(); ++x)
+            if (coverage.constScanLine(y)[x] != 255) { session->m_fullCoverage = false; break; }
     session->m_target = target;
     session->m_baseOffset = target->offset();
     session->setTransform(QTransform::fromTranslate(sourceOrigin.x(), sourceOrigin.y()));
@@ -87,20 +105,84 @@ QImage FloatingPixelSession::render(const QRect &documentRegion) const {
     if (documentRegion.isEmpty()) return {};
     QImage result(documentRegion.size(), QImage::Format_ARGB32_Premultiplied);
     if (result.isNull()) return {};
-    for (int y = 0; y < result.height(); ++y) {
-        auto *line = reinterpret_cast<QRgb *>(result.scanLine(y));
-        for (int x = 0; x < result.width(); ++x) {
-            const double dx = double(documentRegion.x()) + x;
-            const double dy = double(documentRegion.y()) + y;
-            const double bx = dx - m_baseOffset.x(), by = dy - m_baseOffset.y();
-            QRgb pixel = 0;
-            if (bx >= 0 && by >= 0 && bx < m_base.width() && by < m_base.height())
-                pixel = m_base.pixel(int(bx), int(by));
-            QPoint source;
-            if (sourcePoint(QPointF(dx + 0.5, dy + 0.5), source))
-                pixel = replaceCoveredPixel(pixel, m_source.pixel(source),
-                                             m_coverage.constScanLine(source.y())[source.x()]);
-            line[x] = pixel;
+    const bool originalLiftPose = !m_liftOriginal.isNull() && m_transform == m_liftTransform;
+    const QImage &base = originalLiftPose ? m_liftOriginal : m_base;
+    result.fill(Qt::transparent);
+    {
+        QPainter painter(&result);
+        painter.setCompositionMode(QPainter::CompositionMode_Source);
+        painter.drawImage(QPointF(double(m_baseOffset.x()) - documentRegion.x(),
+                                 double(m_baseOffset.y()) - documentRegion.y()), base);
+    }
+    if (originalLiftPose) return result;
+    // Intersect before narrowing to QRect: distant off-canvas transforms need
+    // no sampling and must not overflow integer coordinates.
+    const QRect affected = sourceBounds().intersected(QRectF(documentRegion)).toAlignedRect().intersected(documentRegion);
+    if (!affected.isEmpty() && integerTranslation(m_transform)) {
+        const int sx = int(double(affected.x()) - m_transform.dx());
+        const int sy = int(double(affected.y()) - m_transform.dy());
+        for (int y = 0; y < affected.height(); ++y) {
+            auto *destination = reinterpret_cast<QRgb *>(result.scanLine(affected.y() - documentRegion.y() + y))
+                + affected.x() - documentRegion.x();
+            const auto *source = reinterpret_cast<const QRgb *>(m_source.constScanLine(sy + y)) + sx;
+            const uchar *coverage = m_coverage.constScanLine(sy + y) + sx;
+            if (m_fullCoverage) std::memcpy(destination, source, size_t(affected.width()) * 4);
+            else for (int x = 0; x < affected.width(); ++x) {
+                if (coverage[x] == 255) destination[x] = source[x];
+                else if (coverage[x]) destination[x] = replaceCoveredPixel(destination[x], source[x], coverage[x]);
+            }
+        }
+        return result;
+    }
+    const auto *pixels = reinterpret_cast<const QRgb *>(m_source.constBits());
+    const uchar *mask = m_coverage.constBits();
+    const qsizetype pixelStride = m_source.bytesPerLine() / 4, maskStride = m_coverage.bytesPerLine();
+    // Match QTransform::map's classified affine paths, including its fuzzy
+    // identity/axis classification, while keeping getters out of pixel loops.
+    const auto type = m_inverse.type();
+    const double a = type <= QTransform::TxTranslate ? 1 : m_inverse.m11();
+    const double d = type <= QTransform::TxTranslate ? 1 : m_inverse.m22();
+    const double b = type <= QTransform::TxScale ? 0 : m_inverse.m12();
+    const double c = type <= QTransform::TxScale ? 0 : m_inverse.m21();
+    const double tx = m_inverse.dx(), ty = m_inverse.dy();
+    const int sourceWidth = m_source.width(), sourceHeight = m_source.height();
+    if (b == 0 && c == 0 && !affected.isEmpty()) {
+        std::vector<int> columns(size_t(affected.width()), -1);
+        for (int x = 0; x < affected.width(); ++x) {
+            const double sx = (double(affected.x()) + x + 0.5) * a + tx;
+            if (sx >= 0 && sx < sourceWidth) columns[x] = int(sx);
+        }
+        for (int y = 0; y < affected.height(); ++y) {
+            const double sy = (double(affected.y()) + y + 0.5) * d + ty;
+            if (!(sy >= 0 && sy < sourceHeight)) continue;
+            const auto *source = pixels + int(sy) * pixelStride;
+            const auto *coverage = mask + int(sy) * maskStride;
+            auto *destination = reinterpret_cast<QRgb *>(result.scanLine(affected.y() - documentRegion.y() + y))
+                + affected.x() - documentRegion.x();
+            for (int x = 0; x < affected.width(); ++x) {
+                const int sx = columns[x];
+                if (sx < 0) continue;
+                const int value = m_fullCoverage ? 255 : coverage[sx];
+                if (value == 255) destination[x] = source[sx];
+                else if (value) destination[x] = replaceCoveredPixel(destination[x], source[sx], value);
+            }
+        }
+        return result;
+    }
+    for (int y = 0; y < affected.height(); ++y) {
+        auto *line = reinterpret_cast<QRgb *>(result.scanLine(affected.y() - documentRegion.y() + y));
+        const double py = double(affected.y()) + y + 0.5, yc = py * c, yd = py * d;
+        for (int x = 0; x < affected.width(); ++x) {
+            const double px = double(affected.x()) + x + 0.5;
+            const double sx = px * a + yc + tx, sy = px * b + yd + ty;
+            if (sx >= 0 && sy >= 0 && sx < sourceWidth && sy < sourceHeight) {
+                const int ix = int(sx), iy = int(sy);
+                const int coverage = mask[iy * maskStride + ix];
+                auto &pixel = line[affected.x() - documentRegion.x() + x];
+                const QRgb source = pixels[iy * pixelStride + ix];
+                if (coverage == 255) pixel = source;
+                else if (coverage) pixel = replaceCoveredPixel(pixel, source, coverage);
+            }
         }
     }
     return result;
@@ -111,13 +193,92 @@ QImage FloatingPixelSession::renderCoverage(const QRect &documentRegion) const {
     QImage result(documentRegion.size(), QImage::Format_Grayscale8);
     if (result.isNull()) return {};
     result.fill(0);
+    const QRect affected = sourceBounds().intersected(QRectF(documentRegion)).toAlignedRect().intersected(documentRegion);
+    if (!affected.isEmpty() && integerTranslation(m_transform)) {
+        const int sx = int(double(affected.x()) - m_transform.dx());
+        const int sy = int(double(affected.y()) - m_transform.dy());
+        for (int y = 0; y < affected.height(); ++y)
+            std::memcpy(result.scanLine(affected.y() - documentRegion.y() + y) + affected.x() - documentRegion.x(),
+                        m_coverage.constScanLine(sy + y) + sx, size_t(affected.width()));
+        return result;
+    }
+    const uchar *mask = m_coverage.constBits();
+    const qsizetype stride = m_coverage.bytesPerLine();
+    // Match QTransform::map's classified affine paths, including its fuzzy
+    // identity/axis classification, while keeping getters out of pixel loops.
+    const auto type = m_inverse.type();
+    const double a = type <= QTransform::TxTranslate ? 1 : m_inverse.m11();
+    const double d = type <= QTransform::TxTranslate ? 1 : m_inverse.m22();
+    const double b = type <= QTransform::TxScale ? 0 : m_inverse.m12();
+    const double c = type <= QTransform::TxScale ? 0 : m_inverse.m21();
+    const double tx = m_inverse.dx(), ty = m_inverse.dy();
+    const int sourceWidth = m_source.width(), sourceHeight = m_source.height();
+    if (b == 0 && c == 0 && !affected.isEmpty()) {
+        std::vector<int> columns(size_t(affected.width()), -1);
+        int first = affected.width(), last = -1;
+        for (int x = 0; x < affected.width(); ++x) {
+            const double sx = (double(affected.x()) + x + 0.5) * a + tx;
+            if (sx >= 0 && sx < sourceWidth) { columns[x] = int(sx); first = qMin(first, x); last = x; }
+        }
+        for (int y = 0; y < affected.height(); ++y) {
+            const double sy = (double(affected.y()) + y + 0.5) * d + ty;
+            if (!(sy >= 0 && sy < sourceHeight)) continue;
+            auto *destination = result.scanLine(affected.y() - documentRegion.y() + y) + affected.x() - documentRegion.x();
+            const auto *source = mask + int(sy) * stride;
+            if (m_fullCoverage && last >= first) std::memset(destination + first, 255, size_t(last - first + 1));
+            else for (int x = first; x <= last; ++x) destination[x] = source[columns[x]];
+        }
+        return result;
+    }
+    for (int y = 0; y < affected.height(); ++y) {
+        uchar *line = result.scanLine(affected.y() - documentRegion.y() + y);
+        const double py = double(affected.y()) + y + 0.5, yc = py * c, yd = py * d;
+        for (int x = 0; x < affected.width(); ++x) {
+            const double px = double(affected.x()) + x + 0.5;
+            const double sx = px * a + yc + tx, sy = px * b + yd + ty;
+            if (sx >= 0 && sy >= 0 && sx < sourceWidth && sy < sourceHeight)
+                line[affected.x() - documentRegion.x() + x] = mask[int(sy) * stride + int(sx)];
+        }
+    }
+    return result;
+}
+
+QImage FloatingPixelSession::transformedSource(const QRect &documentRegion) const {
+    if (documentRegion.isEmpty()) return {};
+    QImage result(documentRegion.size(), QImage::Format_ARGB32_Premultiplied);
+    if (result.isNull()) return {};
+    result.fill(Qt::transparent);
     for (int y = 0; y < result.height(); ++y) {
-        uchar *line = result.scanLine(y);
+        auto *line = reinterpret_cast<QRgb *>(result.scanLine(y));
         for (int x = 0; x < result.width(); ++x) {
             QPoint source;
             if (sourcePoint(QPointF(double(documentRegion.x()) + x + 0.5,
-                                   double(documentRegion.y()) + y + 0.5), source))
-                line[x] = m_coverage.constScanLine(source.y())[source.x()];
+                                   double(documentRegion.y()) + y + 0.5), source)
+                && m_coverage.constScanLine(source.y())[source.x()]) line[x] = m_source.pixel(source);
+        }
+    }
+    return result;
+}
+
+QImage FloatingPixelSession::renderScaled(const QRect &region, QSize outputSize) const {
+    if (region.isEmpty() || outputSize.isEmpty()) return {};
+    QImage result(outputSize, QImage::Format_ARGB32_Premultiplied);
+    if (result.isNull()) return {};
+    const bool originalLiftPose = !m_liftOriginal.isNull() && m_transform == m_liftTransform;
+    const QImage &base = originalLiftPose ? m_liftOriginal : m_base;
+    for (int y = 0; y < result.height(); ++y) {
+        auto *line = reinterpret_cast<QRgb *>(result.scanLine(y));
+        for (int x = 0; x < result.width(); ++x) {
+            const QPointF point(region.x() + (x + 0.5) * region.width() / outputSize.width(),
+                                region.y() + (y + 0.5) * region.height() / outputSize.height());
+            const double bx = std::floor(point.x()) - m_baseOffset.x();
+            const double by = std::floor(point.y()) - m_baseOffset.y();
+            QRgb pixel = bx >= 0 && by >= 0 && bx < base.width() && by < base.height()
+                ? base.pixel(int(bx), int(by)) : 0;
+            QPoint source;
+            if (!originalLiftPose && sourcePoint(point, source))
+                pixel = replaceCoveredPixel(pixel, m_source.pixel(source), m_coverage.constScanLine(source.y())[source.x()]);
+            line[x] = pixel;
         }
     }
     return result;

@@ -3,9 +3,15 @@
 #include "selectionhandles.h"
 #include <QImage>
 #include <QRect>
+#include <QPointer>
+#include <memory>
+
+class DocumentSnapshotCommand;
 
 class MoveTool : public Tool {
 public:
+    MoveTool();
+    ~MoveTool() override;
     ToolType type() const override { return ToolType::Move; }
     QString name() const override { return "Déplacer les pixels sélectionnés"; }
     QCursor cursor() const override { return Qt::SizeAllCursor; }
@@ -14,8 +20,17 @@ public:
     void mouseMoveEvent(const QPointF &canvasPos, QMouseEvent *event, CanvasWidget &canvas) override;
     void mouseReleaseEvent(const QPointF &canvasPos, QMouseEvent *event, CanvasWidget &canvas) override;
     void drawOverlay(QPainter &painter, const CanvasWidget &canvas) override;
+    void keyPressEvent(QKeyEvent *event, CanvasWidget &canvas) override;
+    void deactivate(CanvasWidget &canvas) override;
 
 private:
+    void finishSessionGesture();
+    bool m_sessionGesture = false;
+    bool m_sessionWasModified = false;
+    QPointer<Document> m_sessionDocument;
+    QTransform m_sessionStartTransform;
+    std::unique_ptr<DocumentSnapshotCommand> m_sessionCommand;
+    QMetaObject::Connection m_historyConnection;
     bool m_moving = false;
     QPointF m_startPos;
     QPoint m_originalOffset;

@@ -50,6 +50,8 @@ public:
 
     // Full-document snapshot support (for undo/redo of structural ops)
     std::vector<std::shared_ptr<Layer>> snapshotLayers() const;
+    // Value snapshots for preview/export workers, including the effective target.
+    std::vector<std::shared_ptr<Layer>> snapshotEffectiveLayers() const;
     void restoreFromSnapshot(std::vector<std::shared_ptr<Layer>> layers,
                              int width, int height, int activeLayer,
                              const FloatingPixelSession *session = nullptr, int sessionLayer = -1);
@@ -75,15 +77,25 @@ public:
     Selection &selection() { return m_selection; }
     const Selection &selection() const { return m_selection; }
 
-    // Internal infrastructure: no UI activation or automatic history/serialization.
+    // Low-level initialization: no UI activation or automatic history entry.
     // Captures a base snapshot; does not lift/erase pixels or mutate the selection.
     bool beginFloatingPixelSession(int layerIndex, const QImage &source,
                                    const QImage &coverage, QPoint sourceOrigin);
+    // Atomic, undoable paste initialization. Placement/canvas decisions are made
+    // by the caller. A previous session is materialized in the same history entry.
+    bool pasteFloatingPixels(const QImage &source, const QImage &coverage, QPoint origin,
+                             bool intoNewLayer = false, QSize canvasSize = QSize());
     // Read-only access ensures transform previews cannot bypass cache invalidation.
     const FloatingPixelSession *floatingPixelSession() const;
     // Preview an absolute transform and synchronize visible selection coverage.
     // History callers capture before a gesture and after its final preview.
     bool setFloatingPixelTransform(const QTransform &transform);
+    // Context changes materialize pixels but preserve selection/editing intent.
+    bool suspendFloatingPixels(bool recordHistory = true);
+    bool finishFloatingPixels(bool clearSelection = true);
+    // Prepare a source from the current active layer after suspension, or a copy.
+    // Caller owns the gesture's before/after history checkpoint.
+    bool prepareFloatingPixelGesture(bool copy = false);
     // Releases temporary state only; never rolls back or commits layer pixels.
     // Required before starting another session, including after target removal.
     void discardFloatingPixelSession();
@@ -98,6 +110,7 @@ public:
     static QImage compositeLayers(const std::vector<Layer> &layers, QSize size);
     bool commitImageEdits(const std::vector<ImageEditState> &edits, const QString &description);
     QImage flatten() const;
+    QImage thumbnail(QSize maximumSize) const;
     QImage flattenVisible() const;
     // Same composition as flattenVisible(), restricted to a document-space tile.
     QImage flattenVisible(const QRect &region) const;
@@ -127,19 +140,25 @@ public:
     void swapColors();
 
 signals:
+    // Finalize a pending gesture before checkpointing a context transition.
+    void floatingContextChanging();
     void layersChanged();
     void activeLayerChanged(int index);
     void selectionChanged();
     void documentChanged();
+    // Transform-only preview: raster dirtiness is confined to these canvas regions.
+    void floatingPixelsChanged(const QRegion &regions);
     void editScopeChanged(bool editAllLayers);
     void primaryColorChanged(const QColor &color);
     void secondaryColorChanged(const QColor &color);
     void sizeChanged(int width, int height);
 
 private:
+    qint64 m_floatingSelectionKey = -1;
     friend class FloatingPixelSessionCommand;
     // Restores checkpoint state without signals; callers publish the complete state.
     void restoreFloatingPixelSession(const FloatingPixelSession *session, int layerIndex);
+    std::optional<Layer> floatingPixelRaster() const;
     int m_width;
     int m_height;
     std::vector<std::shared_ptr<Layer>> m_layers;

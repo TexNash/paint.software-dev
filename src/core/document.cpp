@@ -1,4 +1,5 @@
 #include "document.h"
+#include "clipboardpixels.h"
 #include <QPainter>
 #include <QImageReader>
 #include <QImageWriter>
@@ -6,10 +7,29 @@
 #include <limits>
 #include <QFileInfo>
 #include <QFile>
+#include <QSaveFile>
 #include <QDataStream>
+#include <cmath>
 
 // Magic number for the native layered format: 'P','S','W','1'.
 static const quint32 kPswMagic = 0x50535731;
+static const quint32 kFloatingMagic = 0x46505331; // Optional FPS1 trailer after legacy layers.
+
+static std::optional<QRect> imageBounds(const QRectF &bounds, double existingBytes = 0) {
+    const double left = std::floor(bounds.left()), top = std::floor(bounds.top());
+    const double right = std::ceil(bounds.right()), bottom = std::ceil(bounds.bottom());
+    if (!std::isfinite(left) || !std::isfinite(top) || !std::isfinite(right) || !std::isfinite(bottom)
+        || left < std::numeric_limits<int>::min() || top < std::numeric_limits<int>::min()
+        || right > std::numeric_limits<int>::max() || bottom > std::numeric_limits<int>::max()
+        || right <= left || bottom <= top || right - left > std::numeric_limits<int>::max()
+        || bottom - top > std::numeric_limits<int>::max()) return std::nullopt;
+    const double bytes = (right - left) * (bottom - top) * 4;
+    // Respect Qt's existing image allocation budget for materialized previews,
+    // rather than allocating a giant empty bridge to distant off-canvas pixels.
+    const int limit = QImageReader::allocationLimit();
+    if (limit > 0 && bytes > qMax(double(limit) * 1024 * 1024, existingBytes * 2)) return std::nullopt;
+    return QRect(int(left), int(top), int(right - left), int(bottom - top));
+}
 
 Document::Document(int width, int height, QObject *parent)
     : QObject(parent), m_width(width), m_height(height), m_selection(width, height)
@@ -31,6 +51,7 @@ bool Document::beginFloatingPixelSession(int layerIndex, const QImage &source,
     auto session = FloatingPixelSession::create(m_layers[layerIndex], source, coverage, sourceOrigin);
     if (!session) return false;
     m_floatingPixelSession = std::move(session);
+    m_floatingSelectionKey = -1;
     emit documentChanged();
     return true;
 }
@@ -42,16 +63,242 @@ const FloatingPixelSession *Document::floatingPixelSession() const {
     return nullptr;
 }
 
+bool Document::pasteFloatingPixels(const QImage &source, const QImage &coverage, QPoint origin,
+                                   bool intoNewLayer, QSize canvasSize) {
+    if (!activeLayer() || (!intoNewLayer && activeLayer()->isLocked())
+        || source.isNull() || coverage.isNull() || source.size() != coverage.size()
+        || coverage.format() != QImage::Format_Grayscale8) return false;
+    if (canvasSize == QSize()) canvasSize = size();
+    if (canvasSize.isEmpty() || canvasSize.width() < m_width || canvasSize.height() < m_height) return false;
+    bool selectedPixels = false;
+    for (int y = 0; y < coverage.height() && !selectedPixels; ++y)
+        for (int x = 0; x < coverage.width(); ++x)
+            if (coverage.constScanLine(y)[x]) { selectedPixels = true; break; }
+    if (!selectedPixels) return false;
+
+    // Prepare everything before changing document state, including expansion.
+    // A rejected paste must not resize layers or abandon a redo branch.
+    auto prepared = snapshotLayers();
+    if (const auto *previous = floatingPixelSession()) {
+        const auto raster = floatingPixelRaster();
+        if (!raster) return false;
+        for (int i = 0; i < layerCount(); ++i)
+            if (previous->targets(layerAt(i))) { prepared[i] = std::make_shared<Layer>(*raster); break; }
+    }
+    if (canvasSize != size()) {
+        for (auto &layer : prepared) {
+            const qint64 width = qint64(canvasSize.width()) - qMin(layer->offset().x(), 0);
+            const qint64 height = qint64(canvasSize.height()) - qMin(layer->offset().y(), 0);
+            if (width > std::numeric_limits<int>::max() || height > std::numeric_limits<int>::max()) return false;
+            const QSize buffer = layer->image().size().expandedTo(QSize(int(width), int(height)));
+            if (buffer == layer->image().size()) continue;
+            QImage padded(buffer, QImage::Format_ARGB32_Premultiplied);
+            if (padded.isNull()) return false;
+            padded.fill(Qt::transparent);
+            { QPainter painter(&padded); painter.drawImage(0, 0, layer->image()); }
+            layer->setImage(padded);
+        }
+    }
+    int target = m_activeLayer;
+    if (intoNewLayer) {
+        QImage empty(canvasSize, QImage::Format_ARGB32_Premultiplied);
+        if (empty.isNull()) return false;
+        empty.fill(Qt::transparent);
+        ++target;
+        prepared.insert(prepared.begin() + target, std::make_shared<Layer>(empty, "Pasted Layer"));
+    }
+    auto session = FloatingPixelSession::create(prepared[target], source, coverage, origin);
+    if (!session) return false;
+    const QImage mask = session->renderCoverage(QRect(QPoint(), canvasSize));
+    if (mask.isNull()) return false;
+    Selection selected;
+    selected.setMaskImage(mask);
+    if (selected.mask().isNull()) return false;
+
+    auto command = std::make_unique<DocumentSnapshotCommand>(this, intoNewLayer ? "Paste into New Layer" : "Paste");
+    const QSize oldSize = size();
+    m_layers = std::move(prepared);
+    m_activeLayer = target;
+    m_width = canvasSize.width();
+    m_height = canvasSize.height();
+    m_floatingPixelSession = std::move(session);
+    m_selection = std::move(selected);
+    m_floatingSelectionKey = m_selection.mask().cacheKey();
+    command->captureAfter();
+    m_history.push(std::move(command));
+    m_modified = true;
+    if (size() != oldSize) emit sizeChanged(m_width, m_height);
+    emit layersChanged();
+    emit activeLayerChanged(m_activeLayer);
+    emit selectionChanged();
+    emit documentChanged();
+    return true;
+}
+
 bool Document::setFloatingPixelTransform(const QTransform &transform) {
     const auto *session = floatingPixelSession();
-    if (!session) return false;
+    if (!session || session->isSuspended()) return false;
+    if (transform == session->transform() && m_floatingSelectionKey == m_selection.mask().cacheKey()) return true;
     FloatingPixelSession preview = *session;
     if (!preview.setTransform(transform)) return false;
-    const QImage mask = preview.renderCoverage(QRect(QPoint(), size()));
+    const QRect canvas(QPoint(), size());
+    const auto clipped = [&canvas](QRectF bounds) {
+        return bounds.intersected(QRectF(canvas)).toAlignedRect().intersected(canvas);
+    };
+    // Separate old/new footprints avoid rendering an empty bridge on long jumps.
+    // Source bounds also delimit changes to the finite layer domain (Overwrite).
+    QRegion dirty(clipped(session->sourceBounds()));
+    dirty += clipped(preview.sourceBounds());
+    dirty += QRegion(clipped(session->documentBounds())).xored(QRegion(clipped(preview.documentBounds())));
+    QImage mask = preview.renderCoverage(canvas);
     if (mask.isNull()) return false;
+    m_selection.setMaskImage(std::move(mask), clipped(preview.sourceBounds()));
+    m_floatingSelectionKey = m_selection.mask().cacheKey();
+    if (preview.transform() != session->transform()) m_modified = true;
     *m_floatingPixelSession = std::move(preview);
-    m_selection.setMaskImage(mask);
     emit selectionChanged();
+    emit floatingPixelsChanged(dirty);
+    return true;
+}
+
+std::optional<Layer> Document::floatingPixelRaster() const {
+    const auto *session = floatingPixelSession();
+    if (!session) return std::nullopt;
+    for (const auto &layer : m_layers) {
+        if (!session->targets(layer.get())) continue;
+        if (session->isSuspended()) return *layer;
+        const auto bounds = imageBounds(session->documentBounds(),
+            double(session->m_base.sizeInBytes()) + session->m_source.sizeInBytes());
+        if (!bounds) return std::nullopt;
+        const QImage pixels = session->render(*bounds);
+        if (pixels.isNull()) return std::nullopt;
+        Layer result(*layer);
+        result.setImage(pixels);
+        result.setOffset(bounds->topLeft());
+        result.setRetainsOffCanvasPixels(layer->retainsOffCanvasPixels()
+                                        || !QRect(QPoint(), size()).contains(*bounds));
+        return result;
+    }
+    return std::nullopt;
+}
+
+bool Document::suspendFloatingPixels(bool recordHistory) {
+    if (floatingPixelSession()) emit floatingContextChanging();
+    const auto *session = floatingPixelSession();
+    if (!session || session->isSuspended()) return true;
+    auto raster = floatingPixelRaster();
+    if (!raster) return false;
+    int index = 0;
+    while (!session->targets(layerAt(index))) ++index;
+    auto command = recordHistory ? std::make_unique<FloatingPixelSessionCommand>(this, index, "Finish") : nullptr;
+    auto *layer = layerAt(index);
+    layer->setImage(raster->image());
+    layer->setOffset(raster->offset());
+    layer->setRetainsOffCanvasPixels(raster->retainsOffCanvasPixels());
+    m_floatingPixelSession->m_suspended = true;
+    if (command) {
+        command->captureAfter();
+        m_history.push(std::move(command));
+        m_modified = true;
+    }
+    notifyContentChanged();
+    return true;
+}
+
+bool Document::finishFloatingPixels(bool clearSelection) {
+    if (floatingPixelSession()) emit floatingContextChanging();
+    const auto *session = floatingPixelSession();
+    if (!session) return true;
+    auto raster = floatingPixelRaster();
+    if (!raster) return false;
+    int index = 0;
+    while (!session->targets(layerAt(index))) ++index;
+    auto command = std::make_unique<FloatingPixelSessionCommand>(this, index, "Finish");
+    auto *layer = layerAt(index);
+    layer->setImage(raster->image());
+    layer->setOffset(raster->offset());
+    layer->setRetainsOffCanvasPixels(raster->retainsOffCanvasPixels());
+    m_floatingPixelSession.reset();
+    if (clearSelection) m_selection.clear();
+    command->captureAfter();
+    m_history.push(std::move(command));
+    m_modified = true;
+    emit selectionChanged();
+    notifyContentChanged();
+    return true;
+}
+
+bool Document::prepareFloatingPixelGesture(bool copy) {
+    auto *layer = activeLayer();
+    if (!layer || layer->isLocked()) return false;
+    const auto *session = floatingPixelSession();
+    if (!session) return false;
+    const bool sameTarget = session->targets(layer);
+    if (sameTarget && !session->isSuspended() && !copy) return true;
+    std::optional<Layer> previousRaster;
+    int previousTarget = -1;
+    if (!sameTarget) {
+        if (!m_selection.hasSelection()) return false;
+        if (!session->isSuspended()) {
+            previousRaster = floatingPixelRaster();
+            if (!previousRaster) return false;
+            for (int i = 0; i < layerCount(); ++i)
+                if (session->targets(layerAt(i))) { previousTarget = i; break; }
+        }
+    }
+    Layer raster(*layer);
+    std::optional<ClipboardPixels> source;
+    if (sameTarget) {
+        const auto prepared = floatingPixelRaster();
+        const auto bounds = imageBounds(session->sourceBounds(),
+            double(prepared ? prepared->image().sizeInBytes() : 0) + session->m_source.sizeInBytes());
+        if (!prepared || !bounds) return false;
+        raster = *prepared;
+        Selection geometry;
+        // Capture in source-frame coordinates, including off-canvas geometry.
+        const QImage geometryMask = session->renderCoverage(*bounds);
+        if (geometryMask.isNull()) return false;
+        geometry.setMaskImage(geometryMask);
+        if (!geometry.hasSelection()) return false;
+        const qint64 dx = qint64(raster.offset().x()) - bounds->x();
+        const qint64 dy = qint64(raster.offset().y()) - bounds->y();
+        if (dx < std::numeric_limits<int>::min() || dx > std::numeric_limits<int>::max()
+            || dy < std::numeric_limits<int>::min() || dy > std::numeric_limits<int>::max()) return false;
+        source = ClipboardPixels::capture(raster.image(), QPoint(int(dx), int(dy)), geometry);
+        if (source) source->sourceOrigin += bounds->topLeft();
+    } else {
+        // A selection belongs to the document; starting Move on another layer
+        // lifts that layer's pixels. The previous target was materialized on switch.
+        source = ClipboardPixels::capture(raster.image(), raster.offset(), m_selection);
+    }
+    if (!source) return false;
+    auto lifted = FloatingPixelSession::create(m_layers[m_activeLayer], source->pixels,
+                                               source->coverage, source->sourceOrigin);
+    if (!lifted) return false;
+    lifted->m_base = raster.image().copy();
+    if (lifted->m_base.isNull()) return false;
+    lifted->m_baseOffset = raster.offset();
+    lifted->m_liftOriginal = lifted->m_base;
+    lifted->m_liftTransform = lifted->transform();
+    if (!copy) {
+        const QRect layerBounds(raster.offset(), raster.image().size());
+        const QImage mask = sameTarget ? session->renderCoverage(layerBounds)
+                                      : m_selection.maskForImage(raster.image().size(), raster.offset());
+        if (mask.isNull()) return false;
+        Selection erase;
+        erase.setMaskImage(mask);
+        erase.eraseFromImage(lifted->m_base);
+    }
+    if (previousRaster && previousTarget >= 0) {
+        auto *previous = layerAt(previousTarget);
+        previous->setImage(previousRaster->image());
+        previous->setOffset(previousRaster->offset());
+        previous->setRetainsOffCanvasPixels(previousRaster->retainsOffCanvasPixels());
+    }
+    layer->setImage(raster.image());
+    layer->setOffset(raster.offset());
+    layer->setRetainsOffCanvasPixels(raster.retainsOffCanvasPixels());
+    m_floatingPixelSession = std::move(lifted);
     emit documentChanged();
     return true;
 }
@@ -69,10 +316,12 @@ void Document::restoreFloatingPixelSession(const FloatingPixelSession *session, 
         restored->m_target = m_layers[layerIndex];
     }
     m_floatingPixelSession = std::move(restored);
+    m_floatingSelectionKey = -1;
 }
 
 void Document::resize(int width, int height) {
     if (width <= 0 || height <= 0 || (width == m_width && height == m_height)) return;
+    if (!finishFloatingPixels(false)) return;
     auto cmd = std::make_unique<DocumentSnapshotCommand>(this, "Resize Image");
     const QSize oldSize = size();
     const double scaleX = double(width) / m_width;
@@ -124,6 +373,7 @@ void Document::resize(int width, int height) {
 
 void Document::resizeCanvas(int width, int height, int anchorX, int anchorY) {
     if (width <= 0 || height <= 0) return;
+    if (!finishFloatingPixels(false)) return;
     auto cmd = std::make_unique<DocumentSnapshotCommand>(this, "Canvas Size");
     for (auto &layer : m_layers) {
         QImage newImg(width, height, QImage::Format_ARGB32_Premultiplied);
@@ -162,6 +412,7 @@ Layer *Document::activeLayer() {
 
 void Document::setActiveLayer(int index) {
     if (index >= 0 && index < static_cast<int>(m_layers.size())) {
+        if (index != m_activeLayer && !suspendFloatingPixels()) return;
         m_activeLayer = index;
         emit activeLayerChanged(index);
     }
@@ -174,6 +425,7 @@ void Document::setEditAllLayers(bool editAllLayers) {
 }
 
 int Document::addLayer(const QString &name) {
+    if (!suspendFloatingPixels()) return -1;
     QString layerName = name.isEmpty() ? QString("Layer %1").arg(m_layers.size() + 1) : name;
     auto layer = std::make_shared<Layer>(m_width, m_height, layerName);
     // New layers are transparent (the Layer ctor already fills transparent), so
@@ -194,6 +446,7 @@ int Document::addLayer(const QString &name) {
 }
 
 int Document::addLayer(const QImage &image, const QString &name) {
+    if (!suspendFloatingPixels()) return -1;
     QString layerName = name.isEmpty() ? QString("Layer %1").arg(m_layers.size() + 1) : name;
     // Every layer must be canvas-sized — the Move tool and other tools assume it.
     // A pasted/imported image that was smaller than the canvas used to become a
@@ -278,6 +531,7 @@ int Document::pasteImage(const QImage &image, const QString &name, bool expandCa
 
 void Document::removeLayer(int index) {
     if (m_layers.size() <= 1 || index < 0 || index >= static_cast<int>(m_layers.size())) return;
+    if (!finishFloatingPixels(false)) return;
 
     auto cmd = std::make_unique<LayerRemoveCommand>(this, index, "Remove Layer");
     m_layers.erase(m_layers.begin() + index);
@@ -312,6 +566,7 @@ void Document::moveLayer(int fromIndex, int toIndex) {
 
 void Document::duplicateLayer(int index) {
     if (index < 0 || index >= static_cast<int>(m_layers.size())) return;
+    if (!suspendFloatingPixels()) return;
     auto copy = std::make_shared<Layer>(*m_layers[index]);
     copy->setName(copy->name() + " copy");
     int newIndex = index + 1;
@@ -353,6 +608,7 @@ static QImage knockOutBackground(const QImage &src) {
 
 void Document::mergeLayerDown(int index, bool keepArtwork) {
     if (index <= 0 || index >= static_cast<int>(m_layers.size())) return;
+    if (!finishFloatingPixels(false)) return;
     auto cmd = std::make_unique<DocumentSnapshotCommand>(this, "Merge Layer Down");
 
     Layer *upper = m_layers[index].get();
@@ -399,6 +655,7 @@ void Document::mergeLayerDown(int index, bool keepArtwork) {
 
 void Document::flattenImage() {
     if (m_layers.size() <= 1) return;
+    if (!finishFloatingPixels(false)) return;
     auto cmd = std::make_unique<DocumentSnapshotCommand>(this, "Flatten Image");
 
     QImage flat = flattenVisible();
@@ -457,6 +714,18 @@ void Document::pushImageEdit(int layerIndex, const QImage &before, const QString
 
 bool Document::commitImageEdits(const std::vector<ImageEditState> &edits, const QString &description) {
     if (edits.empty()) return false;
+    if (floatingPixelSession()) {
+        emit floatingContextChanging();
+        auto command = std::make_unique<DocumentSnapshotCommand>(this, description);
+        if (!suspendFloatingPixels(false)) return false;
+        for (const auto &edit : edits)
+            if (auto *layer = layerAt(edit.index)) layer->setImage(edit.after);
+        command->captureAfter();
+        m_history.push(std::move(command));
+        m_modified = true;
+        notifyContentChanged();
+        return true;
+    }
     for (const auto &edit : edits)
         if (auto *layer = layerAt(edit.index)) layer->setImage(edit.after);
     m_history.push(std::make_unique<MultiImageEditCommand>(this, edits, description));
@@ -473,12 +742,51 @@ QImage Document::compositeLayers(const std::vector<Layer> &layers, QSize size) {
 }
 
 QImage Document::flatten() const {
-    if (floatingPixelSession()) return flattenVisible(QRect(QPoint(), size()));
+    if (floatingPixelSession() && !floatingPixelSession()->isSuspended()) return flattenVisible(QRect(QPoint(), size()));
     QImage result(m_width, m_height, QImage::Format_ARGB32_Premultiplied);
     result.fill(Qt::transparent);
     for (const auto &layer : m_layers) {
         if (layer->isVisible())
             result = layer->composited(result);
+    }
+    return result;
+}
+
+QImage Document::thumbnail(QSize maximumSize) const {
+    const QSize output = size().scaled(maximumSize, Qt::KeepAspectRatio);
+    if (output.isEmpty()) return {};
+    QImage result(output, QImage::Format_ARGB32_Premultiplied);
+    if (result.isNull()) return {};
+    result.fill(Qt::transparent);
+    const double sx = double(output.width()) / m_width, sy = double(output.height()) / m_height;
+    const auto *session = floatingPixelSession();
+    for (const auto &layer : m_layers) {
+        if (!layer->isVisible() || layer->opacity() <= 0) continue;
+        const bool floating = session && !session->isSuspended() && session->targets(layer.get());
+        const QRectF domain = floating ? session->documentBounds() : QRectF(layer->offset(), layer->image().size());
+        const QRectF clipped = domain.intersected(QRectF(QPointF(), size()));
+        const QRect area = QRectF(clipped.x() * sx, clipped.y() * sy, clipped.width() * sx, clipped.height() * sy)
+                               .toAlignedRect().intersected(result.rect());
+        if (area.isEmpty()) continue;
+        QImage pixels;
+        if (floating) pixels = session->renderScaled(QRect(QPoint(), size()), output).copy(area);
+        else {
+            pixels = QImage(area.size(), QImage::Format_ARGB32_Premultiplied);
+            if (pixels.isNull()) return {};
+            for (int y = 0; y < area.height(); ++y) {
+                auto *line = reinterpret_cast<QRgb *>(pixels.scanLine(y));
+                for (int x = 0; x < area.width(); ++x) {
+                    const double bx = std::floor((area.x() + x + 0.5) / sx) - layer->offset().x();
+                    const double by = std::floor((area.y() + y + 0.5) / sy) - layer->offset().y();
+                    line[x] = bx >= 0 && by >= 0 && bx < layer->width() && by < layer->height()
+                        ? layer->image().pixel(int(bx), int(by)) : 0;
+                }
+            }
+        }
+        if (pixels.isNull()) return {};
+        Layer part(pixels); part.setOffset(area.topLeft());
+        part.setOpacity(layer->opacity()); part.setBlendMode(layer->blendMode());
+        result = part.composited(result);
     }
     return result;
 }
@@ -495,7 +803,7 @@ QImage Document::flattenVisible(const QRect &region) const {
     const auto *session = floatingPixelSession();
     for (const auto &layer : m_layers) {
         if (!layer->isVisible() || layer->opacity() <= 0) continue;
-        if (session && session->targets(layer.get())) {
+        if (session && !session->isSuspended() && session->targets(layer.get())) {
             // Intersect in floating point before rounding to avoid overflowing
             // QRect for distant transforms. Preserve the finite raster domain:
             // Overwrite must not clear lower layers beyond these bounds.
@@ -529,14 +837,25 @@ bool Document::isNativeFormat(const QString &filePath) {
 }
 
 bool Document::saveNative(const QString &filePath) {
-    QFile file(filePath);
+    if (floatingPixelSession()) emit floatingContextChanging();
+    auto savedLayers = snapshotLayers();
+    const auto *session = floatingPixelSession();
+    int sessionLayer = -1;
+    if (session) {
+        for (int i = 0; i < layerCount(); ++i)
+            if (session->targets(layerAt(i))) { sessionLayer = i; break; }
+        const auto raster = floatingPixelRaster();
+        if (!raster) return false;
+        savedLayers[sessionLayer] = std::make_shared<Layer>(*raster);
+    }
+    QSaveFile file(filePath);
     if (!file.open(QIODevice::WriteOnly)) return false;
     QDataStream out(&file);
     out.setVersion(QDataStream::Qt_6_0);
     out << kPswMagic;
     // Preserve legacy output only when it preserves the explicit movement state.
     qint32 version = 1;
-    for (const auto &layer : m_layers) {
+    for (const auto &layer : savedLayers) {
         // v1 infers retention from geometry. Positioned or differently sized
         // ordinary layers also need v2 to keep their explicit false flag.
         if (layer->retainsOffCanvasPixels() || layer->image().size() != size()
@@ -546,7 +865,7 @@ bool Document::saveNative(const QString &filePath) {
     out << qint32(m_width) << qint32(m_height);
     out << qint32(m_activeLayer);
     out << qint32(static_cast<int>(m_layers.size()));
-    for (const auto &l : m_layers) {
+    for (const auto &l : savedLayers) {
         out << l->name();
         out << float(l->opacity());
         out << bool(l->isVisible());
@@ -556,8 +875,15 @@ bool Document::saveNative(const QString &filePath) {
         if (version == 2) out << l->retainsOffCanvasPixels();
         out << l->image();
     }
-    if (out.status() != QDataStream::Ok) return false;
-    file.close();
+    // Legacy readers stop after the layer stack and see its materialized raster.
+    // Updated readers additionally restore the live source, mask and transform.
+    if (session) {
+        out << kFloatingMagic << quint32(1) << qint32(sessionLayer) << session->m_suspended;
+        out << session->m_source << session->m_coverage << session->m_base << session->m_baseOffset;
+        out << session->m_transform << session->m_liftOriginal << session->m_liftTransform;
+        out << m_selection.mask();
+    }
+    if (out.status() != QDataStream::Ok || !file.commit()) return false;
     m_filePath = filePath;
     m_modified = false;
     return true;
@@ -576,6 +902,8 @@ bool Document::loadNative(const QString &filePath) {
     in >> version >> w >> h >> active >> count;
     if (version != 1 && version != 2) return false;
     if (w <= 0 || h <= 0 || count <= 0 || count > 4096) return false;
+    const int allocationLimit = QImageReader::allocationLimit();
+    if (allocationLimit > 0 && qint64(w) * h > qint64(allocationLimit) * 1024 * 1024) return false;
 
     std::vector<std::shared_ptr<Layer>> layers;
     layers.reserve(count);
@@ -605,11 +933,45 @@ bool Document::loadNative(const QString &filePath) {
         layers.push_back(layer);
     }
 
+    std::unique_ptr<FloatingPixelSession> restoredSession;
+    Selection restoredSelection(w, h);
+    if (!in.atEnd()) {
+        quint32 extraMagic = 0;
+        in >> extraMagic;
+        if (extraMagic == kFloatingMagic) {
+            quint32 extraVersion = 0;
+            qint32 target = -1;
+            bool suspended = false;
+            QImage source, coverage, base, liftOriginal, selectionMask;
+            QPoint baseOffset;
+            QTransform transform, liftTransform;
+            in >> extraVersion >> target >> suspended;
+            if (extraVersion != 1 || target < 0 || target >= count) return false;
+            in >> source >> coverage >> base >> baseOffset >> transform >> liftOriginal >> liftTransform >> selectionMask;
+            if (in.status() != QDataStream::Ok || base.isNull() || selectionMask.size() != QSize(w, h)
+                || (!liftOriginal.isNull() && liftOriginal.size() != base.size())) return false;
+            coverage = coverage.convertToFormat(QImage::Format_Grayscale8);
+            restoredSession = FloatingPixelSession::create(layers[target], source, coverage, QPoint());
+            if (!restoredSession) return false;
+            restoredSession->m_base = base.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            restoredSession->m_baseOffset = baseOffset;
+            if (!restoredSession->setTransform(transform)) return false;
+            auto check = *restoredSession;
+            if (!check.setTransform(liftTransform)) return false;
+            restoredSession->m_liftOriginal = liftOriginal.isNull() ? QImage()
+                : liftOriginal.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+            restoredSession->m_liftTransform = liftTransform;
+            restoredSession->m_suspended = suspended;
+            restoredSelection.setMaskImage(selectionMask);
+            if (restoredSelection.mask().isNull()) return false;
+        }
+    }
     m_width = w;
     m_height = h;
     m_layers = std::move(layers);
     m_activeLayer = qBound(0, static_cast<int>(active), static_cast<int>(m_layers.size()) - 1);
-    m_selection = Selection(m_width, m_height);
+    m_selection = std::move(restoredSelection);
+    m_floatingPixelSession = std::move(restoredSession);
     m_history.clear();
     m_filePath = filePath;
     m_modified = false;
@@ -622,6 +984,7 @@ bool Document::loadNative(const QString &filePath) {
 }
 
 bool Document::save(const QString &filePath, int quality) {
+    if (floatingPixelSession()) emit floatingContextChanging();
     if (isNativeFormat(filePath))
         return saveNative(filePath);
 
@@ -670,6 +1033,7 @@ bool Document::load(const QString &filePath) {
     m_layers.push_back(layer);
     m_activeLayer = 0;
     m_selection = Selection(m_width, m_height);
+    m_floatingPixelSession.reset();
     m_history.clear();
     m_filePath = filePath;
     m_modified = false;
@@ -687,6 +1051,17 @@ std::vector<std::shared_ptr<Layer>> Document::snapshotLayers() const {
     for (const auto &l : m_layers)
         copy.push_back(std::make_shared<Layer>(*l));
     return copy;
+}
+
+std::vector<std::shared_ptr<Layer>> Document::snapshotEffectiveLayers() const {
+    auto result = snapshotLayers();
+    if (const auto *session = floatingPixelSession()) {
+        const auto raster = floatingPixelRaster();
+        if (!raster) return {};
+        for (int i = 0; i < layerCount(); ++i)
+            if (session->targets(layerAt(i))) { result[i] = std::make_shared<Layer>(*raster); break; }
+    }
+    return result;
 }
 
 void Document::restoreFromSnapshot(std::vector<std::shared_ptr<Layer>> layers,
@@ -711,6 +1086,7 @@ void Document::restoreFromSnapshot(std::vector<std::shared_ptr<Layer>> layers,
 void Document::cropTo(const QRect &rect) {
     QRect r = rect.intersected(QRect(0, 0, m_width, m_height));
     if (r.isEmpty()) return;
+    if (!finishFloatingPixels(false)) return;
     auto cmd = std::make_unique<DocumentSnapshotCommand>(this, "Crop to Selection");
 
     for (auto &layer : m_layers) {
@@ -736,6 +1112,7 @@ void Document::cropTo(const QRect &rect) {
 void Document::rotate(int quarterTurns, const QString &description) {
     quarterTurns = ((quarterTurns % 4) + 4) % 4;
     if (quarterTurns == 0) return;
+    if (!finishFloatingPixels(false)) return;
     auto cmd = std::make_unique<DocumentSnapshotCommand>(this, description);
 
     QTransform t;
@@ -770,6 +1147,7 @@ void Document::rotate(int quarterTurns, const QString &description) {
 }
 
 void Document::flip(bool horizontal, const QString &description) {
+    if (!finishFloatingPixels(false)) return;
     auto cmd = std::make_unique<DocumentSnapshotCommand>(this, description);
     for (auto &layer : m_layers) {
         const QPoint origin = layer->offset();

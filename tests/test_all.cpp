@@ -19,6 +19,8 @@
 #include <tuple>
 
 #include "core/document.h"
+#include "core/clipboardpixels.h"
+#include <QtEndian>
 #include "core/layer.h"
 #include "core/selection.h"
 #include "core/history.h"
@@ -3919,14 +3921,14 @@ int main(int argc, char **argv) {
         CHECK(doc.floatingPixelSession()->targets(target), "active layer change does not retarget session");
         CHECK(!doc.beginFloatingPixelSession(1, sourceBefore, maskBefore, QPoint()),
               "initialization cannot silently replace existing session");
-        // Native format remains layer-only even with an internal session present.
+        // Native saves include a legacy raster plus optional live-session metadata.
         QTemporaryDir dir;
         const QString path = dir.filePath("session-foundation.psw");
         CHECK(doc.saveNative(path), "native save accepts document with inactive session");
         Document loaded(1, 1);
-        CHECK(loaded.loadNative(path) && !loaded.floatingPixelSession()
-              && loaded.layerAt(0)->image() == doc.layerAt(0)->image(),
-              "native roundtrip preserves ordinary raster and does not serialize session");
+        CHECK(loaded.loadNative(path) && loaded.floatingPixelSession()
+              && loaded.flatten() == doc.flatten(),
+              "native roundtrip preserves visible raster and live session");
         doc.removeLayer(0);
         CHECK(!doc.floatingPixelSession(), "removed target cannot be accessed through session API");
         doc.discardFloatingPixelSession();
@@ -3988,6 +3990,7 @@ int main(int argc, char **argv) {
         mask.scanLine(1)[1] = 100;
         int contentSignals = 0, selectionSignals = 0;
         QObject::connect(&doc, &Document::documentChanged, &doc, [&]() { ++contentSignals; });
+        QObject::connect(&doc, &Document::floatingPixelsChanged, &doc, [&]() { ++contentSignals; });
         QObject::connect(&doc, &Document::selectionChanged, &doc, [&]() { ++selectionSignals; });
         auto initial = std::make_unique<FloatingPixelSessionCommand>(&doc, 0, "Begin Floating Pixels");
         CHECK(doc.beginFloatingPixelSession(0, source, mask, QPoint(1, 2)), "initialize history session");
@@ -4260,6 +4263,380 @@ int main(int argc, char **argv) {
         FloatingPixelSessionCommand nullDocument(nullptr, 0, "Invalid");
         CHECK(!nullDocument.captureAfter(), "checkpoint rejects null document");
         CHECK(!doc.setFloatingPixelTransform(QTransform()), "preview without a session is rejected");
+    }
+
+    SECTION("Floating clipboard pixels preserve independent geometry");
+    {
+        QImage source(5, 4, QImage::Format_ARGB32_Premultiplied);
+        source.fill(QColor(180, 60, 30, 128));
+        source.setPixelColor(1, 1, Qt::transparent);
+        QImage mask(9, 8, QImage::Format_Grayscale8);
+        mask.fill(0);
+        mask.scanLine(2)[3] = 255;
+        mask.scanLine(2)[4] = 128;
+        mask.scanLine(3)[3] = 255;
+        Selection selection(9, 8);
+        selection.setMaskImage(mask);
+        const auto captured = ClipboardPixels::capture(source, QPoint(2, 1), selection);
+        CHECK(captured && captured->pixels.size() == QSize(2, 2)
+              && captured->sourceOrigin == QPoint(3, 2), "capture crops to selection bounds in document space");
+        CHECK(captured->coverage.constScanLine(0)[0] == 255 && captured->pixels.pixel(0, 0) == 0,
+              "transparent selected pixels retain full geometry");
+        CHECK(captured->coverage.constScanLine(1)[1] == 0 && captured->pixels.pixel(1, 1) == 0,
+              "private clipboard does not retain colours from unselected holes");
+        const QImage conventional = captured->standardImage();
+        const QRgb partial = source.pixel(2, 1);
+        CHECK(conventional.pixel(1, 0) == qRgba(qRed(partial) * 128 / 255, qGreen(partial) * 128 / 255,
+                                               qBlue(partial) * 128 / 255, qAlpha(partial) * 128 / 255),
+              "ordinary clipboard image applies fractional coverage exactly once");
+        const auto mime = captured->mimeData();
+        CHECK(mime && mime->hasImage() && mime->hasFormat(ClipboardPixels::mimeType()),
+              "clipboard advertises both standard image and private geometry");
+        const auto decoded = ClipboardPixels::decode(*mime);
+        CHECK(decoded && decoded->pixels == captured->pixels && decoded->coverage == captured->coverage
+              && decoded->sourceOrigin == captured->sourceOrigin, "private format roundtrips unmasked premultiplied pixels and geometry");
+        CHECK(qvariant_cast<QImage>(mime->imageData()) == conventional,
+              "external applications receive the masked standard image");
+        source.fill(Qt::green);
+        mask.fill(0);
+        CHECK(captured->pixels == decoded->pixels && captured->coverage == decoded->coverage,
+              "capture owns snapshots independent of input image mutation");
+        Document destination(2, 3);
+        CHECK(destination.beginFloatingPixelSession(0, decoded->pixels, decoded->coverage, QPoint()),
+              "clipboard data initializes a session in a differently sized document");
+        CHECK(destination.floatingPixelSession()->sourcePixels() == decoded->pixels
+              && destination.floatingPixelSession()->sourceCoverage() == decoded->coverage,
+              "session consumes raw pixels and mask separately without masking twice");
+        Selection all(1, 1);
+        const auto whole = ClipboardPixels::capture(source, QPoint(-7, -3), all);
+        const auto wholeMime = whole->mimeData();
+        const auto wholeDecoded = ClipboardPixels::decode(*wholeMime);
+        CHECK(wholeDecoded && wholeDecoded->pixels == source && wholeDecoded->sourceOrigin == QPoint(-7, -3)
+              && wholeDecoded->coverage.constScanLine(0)[0] == 255, "whole-layer capture preserves negative origin and rectangular geometry");
+        const auto outside = ClipboardPixels::capture(source, QPoint(INT_MIN, INT_MAX), selection);
+        CHECK(outside && outside->pixels.pixel(0, 0) == 0 && outside->coverage.constScanLine(0)[0] == 255,
+              "extreme layer offsets produce selected transparent padding without coordinate overflow");
+    }
+    SECTION("Floating clipboard payload validation");
+    {
+        QImage source(3, 2, QImage::Format_ARGB32_Premultiplied);
+        source.fill(Qt::red);
+        Selection selection(3, 2);
+        const auto captured = ClipboardPixels::capture(source, QPoint(), selection);
+        const auto goodMime = captured->mimeData();
+        const QByteArray payload = goodMime->data(ClipboardPixels::mimeType());
+        auto rejects = [&](QByteArray bytes) {
+            QMimeData mime;
+            mime.setData(ClipboardPixels::mimeType(), bytes);
+            mime.setImageData(source);
+            CHECK(!ClipboardPixels::decode(mime), "invalid private data is rejected independently of ordinary fallback image");
+        };
+        rejects(QByteArray());
+        rejects(payload.first(23));
+        rejects(payload.chopped(1));
+        rejects(payload + 'x');
+        QByteArray bad = payload;
+        bad[0] ^= 1;
+        rejects(bad);
+        bad = payload;
+        qToLittleEndian(quint32(2), reinterpret_cast<uchar *>(bad.data()) + 4);
+        rejects(bad);
+        bad = payload;
+        qToLittleEndian(quint32(INT_MAX), reinterpret_cast<uchar *>(bad.data()) + 8);
+        rejects(bad);
+        bad = payload;
+        qToLittleEndian(quint32(0), reinterpret_cast<uchar *>(bad.data()) + 12);
+        rejects(bad);
+        bad = payload;
+        // First pixel: nonzero colour with zero alpha violates premultiplied storage.
+        qToLittleEndian(quint32(0x00ff0000), reinterpret_cast<uchar *>(bad.data()) + 24);
+        rejects(bad);
+        bad = payload;
+        for (int i = 24 + source.width() * source.height() * 4; i < bad.size(); ++i) bad[i] = 0;
+        rejects(bad);
+        QMimeData external;
+        external.setImageData(source);
+        CHECK(!ClipboardPixels::decode(external), "ordinary external image has no invented private geometry");
+        CHECK(!ClipboardPixels::capture(QImage(), QPoint(), selection), "null image cannot be captured");
+        ClipboardPixels empty;
+        CHECK(!empty.mimeData() && empty.standardImage().isNull(), "invalid clipboard value cannot publish an image");
+    }
+
+    SECTION("Atomic floating paste preserves destination between placements");
+    {
+        Document doc(12, 6);
+        QImage destination(12, 6, QImage::Format_ARGB32_Premultiplied);
+        destination.fill(Qt::white);
+        destination.setPixelColor(1, 2, Qt::red);
+        destination.setPixelColor(5, 2, Qt::green);
+        destination.setPixelColor(9, 2, Qt::blue);
+        doc.activeLayer()->setImage(destination);
+        doc.selection().selectRect(QRect(0, 0, 2, 2));
+        const QImage priorSelection = doc.selection().mask().copy();
+        QImage source(2, 2, QImage::Format_ARGB32_Premultiplied);
+        source.fill(Qt::magenta);
+        source.setPixelColor(1, 0, Qt::transparent);
+        source.setPixelColor(0, 1, QColor(240, 60, 90, 100));
+        QImage mask(2, 2, QImage::Format_Grayscale8);
+        mask.fill(255);
+        CHECK(doc.pasteFloatingPixels(source, mask, QPoint(1, 2)), "ordinary floating paste initializes");
+        CHECK(doc.layerCount() == 1 && doc.activeLayerIndex() == 0 && doc.isModified(),
+              "floating paste targets active layer without creating a layer");
+        CHECK(doc.selection().boundingRect() == QRect(1, 2, 2, 2), "paste replaces previous selection with source geometry");
+        CHECK(doc.activeLayer()->image() == destination && doc.flatten().pixelColor(1, 2) == QColor(Qt::magenta),
+              "paste preview replaces target pixels without altering captured destination");
+        CHECK(doc.flatten().pixel(2, 2) == 0 && doc.flatten().pixel(1, 3) == source.pixel(0, 1),
+              "selected full and partial transparency replace destination alpha");
+        auto move = [&](int x) {
+            auto command = std::make_unique<FloatingPixelSessionCommand>(&doc, 0, "Move Pasted Pixels");
+            CHECK(doc.setFloatingPixelTransform(QTransform::fromTranslate(x, 2)), "pasted transform preview accepted");
+            CHECK(command->captureAfter(), "pasted transform checkpoint captured");
+            doc.history().push(std::move(command));
+        };
+        move(5);
+        CHECK(doc.flatten().pixelColor(1, 2) == QColor(Qt::red), "A is preserved after moving pasted pixels to B");
+        move(9);
+        CHECK(doc.flatten().pixelColor(5, 2) == QColor(Qt::green)
+              && doc.flatten().pixelColor(9, 2) == QColor(Qt::magenta),
+              "B is preserved after moving pasted pixels to C");
+        doc.history().goToIndex(0);
+        CHECK(!doc.floatingPixelSession() && doc.flatten() == destination
+              && doc.selection().mask() == priorSelection, "undo paste restores pixels and preceding selection");
+        doc.history().goToIndex(3);
+        CHECK(doc.floatingPixelSession() && doc.flatten().pixelColor(9, 2) == QColor(Qt::magenta),
+              "paste and consecutive placements replay as separate history operations");
+    }
+    SECTION("Floating paste new layer expansion and rejection boundaries");
+    {
+        Document doc(3, 2);
+        doc.activeLayer()->setOffset(QPoint(-1, 0));
+        doc.activeLayer()->setRetainsOffCanvasPixels(true);
+        doc.activeLayer()->setLocked(true);
+        const QImage original = doc.activeLayer()->image().copy();
+        QImage source(5, 4, QImage::Format_ARGB32_Premultiplied);
+        source.fill(QColor(120, 30, 220, 128));
+        QImage mask(5, 4, QImage::Format_Grayscale8);
+        mask.fill(255);
+        CHECK(!doc.pasteFloatingPixels(source, mask, QPoint()), "active-layer paste rejects locked layer");
+        CHECK(doc.size() == QSize(3, 2) && doc.layerCount() == 1 && !doc.isModified()
+              && !doc.history().canUndo(), "rejected paste leaves geometry layer stack and history untouched");
+        CHECK(doc.pasteFloatingPixels(source, mask, QPoint(), true, QSize(5, 4)),
+              "paste into new layer can expand canvas above locked layer");
+        CHECK(doc.layerCount() == 2 && doc.activeLayerIndex() == 1 && doc.size() == QSize(5, 4)
+              && doc.floatingPixelSession()->targets(doc.layerAt(1)), "new layer is active above original and owns paste");
+        CHECK(doc.layerAt(0)->offset() == QPoint(-1, 0) && doc.layerAt(0)->retainsOffCanvasPixels()
+              && doc.layerAt(0)->image().copy(QRect(QPoint(), original.size())) == original,
+              "expansion preserves existing pixels offsets and retained-content state");
+        doc.history().undo();
+        CHECK(doc.size() == QSize(3, 2) && doc.layerCount() == 1 && doc.activeLayerIndex() == 0
+              && !doc.floatingPixelSession() && doc.layerAt(0)->image() == original,
+              "single undo reverses expansion new layer and session");
+        doc.history().redo();
+        CHECK(doc.floatingPixelSession() && doc.layerCount() == 2 && doc.size() == QSize(5, 4),
+              "redo restores expanded paste and target binding");
+        const int history = doc.history().currentIndex();
+        CHECK(doc.pasteFloatingPixels(source, mask, QPoint()) && doc.history().currentIndex() == history + 1,
+              "new paste atomically replaces previous session with one new history entry");
+        doc.history().undo();
+        CHECK(doc.floatingPixelSession() && doc.history().currentIndex() == history,
+              "undo replacement paste restores previous editable session");
+
+        Document invalid(3, 2);
+        CHECK(!invalid.pasteFloatingPixels(source, mask, QPoint(), false, QSize(2, 2)),
+              "paste cannot silently shrink canvas");
+        mask.fill(0);
+        CHECK(!invalid.pasteFloatingPixels(source, mask, QPoint(), false, QSize(5, 4))
+              && invalid.size() == QSize(3, 2) && !invalid.isModified(),
+              "invalid coverage cannot leave partially expanded document");
+        invalid.activeLayer()->setOffset(QPoint(INT_MIN, 0));
+        mask.fill(255);
+        CHECK(!invalid.pasteFloatingPixels(source, mask, QPoint(), false, QSize(5, 4)),
+              "overflowing retained bitmap extent is rejected before allocation");
+    }
+
+    SECTION("Floating context boundaries preserve painting and resume with a hole");
+    {
+        Document doc(100, 70);
+        QImage source(20, 20, QImage::Format_ARGB32_Premultiplied);
+        source.fill(Qt::magenta);
+        QImage mask(20, 20, QImage::Format_Grayscale8);
+        mask.fill(255);
+        CHECK(doc.pasteFloatingPixels(source, mask, QPoint(10, 10)), "context fixture pastes");
+        CHECK(doc.setFloatingPixelTransform(QTransform::fromTranslate(30, 10)), "uninterrupted fixture movement");
+        const QImage floating = doc.flatten();
+        CHECK(doc.suspendFloatingPixels() && doc.floatingPixelSession()->isSuspended()
+              && doc.selection().hasSelection() && doc.flatten() == floating,
+              "context transition preserves appearance and active selection");
+        const QImage beforeBrush = doc.activeLayer()->image().copy();
+        doc.activeLayer()->image().setPixelColor(35, 15, Qt::black);
+        doc.pushImageEdit(0, beforeBrush, "Brush");
+        CHECK(doc.flatten().pixelColor(35, 15) == QColor(Qt::black), "painting affects suspended session raster");
+        auto move = std::make_unique<DocumentSnapshotCommand>(&doc, "Move Selected Pixels");
+        const QImage painted = doc.flatten();
+        CHECK(doc.prepareFloatingPixelGesture() && doc.flatten() == painted,
+              "resuming source preserves initial appearance exactly");
+        CHECK(doc.setFloatingPixelTransform(QTransform::fromTranslate(60, 10)), "resumed movement accepted");
+        move->captureAfter(); doc.history().push(std::move(move));
+        CHECK(doc.flatten().pixelColor(35, 15).alpha() == 0
+              && doc.flatten().pixelColor(65, 15) == QColor(Qt::black),
+              "after painting the lifted source includes stroke and leaves transparency behind");
+        const QImage moved = doc.flatten();
+        CHECK(doc.finishFloatingPixels() && !doc.floatingPixelSession()
+              && !doc.selection().hasSelection() && doc.flatten() == moved, "Finish preserves raster and deselects");
+        doc.history().undo();
+        CHECK(doc.floatingPixelSession() && !doc.floatingPixelSession()->isSuspended()
+              && doc.flatten() == moved && doc.selection().hasSelection(), "Undo Finish restores editable source and its hole");
+        doc.history().undo();
+        CHECK(doc.floatingPixelSession()->isSuspended() && doc.flatten() == painted,
+              "Undo movement restores pre-lift painted raster");
+        doc.history().undo();
+        CHECK(doc.flatten() == floating, "Undo Brush restores pre-stroke raster");
+        doc.history().undo();
+        CHECK(!doc.floatingPixelSession()->isSuspended(), "Undo context boundary restores uninterrupted paste state");
+        CHECK(doc.setFloatingPixelTransform(QTransform::fromTranslate(60, 10))
+              && doc.flatten().pixelColor(35, 15) == QColor(Qt::white), "pre-context movement reveals original destination again");
+    }
+    SECTION("Floating sessions survive layer switches and fresh native reopening");
+    {
+        QTemporaryDir dir;
+        const QString path = dir.filePath("floating.psw");
+        QImage expected, selected, immutable;
+        QTransform transform;
+        {
+            Document original(80, 60);
+            original.addLayer("Other");
+            original.setActiveLayer(0);
+            QImage source(20, 20, QImage::Format_ARGB32_Premultiplied);
+            source.fill(QColor(180, 70, 40, 128));
+            source.setPixelColor(3, 3, Qt::transparent);
+            QImage mask(20, 20, QImage::Format_Grayscale8);
+            mask.fill(255);
+            mask.scanLine(4)[4] = 100;
+            CHECK(original.pasteFloatingPixels(source, mask, QPoint(10, 10)), "native fixture initializes");
+            CHECK(original.setFloatingPixelTransform(QTransform::fromTranslate(40, 20)), "native fixture transforms");
+            expected = original.flatten(); selected = original.selection().mask();
+            immutable = original.floatingPixelSession()->sourcePixels();
+            transform = original.floatingPixelSession()->transform();
+            const int history = original.history().currentIndex();
+            CHECK(original.saveNative(path) && original.floatingPixelSession()
+                  && !original.floatingPixelSession()->isSuspended() && original.history().currentIndex() == history,
+                  "native saving does not finish or add history");
+            CHECK(original.save(dir.filePath("visible.png")) && original.floatingPixelSession()
+                  && original.flatten() == expected, "PNG export preserves live editing state");
+            CHECK(QImage(dir.filePath("visible.png")).convertToFormat(QImage::Format_ARGB32_Premultiplied) == expected,
+                  "PNG contains current visible source and transparency");
+        } // No original document/session survives this scope.
+        Document reopened(1, 1);
+        CHECK(reopened.loadNative(path) && reopened.floatingPixelSession(), "fresh document restores native session metadata");
+        CHECK(reopened.flatten() == expected && reopened.selection().mask() == selected
+              && reopened.floatingPixelSession()->sourcePixels() == immutable
+              && reopened.floatingPixelSession()->transform() == transform,
+              "fresh reopen restores appearance independent geometry immutable source and transform");
+        CHECK(reopened.setFloatingPixelTransform(QTransform::fromTranslate(10, 10))
+              && reopened.flatten().pixelColor(45, 25) == QColor(Qt::white),
+              "moving reopened source reveals original destination instead of saved composite");
+        reopened.setActiveLayer(1);
+        CHECK(reopened.floatingPixelSession()->isSuspended(), "layer switch suspends without deselecting");
+        reopened.setActiveLayer(0);
+        CHECK(reopened.prepareFloatingPixelGesture()
+              && reopened.setFloatingPixelTransform(QTransform::fromTranslate(40, 20))
+              && reopened.flatten().pixelColor(15, 15).alpha() == 0,
+              "returning after layer switch lifts raster and leaves hole");
+        const QImage resumed = reopened.flatten();
+        CHECK(reopened.saveNative(path), "lifted source saves with original-pose data");
+        Document lifted;
+        CHECK(lifted.loadNative(path) && lifted.flatten() == resumed, "lifted source native roundtrip preserves result");
+
+        // Simulate an old reader by consuming only the unchanged v1/v2 prefix.
+        QFile file(path); CHECK(file.open(QIODevice::ReadOnly), "open native prefix for legacy read");
+        QDataStream input(&file); input.setVersion(QDataStream::Qt_6_0);
+        quint32 magic; qint32 version, width, height, active, count;
+        input >> magic >> version >> width >> height >> active >> count;
+        std::vector<Layer> legacyLayers;
+        for (int i = 0; i < count; ++i) {
+            QString name; float opacity; bool visible, locked, retained = false; qint32 blend; QPoint offset; QImage image;
+            input >> name >> opacity >> visible >> locked >> blend >> offset;
+            if (version == 2) input >> retained;
+            input >> image;
+            Layer layer(image, name); layer.setOpacity(opacity); layer.setVisible(visible);
+            layer.setBlendMode(BlendMode(blend)); layer.setOffset(offset);
+            legacyLayers.push_back(layer);
+        }
+        CHECK(input.status() == QDataStream::Ok && magic == 0x50535731 && (version == 1 || version == 2)
+              && Document::compositeLayers(legacyLayers, QSize(width, height)) == resumed,
+              "legacy reader sees correct materialized raster in unchanged layered format");
+        const qint64 footer = file.pos();
+        file.seek(0); const QByteArray bytes = file.readAll();
+        const QString legacyPath = dir.filePath("legacy.psw");
+        { QFile output(legacyPath); CHECK(output.open(QIODevice::WriteOnly), "write legacy native fixture"); output.write(bytes.left(footer)); }
+        Document legacy;
+        CHECK(legacy.loadNative(legacyPath) && !legacy.floatingPixelSession() && legacy.flatten() == resumed,
+              "native files without optional metadata remain readable");
+        const QString broken = dir.filePath("truncated.psw");
+        { QFile output(broken); CHECK(output.open(QIODevice::WriteOnly), "write truncated native fixture"); output.write(bytes.chopped(8)); }
+        const QImage before = lifted.flatten();
+        CHECK(!lifted.loadNative(broken) && lifted.floatingPixelSession() && lifted.flatten() == before,
+              "invalid session trailer cannot partially replace existing document");
+    }
+
+    SECTION("Floating regional redraw matches full reference across transforms and blend modes");
+    {
+        for (bool fullCoverage : {false, true}) for (BlendMode mode : {BlendMode::Normal, BlendMode::Multiply, BlendMode::Overwrite}) {
+            Document doc(43, 31);
+            doc.activeLayer()->clear(Qt::green);
+            doc.addLayer("Offset target");
+            QImage base(13, 9, QImage::Format_ARGB32_Premultiplied); base.fill(QColor(30, 90, 180, 140));
+            doc.activeLayer()->setImage(base); doc.activeLayer()->setOffset(QPoint(9, 7));
+            doc.activeLayer()->setBlendMode(mode); doc.activeLayer()->setOpacity(0.7);
+            QImage source(7, 5, QImage::Format_ARGB32_Premultiplied); source.fill(QColor(190, 60, 80, 110));
+            source.setPixel(0, 0, 0);
+            QImage coverage(7, 5, QImage::Format_Grayscale8); coverage.fill(255);
+            if (!fullCoverage) { coverage.scanLine(0)[0] = 100; coverage.scanLine(2)[3] = 0; }
+            CHECK(doc.pasteFloatingPixels(source, coverage, QPoint(28, 20)), "regional fixture starts live");
+            QRegion dirty; int notifications = 0;
+            QObject::connect(&doc, &Document::floatingPixelsChanged, &doc, [&](const QRegion &area) { dirty = area; ++notifications; });
+            for (const QTransform transform : {QTransform::fromTranslate(29, 21), QTransform::fromTranslate(-3, -2),
+                     QTransform::fromScale(2.3, 1.7) * QTransform::fromTranslate(12.25, 8.5),
+                     QTransform().rotate(37) * QTransform::fromTranslate(30, 6),
+                     QTransform::fromTranslate(1000, 900), QTransform::fromTranslate(5, 4),
+                     QTransform(1 + 1e-14, 1e-16, 1e-16, 1, 5.5, 4.5)}) {
+                QImage incremental = doc.flatten();
+                CHECK(doc.setFloatingPixelTransform(transform), "regional transform accepted");
+                { QPainter painter(&incremental); painter.setCompositionMode(QPainter::CompositionMode_Source);
+                  for (const QRect &area : dirty) painter.drawImage(area.topLeft(), doc.flattenVisible(area)); }
+                CHECK(incremental == doc.flatten(), "old/new footprints and finite-domain changes fully invalidate composite");
+                const auto *session = doc.floatingPixelSession();
+                const QRect region(-4, -3, 53, 40);
+                QImage expected(region.size(), QImage::Format_ARGB32_Premultiplied); expected.fill(0);
+                QImage expectedMask(doc.size(), QImage::Format_Grayscale8); expectedMask.fill(0);
+                const QTransform inverse = transform.inverted();
+                for (int y = 0; y < region.height(); ++y) for (int x = 0; x < region.width(); ++x) {
+                    const QPoint point = region.topLeft() + QPoint(x, y);
+                    const QPoint bp = point - QPoint(9, 7);
+                    QRgb pixel = base.rect().contains(bp) ? base.pixel(bp) : 0;
+                    const QPointF sp = inverse.map(QPointF(point) + QPointF(0.5, 0.5));
+                    if (sp.x() >= 0 && sp.y() >= 0 && sp.x() < source.width() && sp.y() < source.height()) {
+                        const QPoint sample(int(std::floor(sp.x())), int(std::floor(sp.y())));
+                        const int c = coverage.constScanLine(sample.y())[sample.x()]; const QRgb src = source.pixel(sample);
+                        auto mix = [c](int d, int s) { return (s*c + d*(255-c) + 127)/255; };
+                        pixel = qRgba(mix(qRed(pixel),qRed(src)), mix(qGreen(pixel),qGreen(src)),
+                                      mix(qBlue(pixel),qBlue(src)), mix(qAlpha(pixel),qAlpha(src)));
+                        if (expectedMask.rect().contains(point)) expectedMask.scanLine(point.y())[point.x()] = c;
+                    }
+                    expected.setPixel(x, y, pixel);
+                }
+                CHECK(session->render(region) == expected, "optimized raster equals scalar replacement reference");
+                CHECK(doc.selection().mask() == expectedMask, "bounded mask equals scalar inverse-sampling reference");
+                Selection ordinary; ordinary.setMaskImage(expectedMask);
+                CHECK(doc.selection().boundingRect() == ordinary.boundingRect() && doc.selection().region() == ordinary.region(),
+                      "bounded selection caches preserve bounds and marquee geometry");
+                CHECK(session->renderScaled(region, region.size()) == expected, "bounded preview uses identical pixel-centre sampling");
+                const int before = notifications; const qint64 key = doc.selection().mask().cacheKey();
+                CHECK(doc.setFloatingPixelTransform(transform) && notifications == before && doc.selection().mask().cacheKey() == key,
+                      "unchanged transform performs no raster or selection update");
+            }
+            CHECK(doc.thumbnail(QSize(30, 30)).size() == QSize(30, 21), "document thumbnail stays bounded");
+        }
     }
 
     // ---------- RESULT ----------

@@ -21,7 +21,7 @@ struct PluginParamInfo {
 };
 
 // Wraps a plugin-provided PswEffect as a first-class Effect so it flows through the
-// exact same pipeline (PreviewDialog, applyImageOperationToTargetLayers) as built-in
+// same canvas preview and commit pipeline as built-in
 // effects. Holds a reference to the QLibrary so the code stays mapped while in use.
 class PluginEffect : public Effect {
 public:

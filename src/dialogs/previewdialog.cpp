@@ -7,37 +7,18 @@
 #include <QSpinBox>
 #include <QDialogButtonBox>
 #include <QPushButton>
-#include <QPainter>
 
 PreviewDialog::PreviewDialog(const QString &title, QVector<Param> params, QWidget *parent)
     : QDialog(parent), m_params(std::move(params)) {
     setupUi(title);
 }
 
-PreviewDialog::PreviewDialog(const QString &title, const QImage &source,
-                             QVector<Param> params, Renderer renderer, QWidget *parent)
-    : QDialog(parent), m_renderer(std::move(renderer)), m_params(std::move(params)) {
-    // Downscale the source so the renderer runs on a small image on every drag.
-    const int maxDim = 340;
-    m_previewSource = (source.width() > maxDim || source.height() > maxDim)
-        ? source.scaled(maxDim, maxDim, Qt::KeepAspectRatio, Qt::SmoothTransformation)
-        : source;
-
-    m_preview = new QLabel;
-    m_preview->setAlignment(Qt::AlignCenter);
-    m_preview->setMinimumSize(maxDim, 220);
-    m_preview->setStyleSheet("border: 1px solid palette(mid);");
-    setupUi(title);
-    updatePreview();
-}
-
 void PreviewDialog::setupUi(const QString &title) {
     setWindowTitle(title);
     auto *root = new QVBoxLayout(this);
-    if (m_preview) root->addWidget(m_preview);
 
     auto *grid = new QGridLayout;
-    if (!m_preview) grid->setColumnStretch(1, 1);
+    grid->setColumnStretch(1, 1);
     for (int i = 0; i < m_params.size(); ++i) {
         const Param &p = m_params[i];
         auto *lab = new QLabel(p.label);
@@ -53,7 +34,6 @@ void PreviewDialog::setupUi(const QString &title) {
         connect(slider, &QSlider::valueChanged, spin, &QSpinBox::setValue);
         connect(spin, QOverload<int>::of(&QSpinBox::valueChanged), slider, &QSlider::setValue);
         connect(slider, &QSlider::valueChanged, this, [this]() {
-            if (m_preview) updatePreview();
             emit parametersChanged();
         });
 
@@ -81,25 +61,4 @@ QVector<int> PreviewDialog::values() const {
     v.reserve(m_spins.size());
     for (auto *s : m_spins) v.push_back(s->value());
     return v;
-}
-
-void PreviewDialog::updatePreview() {
-    if (!m_renderer) return;
-    QImage processed = m_renderer(m_previewSource, values());
-    if (processed.isNull()) return;
-
-    // Composite over a checkerboard so transparency is visible in the preview.
-    QImage canvas(processed.size(), QImage::Format_ARGB32);
-    const int cell = 8;
-    for (int y = 0; y < canvas.height(); ++y) {
-        QRgb *line = reinterpret_cast<QRgb *>(canvas.scanLine(y));
-        for (int x = 0; x < canvas.width(); ++x) {
-            bool light = ((x / cell) + (y / cell)) % 2 == 0;
-            line[x] = light ? qRgb(200, 200, 200) : qRgb(160, 160, 160);
-        }
-    }
-    QPainter p(&canvas);
-    p.drawImage(0, 0, processed);
-    p.end();
-    m_preview->setPixmap(QPixmap::fromImage(canvas));
 }

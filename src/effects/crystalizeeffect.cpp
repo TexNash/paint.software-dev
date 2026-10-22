@@ -1,5 +1,5 @@
 #include "crystalizeeffect.h"
-#include <cstdlib>
+#include <QRandomGenerator>
 #include <cmath>
 #include <vector>
 
@@ -16,11 +16,11 @@ QImage CrystalizeEffect::apply(const QImage &input) {
     std::vector<Cell> cells;
     cells.reserve(numCellsX * numCellsY);
 
-    srand(42);
+    QRandomGenerator rng(42);
     for (int cy = 0; cy < numCellsY; ++cy) {
         for (int cx = 0; cx < numCellsX; ++cx) {
-            int px = cx * m_cellSize + rand() % m_cellSize;
-            int py = cy * m_cellSize + rand() % m_cellSize;
+            int px = cx * m_cellSize + rng.bounded(m_cellSize);
+            int py = cy * m_cellSize + rng.bounded(m_cellSize);
             px = qBound(0, px, w - 1);
             py = qBound(0, py, h - 1);
             cells.push_back({px, py, 0, 0, 0, 0, 0});

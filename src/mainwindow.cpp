@@ -688,16 +688,14 @@ void MainWindow::runPluginEffect(PluginEffect *effect) {
     for (const auto &p : effect->params())
         dlgParams.push_back({p.label, p.minValue, p.maxValue, p.defValue, p.suffix});
 
-    PreviewDialog dlg(effect->name(), layer->image(), dlgParams,
-        [effect](const QImage &src, const QVector<int> &v) {
-            effect->setValues(v);
-            return effect->apply(src);
-        }, this);
-    if (dlg.exec() != QDialog::Accepted) return;
-
-    effect->setValues(dlg.values());
-    applyImageOperationToTargetLayers(
-        [effect](const QImage &image) { return effect->apply(image); }, effect->name());
+    // Copy the wrapper to retain the library and isolate parameter snapshots.
+    const auto snapshot = std::make_shared<PluginEffect>(*effect);
+    PreviewDialog dlg(effect->name(), dlgParams, this);
+    runEffectDialog(dlg, [snapshot](const QImage &src, const QVector<int> &values) {
+        PluginEffect invocation(*snapshot);
+        invocation.setValues(values);
+        return invocation.apply(src);
+    }, effect->name());
 }
 
 void MainWindow::rebuildToolsPaletteTooltips() {
@@ -2858,6 +2856,32 @@ void MainWindow::selectTool(ToolType type) {
     }
 }
 
+void MainWindow::runEffectDialog(PreviewDialog &dialog,
+        const std::function<QImage(const QImage &, const QVector<int> &)> &renderer,
+        const QString &description) {
+    AdjustmentPreview preview(m_document, m_canvas, targetLayerIndices());
+    auto operation = [renderer](const QVector<int> &values) -> ImageOperation {
+        return [renderer, values](const QImage &image) { return renderer(image, values); };
+    };
+    connect(&dialog, &QDialog::rejected, &preview, &AdjustmentPreview::cancel);
+    connect(&dialog, &PreviewDialog::parametersChanged, &preview, [&]() {
+        preview.request(operation(dialog.values()));
+    });
+    preview.request(operation(dialog.values()));
+    if (dialog.exec() != QDialog::Accepted) { preview.cancel(); return; }
+    const auto finalOperation = operation(dialog.values());
+    preview.commit(finalOperation, description);
+    m_lastEffect = [this, finalOperation, description]() {
+        AdjustmentPreview repeat(m_document, m_canvas, targetLayerIndices());
+        repeat.commit(finalOperation, description);
+    };
+    m_lastEffectLabel = description;
+    if (m_repeatEffectAction) {
+        m_repeatEffectAction->setEnabled(true);
+        m_repeatEffectAction->setText(TR("Répéter : ") + description);
+    }
+}
+
 // ---- Effects ----
 
 void MainWindow::applyEffect(int effectIndex) {
@@ -2869,33 +2893,24 @@ void MainWindow::applyEffect(int effectIndex) {
     switch (effectIndex) {
     case 0: {
         BlurEffect def;
-        PreviewDialog dlg(TR("Flou gaussien"), layer->image(),
-            {{TR("Rayon"), 1, 100, def.radius(), ""}},
-            [](const QImage &src, const QVector<int> &v) { BlurEffect t; t.setRadius(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new BlurEffect; e->setRadius(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Flou gaussien"),
+            {{TR("Rayon"), 1, 100, def.radius(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { BlurEffect t; t.setRadius(v[0]); return t.apply(src); }, BlurEffect().name());
+        return;
     }
     case 1: {
         SharpenEffect def;
-        PreviewDialog dlg(TR("Netteté"), layer->image(),
-            {{TR("Quantité"), 1, 100, def.amount(), ""}},
-            [](const QImage &src, const QVector<int> &v) { SharpenEffect t; t.setAmount(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new SharpenEffect; e->setAmount(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Netteté"),
+            {{TR("Quantité"), 1, 100, def.amount(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { SharpenEffect t; t.setAmount(v[0]); return t.apply(src); }, SharpenEffect().name());
+        return;
     }
     case 2: {
         NoiseEffect def;
-        PreviewDialog dlg(TR("Ajouter du bruit"), layer->image(),
-            {{TR("Intensité"), 1, 100, def.intensity(), ""}},
-            [](const QImage &src, const QVector<int> &v) { NoiseEffect t; t.setIntensity(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new NoiseEffect; e->setIntensity(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Ajouter du bruit"),
+            {{TR("Intensité"), 1, 100, def.intensity(), ""}}, this);
+        runEffectDialog(dlg, [seed = def.seed()](const QImage &src, const QVector<int> &v) { NoiseEffect t; t.setSeed(seed); t.setIntensity(v[0]); return t.apply(src); }, NoiseEffect().name());
+        return;
     }
     case 3: {
         effect = std::make_unique<EmbossEffect>();
@@ -2907,33 +2922,24 @@ void MainWindow::applyEffect(int effectIndex) {
     }
     case 5: {
         OilPaintEffect def;
-        PreviewDialog dlg(TR("Peinture à l'huile"), layer->image(),
-            {{TR("Taille du pinceau"), 1, 10, def.radius(), ""}},
-            [](const QImage &src, const QVector<int> &v) { OilPaintEffect t; t.setRadius(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new OilPaintEffect; e->setRadius(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Peinture à l'huile"),
+            {{TR("Taille du pinceau"), 1, 10, def.radius(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { OilPaintEffect t; t.setRadius(v[0]); return t.apply(src); }, OilPaintEffect().name());
+        return;
     }
     case 6: {
         PixelateEffect def;
-        PreviewDialog dlg(TR("Pixéliser"), layer->image(),
-            {{TR("Taille de cellule"), 2, 100, def.cellSize(), ""}},
-            [](const QImage &src, const QVector<int> &v) { PixelateEffect t; t.setCellSize(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new PixelateEffect; e->setCellSize(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Pixéliser"),
+            {{TR("Taille de cellule"), 2, 100, def.cellSize(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { PixelateEffect t; t.setCellSize(v[0]); return t.apply(src); }, PixelateEffect().name());
+        return;
     }
     case 7: {
         MotionBlurEffect def;
-        PreviewDialog dlg(TR("Flou directionnel"), layer->image(),
-            {{TR("Distance"), 1, 100, def.distance(), ""}},
-            [](const QImage &src, const QVector<int> &v) { MotionBlurEffect t; t.setDistance(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new MotionBlurEffect; e->setDistance(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Flou directionnel"),
+            {{TR("Distance"), 1, 100, def.distance(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { MotionBlurEffect t; t.setDistance(v[0]); return t.apply(src); }, MotionBlurEffect().name());
+        return;
     }
     case 8: {
         // Ink Sketch - edge detection + invert for sketch look
@@ -2956,14 +2962,9 @@ void MainWindow::applyEffect(int effectIndex) {
             }
             return edges;
         };
-        PreviewDialog dlg(TR("Croquis à l'encre"), layer->image(),
-            {{TR("Contour encre"), 1, 100, 50, ""}},
-            [inkSketch](const QImage &src, const QVector<int> &v) { return inkSketch(src, v[0]); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        const int strength = dlg.values()[0];
-        applyImageOperationToTargetLayers([inkSketch, strength](const QImage &image) {
-            return inkSketch(image, strength);
-        }, "Ink Sketch");
+        PreviewDialog dlg(TR("Croquis à l'encre"),
+            {{TR("Contour encre"), 1, 100, 50, ""}}, this);
+        runEffectDialog(dlg, [inkSketch](const QImage &src, const QVector<int> &v) { return inkSketch(src, v[0]); }, QStringLiteral("Ink Sketch"));
         return;
     }
     case 9: {
@@ -3012,21 +3013,15 @@ void MainWindow::applyEffect(int effectIndex) {
             }
             return edges;
         };
-        PreviewDialog dlg(TR("Croquis au crayon"), layer->image(),
-            {{TR("Taille de mine"), 1, 20, 2, ""}},
-            [pencilSketch](const QImage &src, const QVector<int> &v) { return pencilSketch(src, v[0]); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        const int pencilSize = dlg.values()[0];
-        applyImageOperationToTargetLayers([pencilSketch, pencilSize](const QImage &image) {
-            return pencilSketch(image, pencilSize);
-        }, "Pencil Sketch");
+        PreviewDialog dlg(TR("Croquis au crayon"),
+            {{TR("Taille de mine"), 1, 20, 2, ""}}, this);
+        runEffectDialog(dlg, [pencilSketch](const QImage &src, const QVector<int> &v) { return pencilSketch(src, v[0]); }, QStringLiteral("Pencil Sketch"));
         return;
     }
     case 10: {
         // Clouds - Perlin-like noise render
         auto genClouds = [](int w, int h, int scale) {
             QImage img(w, h, QImage::Format_ARGB32);
-            srand(42);
             for (int y = 0; y < img.height(); ++y) {
                 QRgb *line = reinterpret_cast<QRgb*>(img.scanLine(y));
                 for (int x = 0; x < img.width(); ++x) {
@@ -3040,14 +3035,9 @@ void MainWindow::applyEffect(int effectIndex) {
             }
             return img;
         };
-        PreviewDialog dlg(TR("Nuages"), layer->image(),
-            {{TR("Échelle"), 10, 500, 100, ""}},
-            [genClouds](const QImage &src, const QVector<int> &v) { return genClouds(src.width(), src.height(), v[0]); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        QImage img = genClouds(m_document->width(), m_document->height(), dlg.values()[0]);
-        applyImageOperationToTargetLayers([img](const QImage &) {
-            return img;
-        }, "Clouds");
+        PreviewDialog dlg(TR("Nuages"),
+            {{TR("Échelle"), 10, 500, 100, ""}}, this);
+        runEffectDialog(dlg, [genClouds](const QImage &src, const QVector<int> &v) { return genClouds(src.width(), src.height(), v[0]); }, QStringLiteral("Clouds"));
         return;
     }
     case 11: {
@@ -3104,253 +3094,178 @@ void MainWindow::applyEffect(int effectIndex) {
     }
     case 13: {
         RadialBlurEffect def;
-        PreviewDialog dlg(TR("Flou radial"), layer->image(),
-            {{TR("Angle"), 1, 90, def.angle(), ""}},
-            [](const QImage &src, const QVector<int> &v) {
+        PreviewDialog dlg(TR("Flou radial"),
+            {{TR("Angle"), 1, 90, def.angle(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) {
                 RadialBlurEffect t; t.setAngle(v[0]);
                 t.setCenter(QPoint(src.width() / 2, src.height() / 2));
                 return t.apply(src);
-            }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new RadialBlurEffect; e->setAngle(dlg.values()[0]);
-        e->setCenter(QPoint(layer->image().width() / 2, layer->image().height() / 2));
-        effect.reset(e);
-        break;
+            }, RadialBlurEffect().name());
+        return;
     }
     case 14: {
         ZoomBlurEffect def;
-        PreviewDialog dlg(TR("Flou de zoom"), layer->image(),
-            {{TR("Quantité"), 1, 100, def.amount(), ""}},
-            [](const QImage &src, const QVector<int> &v) { ZoomBlurEffect t; t.setAmount(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new ZoomBlurEffect; e->setAmount(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Flou de zoom"),
+            {{TR("Quantité"), 1, 100, def.amount(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { ZoomBlurEffect t; t.setAmount(v[0]); return t.apply(src); }, ZoomBlurEffect().name());
+        return;
     }
     case 15: {
         SurfaceBlurEffect def;
-        PreviewDialog dlg(TR("Flou de surface"), layer->image(),
-            {{TR("Rayon"), 1, 20, def.radius(), ""}, {TR("Seuil"), 1, 100, def.threshold(), ""}},
-            [](const QImage &src, const QVector<int> &v) { SurfaceBlurEffect t; t.setRadius(v[0]); t.setThreshold(v[1]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new SurfaceBlurEffect; e->setRadius(dlg.values()[0]); e->setThreshold(dlg.values()[1]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Flou de surface"),
+            {{TR("Rayon"), 1, 20, def.radius(), ""}, {TR("Seuil"), 1, 100, def.threshold(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { SurfaceBlurEffect t; t.setRadius(v[0]); t.setThreshold(v[1]); return t.apply(src); }, SurfaceBlurEffect().name());
+        return;
     }
     case 16: {
         UnfocusEffect def;
-        PreviewDialog dlg(TR("Flou"), layer->image(),
-            {{TR("Rayon"), 1, 50, def.radius(), ""}},
-            [](const QImage &src, const QVector<int> &v) { UnfocusEffect t; t.setRadius(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new UnfocusEffect; e->setRadius(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Flou"),
+            {{TR("Rayon"), 1, 50, def.radius(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { UnfocusEffect t; t.setRadius(v[0]); return t.apply(src); }, UnfocusEffect().name());
+        return;
     }
     case 17: {
         FragmentEffect def;
-        PreviewDialog dlg(TR("Fragment"), layer->image(),
-            {{TR("Fragments"), 2, 16, def.fragments(), ""}, {TR("Distance"), 1, 50, def.distance(), ""}},
-            [](const QImage &src, const QVector<int> &v) { FragmentEffect t; t.setFragments(v[0]); t.setDistance(v[1]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new FragmentEffect; e->setFragments(dlg.values()[0]); e->setDistance(dlg.values()[1]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Fragment"),
+            {{TR("Fragments"), 2, 16, def.fragments(), ""}, {TR("Distance"), 1, 50, def.distance(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { FragmentEffect t; t.setFragments(v[0]); t.setDistance(v[1]); return t.apply(src); }, FragmentEffect().name());
+        return;
     }
     case 18: {
         BulgeEffect def;
-        PreviewDialog dlg(TR("Bombement"), layer->image(),
-            {{TR("Quantité"), -100, 100, def.amount(), ""}},
-            [](const QImage &src, const QVector<int> &v) { BulgeEffect t; t.setAmount(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new BulgeEffect; e->setAmount(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Bombement"),
+            {{TR("Quantité"), -100, 100, def.amount(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { BulgeEffect t; t.setAmount(v[0]); return t.apply(src); }, BulgeEffect().name());
+        return;
     }
     case 19: {
         FrostedGlassEffect def;
-        PreviewDialog dlg(TR("Verre givré"), layer->image(),
-            {{TR("Quantité"), 1, 20, def.amount(), ""}},
-            [](const QImage &src, const QVector<int> &v) { FrostedGlassEffect t; t.setAmount(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new FrostedGlassEffect; e->setAmount(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Verre givré"),
+            {{TR("Quantité"), 1, 20, def.amount(), ""}}, this);
+        runEffectDialog(dlg, [seed = def.seed()](const QImage &src, const QVector<int> &v) { FrostedGlassEffect t; t.setSeed(seed); t.setAmount(v[0]); return t.apply(src); }, FrostedGlassEffect().name());
+        return;
     }
     case 20: {
         CrystalizeEffect def;
-        PreviewDialog dlg(TR("Cristalliser"), layer->image(),
-            {{TR("Taille de cellule"), 2, 100, def.cellSize(), ""}},
-            [](const QImage &src, const QVector<int> &v) { CrystalizeEffect t; t.setCellSize(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new CrystalizeEffect; e->setCellSize(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Cristalliser"),
+            {{TR("Taille de cellule"), 2, 100, def.cellSize(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { CrystalizeEffect t; t.setCellSize(v[0]); return t.apply(src); }, CrystalizeEffect().name());
+        return;
     }
     case 21: {
         TileEffect def;
-        PreviewDialog dlg(TR("Réflexion en mosaïque"), layer->image(),
-            {{TR("Taille de tuile"), 2, 200, def.tileSize(), ""}, {TR("Rotation"), -180, 180, def.rotation(), ""}},
-            [](const QImage &src, const QVector<int> &v) { TileEffect t; t.setTileSize(v[0]); t.setRotation(v[1]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new TileEffect; e->setTileSize(dlg.values()[0]); e->setRotation(dlg.values()[1]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Réflexion en mosaïque"),
+            {{TR("Taille de tuile"), 2, 200, def.tileSize(), ""}, {TR("Rotation"), -180, 180, def.rotation(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { TileEffect t; t.setTileSize(v[0]); t.setRotation(v[1]); return t.apply(src); }, TileEffect().name());
+        return;
     }
     case 22: {
         DentsEffect def;
-        PreviewDialog dlg(TR("Bosselure"), layer->image(),
-            {{TR("Échelle"), 1, 200, def.scale(), ""}, {TR("Réfraction"), 1, 200, def.refraction(), ""}},
-            [](const QImage &src, const QVector<int> &v) { DentsEffect t; t.setScale(v[0]); t.setRefraction(v[1]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new DentsEffect; e->setScale(dlg.values()[0]); e->setRefraction(dlg.values()[1]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Bosselure"),
+            {{TR("Échelle"), 1, 200, def.scale(), ""}, {TR("Réfraction"), 1, 200, def.refraction(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { DentsEffect t; t.setScale(v[0]); t.setRefraction(v[1]); return t.apply(src); }, DentsEffect().name());
+        return;
     }
     case 23: {
         PolarInversionEffect def;
-        PreviewDialog dlg(TR("Inversion polaire"), layer->image(),
-            {{TR("Quantité"), 0, 100, def.amount(), ""}},
-            [](const QImage &src, const QVector<int> &v) { PolarInversionEffect t; t.setAmount(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new PolarInversionEffect; e->setAmount(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Inversion polaire"),
+            {{TR("Quantité"), 0, 100, def.amount(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { PolarInversionEffect t; t.setAmount(v[0]); return t.apply(src); }, PolarInversionEffect().name());
+        return;
     }
     case 24: {
         TwistEffect def;
-        PreviewDialog dlg(TR("Torsion"), layer->image(),
-            {{TR("Quantité"), -360, 360, def.amount(), ""}},
-            [](const QImage &src, const QVector<int> &v) { TwistEffect t; t.setAmount(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new TwistEffect; e->setAmount(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Torsion"),
+            {{TR("Quantité"), -360, 360, def.amount(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { TwistEffect t; t.setAmount(v[0]); return t.apply(src); }, TwistEffect().name());
+        return;
     }
     case 25: {
         MedianEffect def;
-        PreviewDialog dlg(TR("Médiane"), layer->image(),
-            {{TR("Rayon"), 1, 10, def.radius(), ""}},
-            [](const QImage &src, const QVector<int> &v) { MedianEffect t; t.setRadius(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new MedianEffect; e->setRadius(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Médiane"),
+            {{TR("Rayon"), 1, 10, def.radius(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { MedianEffect t; t.setRadius(v[0]); return t.apply(src); }, MedianEffect().name());
+        return;
     }
     case 26: {
         ReduceNoiseEffect def;
-        PreviewDialog dlg(TR("Réduire le bruit"), layer->image(),
-            {{TR("Rayon"), 1, 10, def.radius(), ""}, {TR("Force"), 1, 100, def.strength(), ""}},
-            [](const QImage &src, const QVector<int> &v) { ReduceNoiseEffect t; t.setRadius(v[0]); t.setStrength(v[1]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new ReduceNoiseEffect; e->setRadius(dlg.values()[0]); e->setStrength(dlg.values()[1]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Réduire le bruit"),
+            {{TR("Rayon"), 1, 10, def.radius(), ""}, {TR("Force"), 1, 100, def.strength(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { ReduceNoiseEffect t; t.setRadius(v[0]); t.setStrength(v[1]); return t.apply(src); }, ReduceNoiseEffect().name());
+        return;
     }
     case 27: {
         QuantizeEffect def;
-        PreviewDialog dlg(TR("Quantifier"), layer->image(),
-            {{TR("Couleurs"), 2, 256, def.colors(), ""}},
-            [](const QImage &src, const QVector<int> &v) { QuantizeEffect t; t.setColors(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new QuantizeEffect; e->setColors(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Quantifier"),
+            {{TR("Couleurs"), 2, 256, def.colors(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { QuantizeEffect t; t.setColors(v[0]); return t.apply(src); }, QuantizeEffect().name());
+        return;
     }
     case 28: {
         GlowEffect def;
-        PreviewDialog dlg(TR("Lueur"), layer->image(),
-            {{TR("Rayon"), 1, 20, def.radius(), ""}, {TR("Luminosité"), 0, 100, def.brightness(), ""}},
-            [](const QImage &src, const QVector<int> &v) { GlowEffect t; t.setRadius(v[0]); t.setBrightness(v[1]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new GlowEffect; e->setRadius(dlg.values()[0]); e->setBrightness(dlg.values()[1]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Lueur"),
+            {{TR("Rayon"), 1, 20, def.radius(), ""}, {TR("Luminosité"), 0, 100, def.brightness(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { GlowEffect t; t.setRadius(v[0]); t.setBrightness(v[1]); return t.apply(src); }, GlowEffect().name());
+        return;
     }
     case 29: {
         RedEyeRemoveEffect def;
-        PreviewDialog dlg(TR("Suppression yeux rouges"), layer->image(),
-            {{TR("Tolérance"), 0, 100, def.tolerance(), ""}, {TR("Saturation"), 0, 100, def.saturation(), ""}},
-            [](const QImage &src, const QVector<int> &v) { RedEyeRemoveEffect t; t.setTolerance(v[0]); t.setSaturation(v[1]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new RedEyeRemoveEffect; e->setTolerance(dlg.values()[0]); e->setSaturation(dlg.values()[1]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Suppression yeux rouges"),
+            {{TR("Tolérance"), 0, 100, def.tolerance(), ""}, {TR("Saturation"), 0, 100, def.saturation(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { RedEyeRemoveEffect t; t.setTolerance(v[0]); t.setSaturation(v[1]); return t.apply(src); }, RedEyeRemoveEffect().name());
+        return;
     }
     case 30: {
         SoftenPortraitEffect def;
-        PreviewDialog dlg(TR("Adoucir le portrait"), layer->image(),
-            {{TR("Douceur"), 1, 20, def.softness(), ""}, {TR("Chaleur"), 0, 100, def.warmth(), ""}},
-            [](const QImage &src, const QVector<int> &v) { SoftenPortraitEffect t; t.setSoftness(v[0]); t.setWarmth(v[1]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new SoftenPortraitEffect; e->setSoftness(dlg.values()[0]); e->setWarmth(dlg.values()[1]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Adoucir le portrait"),
+            {{TR("Douceur"), 1, 20, def.softness(), ""}, {TR("Chaleur"), 0, 100, def.warmth(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { SoftenPortraitEffect t; t.setSoftness(v[0]); t.setWarmth(v[1]); return t.apply(src); }, SoftenPortraitEffect().name());
+        return;
     }
     case 31: {
         VignetteEffect def;
-        PreviewDialog dlg(TR("Vignette"), layer->image(),
-            {{TR("Quantité"), 0, 100, def.amount(), ""}, {TR("Rayon"), 0, 100, def.radius(), ""}},
-            [](const QImage &src, const QVector<int> &v) { VignetteEffect t; t.setAmount(v[0]); t.setRadius(v[1]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new VignetteEffect; e->setAmount(dlg.values()[0]); e->setRadius(dlg.values()[1]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Vignette"),
+            {{TR("Quantité"), 0, 100, def.amount(), ""}, {TR("Rayon"), 0, 100, def.radius(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { VignetteEffect t; t.setAmount(v[0]); t.setRadius(v[1]); return t.apply(src); }, VignetteEffect().name());
+        return;
     }
     case 32: {
         TurbulenceEffect def;
-        PreviewDialog dlg(TR("Turbulence"), layer->image(),
-            {{TR("Échelle"), 10, 500, def.scale(), ""}, {TR("Rugosité"), 1, 100, def.roughness(), ""}},
-            [](const QImage &src, const QVector<int> &v) { TurbulenceEffect t; t.setScale(v[0]); t.setRoughness(v[1]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new TurbulenceEffect; e->setScale(dlg.values()[0]); e->setRoughness(dlg.values()[1]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Turbulence"),
+            {{TR("Échelle"), 10, 500, def.scale(), ""}, {TR("Rugosité"), 1, 100, def.roughness(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { TurbulenceEffect t; t.setScale(v[0]); t.setRoughness(v[1]); return t.apply(src); }, TurbulenceEffect().name());
+        return;
     }
     case 33: {
         ReliefEffect def;
-        PreviewDialog dlg(TR("Relief"), layer->image(),
-            {{TR("Angle"), 0, 360, def.angle(), ""}},
-            [](const QImage &src, const QVector<int> &v) { ReliefEffect t; t.setAngle(v[0]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new ReliefEffect; e->setAngle(dlg.values()[0]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Relief"),
+            {{TR("Angle"), 0, 360, def.angle(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { ReliefEffect t; t.setAngle(v[0]); return t.apply(src); }, ReliefEffect().name());
+        return;
     }
     case 34: {
         OutlineEffect def;
-        PreviewDialog dlg(TR("Contour"), layer->image(),
-            {{TR("Épaisseur"), 1, 10, def.thickness(), ""}, {TR("Intensité"), 1, 100, def.intensity(), ""}},
-            [](const QImage &src, const QVector<int> &v) { OutlineEffect t; t.setThickness(v[0]); t.setIntensity(v[1]); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new OutlineEffect; e->setThickness(dlg.values()[0]); e->setIntensity(dlg.values()[1]);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Contour"),
+            {{TR("Épaisseur"), 1, 10, def.thickness(), ""}, {TR("Intensité"), 1, 100, def.intensity(), ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { OutlineEffect t; t.setThickness(v[0]); t.setIntensity(v[1]); return t.apply(src); }, OutlineEffect().name());
+        return;
     }
     case 35: {
         MorphologyEffect def;
-        PreviewDialog dlg(TR("Morphologie"), layer->image(),
-            {{TR("Rayon"), 1, 10, def.radius(), ""}, {TR("Mode (0=Dilater, 1=Éroder)"), 0, 1, 0, ""}},
-            [](const QImage &src, const QVector<int> &v) { MorphologyEffect t; t.setRadius(v[0]); t.setDilate(v[1] == 0); return t.apply(src); }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new MorphologyEffect; e->setRadius(dlg.values()[0]); e->setDilate(dlg.values()[1] == 0);
-        effect.reset(e);
-        break;
+        PreviewDialog dlg(TR("Morphologie"),
+            {{TR("Rayon"), 1, 10, def.radius(), ""}, {TR("Mode (0=Dilater, 1=Éroder)"), 0, 1, 0, ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) { MorphologyEffect t; t.setRadius(v[0]); t.setDilate(v[1] == 0); return t.apply(src); }, MorphologyEffect().name());
+        return;
     }
     case 36: {   // Drop Shadow
-        PreviewDialog dlg(TR("Ombre portée"), layer->image(),
+        PreviewDialog dlg(TR("Ombre portée"),
             {{TR("Rayon"), 0, 50, 8, ""}, {TR("Décalage X"), -100, 100, 6, ""},
-             {TR("Décalage Y"), -100, 100, 6, ""}, {TR("Opacité"), 0, 100, 70, ""}},
-            [](const QImage &src, const QVector<int> &v) {
+             {TR("Décalage Y"), -100, 100, 6, ""}, {TR("Opacité"), 0, 100, 70, ""}}, this);
+        runEffectDialog(dlg, [](const QImage &src, const QVector<int> &v) {
                 DropShadowEffect t; t.setRadius(v[0]); t.setOffsetX(v[1]); t.setOffsetY(v[2]); t.setOpacity(v[3]);
                 return t.apply(src);
-            }, this);
-        if (dlg.exec() != QDialog::Accepted) return;
-        auto *e = new DropShadowEffect;
-        e->setRadius(dlg.values()[0]); e->setOffsetX(dlg.values()[1]);
-        e->setOffsetY(dlg.values()[2]); e->setOpacity(dlg.values()[3]);
-        effect.reset(e);
-        break;
+            }, DropShadowEffect().name());
+        return;
     }
     default: return;
     }

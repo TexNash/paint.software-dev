@@ -3,6 +3,7 @@
 
 #include <QImage>
 #include <QLibrary>
+#include <mutex>
 
 PluginEffect::PluginEffect(const PswEffect &desc, std::shared_ptr<QLibrary> library)
     : m_process(desc.process), m_userData(desc.userData), m_library(std::move(library)) {
@@ -46,6 +47,10 @@ QImage PluginEffect::apply(const QImage &input) {
     if (values.size() != static_cast<int>(m_params.size()))
         values = defaultValues();
 
+    // The ABI does not promise reentrancy, even across effects from one library.
+    // Copies retain the library and own their values; serialise opaque plugin state.
+    static std::mutex processMutex;
+    std::lock_guard<std::mutex> lock(processMutex);
     m_process(img.bits(), img.width(), img.height(),
               values.constData(), values.size(), m_userData);
     return img;

@@ -18,6 +18,7 @@
 #include <vector>
 #include "tools/tool.h"
 
+class PreviewDialog;
 class QMenu;
 class Document;
 class CanvasWidget;
@@ -136,6 +137,9 @@ private:
     void createStatusBar();
     void createTools();
     void createKeyboardShortcuts();
+    void runEffectDialog(PreviewDialog &dialog,
+        const std::function<QImage(const QImage &, const QVector<int> &)> &renderer,
+        const QString &description);
     void applyImageOperation(const QImage &result, const QString &description);
     void applyImageOperationToTargetLayers(const std::function<QImage(const QImage &)> &operation, const QString &description);
     void applySelectionFilterToTargetLayers(const std::function<QImage(const QImage &)> &operation, const QString &description);

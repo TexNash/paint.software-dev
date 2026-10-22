@@ -21,6 +21,8 @@
 #include <QMouseEvent>
 #include <QPushButton>
 #include "mainwindow.h"
+#include "plugins/plugineffect.h"
+#include "effects/blureffect.h"
 #include <QTemporaryDir>
 #include <QDir>
 #include <QFile>
@@ -75,17 +77,98 @@ int main(int argc, char **argv) {
             check(QMetaObject::invokeMethod(&window, "applyAdjustment", Qt::DirectConnection, Q_ARG(int, index)),
                   "Open adjustment for layout regression");
         }
-        QTimer::singleShot(0, &window, [&window]() {
-            auto *dialog = window.findChild<PreviewDialog *>();
-            check(dialog, "Gaussian Blur dialog opens");
-            bool imageFound = false;
-            for (auto *label : dialog->findChildren<QLabel *>())
-                imageFound |= !label->pixmap().isNull();
-            check(imageFound, "Effects retain embedded image previews");
-            dialog->reject();
-        });
-        check(QMetaObject::invokeMethod(&window, "applyEffect", Qt::DirectConnection, Q_ARG(int, 0)),
-              "Open representative effect");
+        for (int index = 0; index <= 36; ++index) {
+            if (index == 3 || index == 4 || index == 11 || index == 12) continue;
+            QTimer::singleShot(0, &window, [&window]() {
+                auto *dialog = window.findChild<PreviewDialog *>();
+                check(dialog, "Effect parameter dialog opens");
+                check(dialog->findChildren<QLabel *>().size() == dialog->values().size(),
+                      "Effect has parameter labels only, no embedded image");
+                check(dialog->sizeHint().height() < 220, "Effect layout excludes thumbnail space");
+                dialog->reject();
+            });
+            check(QMetaObject::invokeMethod(&window, "applyEffect", Qt::DirectConnection, Q_ARG(int, index)),
+                  "Open every parameterised built-in effect");
+        }
+
+    }
+    for (int index : {-1, 0, 2, 10, 19, 20, 36}) {
+        MainWindow window;
+        auto *view = window.findChild<CanvasWidget *>();
+        check(view && view->document(), "Effect canvas available");
+        auto *document = view->document();
+        document->resize(12,12);
+        QImage source = sample({12,12});
+        source.setPixelColor(5,5, QColor(240,20,60,200));
+        document->layerAt(0)->setImage(source);
+        document->history().clear(); document->setModified(false);
+        view->resize(200,200); view->show(); view->setShowRulers(false);
+        view->setZoom(10); view->setPan({20,20});
+        QApplication::processEvents();
+        const auto baseline = view->grab().toImage();
+        QImage previewFrame;
+        PswParam param{"Amount",0,100,100,"%"};
+        PswEffect descriptor{"Preview test plugin","Test",1,&param,
+            [](unsigned char *rgba,int w,int h,const int *values,int,void *) {
+                for (int i=0;i<w*h;++i) rgba[4*i] = (rgba[4*i]*(100-values[0])+(255-rgba[4*i])*values[0])/100;
+            },nullptr};
+        PluginEffect plugin(descriptor,{});
+        auto invoke = [&]() {
+            return index < 0
+                ? QMetaObject::invokeMethod(&window,"runPluginEffect",Qt::DirectConnection,Q_ARG(PluginEffect *, &plugin))
+                : QMetaObject::invokeMethod(&window,"applyEffect",Qt::DirectConnection,Q_ARG(int,index));
+        };
+        auto edit = [&](bool accept) {
+            QTimer::singleShot(0, &window, [&]() {
+                auto *dialog = window.findChild<PreviewDialog *>();
+                check(dialog, "Effect opens for canvas regression");
+                check(until([&] { return view->grab().toImage() != baseline; }),
+                      "Default effect parameters preview on canvas");
+                check(document->layerAt(0)->image() == source && document->history().currentIndex() == 0,
+                      "Effect preview leaves source and history unchanged");
+                auto *spin = dialog->findChild<QSpinBox *>();
+                const int initial = spin->value();
+                spin->setValue(initial == spin->maximum() ? initial-1 : initial+1);
+                dialog->findChild<QDialogButtonBox *>()->button(QDialogButtonBox::Reset)->click();
+                check(spin->value() == initial, "Effect Reset restores defaults");
+                // Let the final request finish before checking preview/commit equality.
+                QElapsedTimer settle; settle.start();
+                while (settle.elapsed() < 100) { QApplication::processEvents(); QThread::msleep(1); }
+                previewFrame = view->grab().toImage();
+                if (accept) dialog->accept(); else dialog->reject();
+            });
+            check(invoke(), "Invoke effect canvas regression");
+        };
+        edit(false);
+        check(document->layerAt(0)->image() == source && !document->isModified() &&
+              document->history().currentIndex() == 0, "Effect Cancel preserves document state");
+        edit(true);
+        check(document->history().currentIndex() == 1, "Effect OK creates one undo entry");
+        check(view->grab().toImage() == previewFrame, "Effect accepted result matches canvas preview");
+        const auto result = document->layerAt(0)->image();
+        document->history().undo();
+        check(document->layerAt(0)->image() == source, "Effect undo restores source");
+        document->history().redo();
+        check(document->layerAt(0)->image() == result, "Effect redo restores result");
+        if (index == 0) {
+            document->history().undo(); document->history().clear();
+            QTimer::singleShot(0,&window,[&]() {
+                auto *dialog = window.findChild<PreviewDialog *>();
+                dialog->findChild<QSpinBox *>()->setValue(7);
+                dialog->accept();
+            });
+            check(invoke(), "Effect accepts immediately after parameter change");
+            BlurEffect blur; blur.setRadius(7);
+            const auto expected = blur.apply(source).convertToFormat(source.format());
+            check(document->layerAt(0)->image() == expected, "Immediate OK uses final parameters");
+            document->history().undo();
+            bool repeated = false;
+            for (auto *action : window.findChildren<QAction *>()) {
+                if (action->shortcut() == QKeySequence("Ctrl+F")) { action->trigger(); repeated = true; break; }
+            }
+            check(repeated && document->layerAt(0)->image() == expected,
+                  "Repeat uses accepted effect parameters without a dialog");
+        }
     }
     Document doc(8,8);
     doc.layerAt(0)->setImage(sample());

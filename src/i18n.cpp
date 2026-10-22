@@ -266,6 +266,7 @@ const QHash<QString, QString> &table() {
         {"Calques", "Layers"},
         {"Couleurs", "Colors"},
         {"Paramètres", "Settings"},
+        {"Paramètres...", "Settings..."},
         {"Aide", "Help"},
         {"À &propos de paint.software", "&About paint.software"},
         {"À propos de paint.software", "About paint.software"},

@@ -2,6 +2,9 @@
 // Exercises the real code paths: tools, effects, adjustments, layers,
 // selection, undo/redo, save/load, i18n and theming.
 #include <QApplication>
+#include <QToolButton>
+#include <QEnterEvent>
+#include "panels/imagelistbar.h"
 #include "core/floatingrendercache.h"
 #include "dialogs/previewdialog.h"
 #include <QDialogButtonBox>
@@ -1098,6 +1101,44 @@ static void retainedMergeRegression() {
 // =====================================================================
 int main(int argc, char **argv) {
     QApplication app(argc, argv);
+    {
+        Document first(8, 8), second(8, 8);
+        ImageListBar bar;
+        bar.setDocuments({&first, &second}, 0);
+        bar.show();
+        QApplication::processEvents();
+        int selected = -1, closed = -1, selections = 0, closures = 0;
+        QObject::connect(&bar, &ImageListBar::imageSelected, [&](int i) { selected = i; ++selections; });
+        QObject::connect(&bar, &ImageListBar::imageCloseRequested, [&](int i) { closed = i; ++closures; });
+        const auto buttons = bar.findChildren<QToolButton *>(QString(), Qt::FindDirectChildrenOnly);
+        CHECK(buttons.size() == 2, "One thumbnail per document");
+        auto *tab = buttons[1];
+        auto *close = tab->findChild<QToolButton *>("imageCloseButton");
+        QEnterEvent enter(QPointF(4,4), QPointF(4,4), QPointF(4,4));
+        QApplication::sendEvent(tab, &enter);
+        CHECK(close && !close->isHidden(), "Hover reveals thumbnail close control");
+        QMouseEvent leftPress(QEvent::MouseButtonPress, QPointF(8,8), QPointF(8,8), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+        QMouseEvent leftRelease(QEvent::MouseButtonRelease, QPointF(8,8), QPointF(8,8), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+        QApplication::sendEvent(close, &leftPress);
+        QApplication::sendEvent(close, &leftRelease);
+        CHECK(closed == 1 && closures == 1 && selections == 0, "Close targets inactive thumbnail without selecting it");
+        tab->click();
+        CHECK(selected == 1 && selections == 1, "Thumbnail body still selects document");
+        for (auto *target : {tab, close}) {
+            QMouseEvent press(QEvent::MouseButtonPress, QPointF(4,4), QPointF(4,4), Qt::MiddleButton, Qt::MiddleButton, Qt::NoModifier);
+            QMouseEvent release(QEvent::MouseButtonRelease, QPointF(4,4), QPointF(4,4), Qt::MiddleButton, Qt::NoButton, Qt::NoModifier);
+            QApplication::sendEvent(target, &press);
+            QApplication::sendEvent(target, &release);
+        }
+        CHECK(closures == 3 && selections == 1, "Middle click closes both thumbnail and close-control areas once");
+        QEvent leave(QEvent::Leave);
+        QApplication::sendEvent(tab, &leave);
+        CHECK(close->isHidden(), "Close control hides when pointer leaves thumbnail");
+        bar.setDocuments({&second}, 0);
+        auto *remaining = bar.findChildren<QToolButton *>(QString(), Qt::FindDirectChildrenOnly).last();
+        remaining->findChild<QToolButton *>("imageCloseButton")->click();
+        CHECK(closed == 0 && closures == 4, "Rebuilt thumbnail uses updated document index");
+    }
     {
         const QVector<PreviewDialog::Param> params = {{"Amount", -100, 100, 0, "%"}};
         PreviewDialog controls("Parameters", params);

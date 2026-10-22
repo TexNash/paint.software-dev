@@ -214,11 +214,7 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
         if (m_redoToolbarAction) m_redoToolbarAction->setEnabled(canRedo);
     });
 
-    // Image list (thumbnail tabs) wiring
-    if (m_imageListBar) {
-        connect(m_imageListBar, &ImageListBar::imageSelected, this, &MainWindow::setActiveDocument);
-        connect(m_imageListBar, &ImageListBar::imageCloseRequested, this, &MainWindow::closeDocument);
-    }
+    // Thumbnail signals are connected when populateFixedToolbar creates the strip.
     updateImageList();
 
     // Select brush tool by default
@@ -459,6 +455,8 @@ void MainWindow::createMenus() {
     modifySelMenu->addAction(TR("&Agrandir..."), this, &MainWindow::growSelection);
     modifySelMenu->addAction(TR("&Rétrécir..."), this, &MainWindow::shrinkSelection);
     modifySelMenu->addAction(TR("A&doucir les bords..."), this, &MainWindow::featherSelection);
+    editMenu->addSeparator();
+    editMenu->addAction(ToolIcons::settings(), TR("Paramètres..."), this, &MainWindow::showSettingsDialog);
     setShortcuts(cutAction, {QKeySequence::Cut, QKeySequence("Shift+Delete")});
     setShortcuts(copyAction, {QKeySequence::Copy, QKeySequence("Ctrl+Insert")});
     setShortcuts(pasteAction, {QKeySequence::Paste, QKeySequence("Shift+Insert")});

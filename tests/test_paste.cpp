@@ -1,4 +1,9 @@
 #include <QApplication>
+#include <QMessageBox>
+#include <QFileDialog>
+#include <QMenuBar>
+#include <QMenu>
+#include <QLayout>
 #include "core/floatingrendercache.h"
 #include "panels/imagelistbar.h"
 #include "panels/layerspanel.h"
@@ -1446,6 +1451,103 @@ static void benchmarkStage4A(FloatingPixelSession::Sampling sampling=FloatingPix
     }
 }
 
+static void thumbnailCloseWorkflow() {
+    QTemporaryDir dir;
+    const QString path = dir.path() + "/close.png";
+    CHECK(fixture().save(path));
+    MainWindow window;
+    auto *canvas = window.findChild<CanvasWidget *>();
+    const QString firstPath = dir.path() + "/first.png";
+    CHECK(fixture().save(firstPath));
+    window.openFile(firstPath);
+    auto *first = canvas->document();
+    window.openFile(path);
+    auto *loaded = canvas->document();
+    auto *bar = window.findChild<ImageListBar *>();
+    auto closeAt = [&](int index) {
+        const auto tabs = bar->findChildren<QToolButton *>(QString(), Qt::FindDirectChildrenOnly);
+        // Old buttons are deleted later after a document-list rebuild.
+        for (auto *tab : tabs) {
+            if (tab->property("imageIndex").toInt() == index && bar->layout()->indexOf(tab) >= 0) {
+                tab->findChild<QToolButton *>("imageCloseButton")->click();
+                return;
+            }
+        }
+        CHECK(false);
+    };
+    auto answer = [&](QMessageBox::StandardButton choice) {
+        QTimer::singleShot(0, [&, choice]() {
+            auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+            CHECK(box != nullptr);
+            if (box) box->button(choice)->click();
+        });
+    };
+    loaded->setModified(true);
+    qobject_cast<QToolButton *>(bar->layout()->itemAt(0)->widget())->click();
+    CHECK(canvas->document() == first);
+    answer(QMessageBox::Cancel);
+    closeAt(1);
+    CHECK(canvas->document() == loaded && loaded->isModified());
+    // A failed write must leave the modified document open.
+    CHECK(QFile::remove(path));
+    CHECK(QDir().mkdir(path));
+    QTimer::singleShot(0, [&]() {
+        auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+        CHECK(box != nullptr);
+        QTimer::singleShot(0, [&]() {
+            auto *warning = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+            CHECK(warning != nullptr);
+            if (warning) warning->accept();
+        });
+        if (box) box->button(QMessageBox::Save)->click();
+    });
+    closeAt(1);
+    CHECK(canvas->document() == loaded && loaded->isModified());
+    CHECK(QDir().rmdir(path));
+    answer(QMessageBox::Save);
+    closeAt(1);
+    CHECK(canvas->document() == first);
+    window.openFile(path);
+    loaded = canvas->document();
+    loaded->setModified(true);
+    answer(QMessageBox::Discard);
+    closeAt(1);
+    CHECK(canvas->document() == first);
+    closeAt(0);
+    first = canvas->document();
+    first->setModified(true);
+    QTimer::singleShot(0, [&]() {
+        auto *box = qobject_cast<QMessageBox *>(QApplication::activeModalWidget());
+        CHECK(box != nullptr);
+        QTimer::singleShot(0, [&]() {
+            auto *dialog = qobject_cast<QFileDialog *>(QApplication::activeModalWidget());
+            CHECK(dialog != nullptr);
+            if (dialog) dialog->reject();
+        });
+        if (box) box->button(QMessageBox::Save)->click();
+    });
+    closeAt(0);
+    CHECK(canvas->document() == first && first->isModified());
+    first->setModified(false);
+    closeAt(0);
+    CHECK(canvas->document() && canvas->document()->size() == QSize(800, 600));
+    QMenu *edit = nullptr;
+    for (auto *action : window.menuBar()->actions())
+        if (action->text().remove('&') == "Edit") edit = action->menu();
+    CHECK(edit != nullptr);
+    if (edit) {
+        const auto actions = edit->actions();
+        CHECK(actions.last()->text() == "Settings...");
+        CHECK(actions[actions.size() - 2]->isSeparator());
+        QTimer::singleShot(0, [&]() {
+            auto *dialog = qobject_cast<SettingsDialog *>(QApplication::activeModalWidget());
+            CHECK(dialog != nullptr);
+            if (dialog) dialog->reject();
+        });
+        actions.last()->trigger();
+    }
+}
+
 int main(int argc, char **argv) {
     // Real MainWindow integration must never read/write a developer's UI state
     // or autosave recovery files, including when this executable is run alone.
@@ -1466,6 +1568,7 @@ int main(int argc, char **argv) {
         for (auto mode:{FloatingPixelSession::Sampling::Nearest,FloatingPixelSession::Sampling::Bilinear,FloatingPixelSession::Sampling::Bicubic}) benchmarkStage4A(mode);
         return failures ? 1 : 0;
     }
+    thumbnailCloseWorkflow();
     pasteDialogStyles();
     utilityPanelPreferences();
     paths();

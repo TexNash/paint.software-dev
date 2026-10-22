@@ -8,10 +8,41 @@
 #include <QFileInfo>
 #include <QMouseEvent>
 #include <QEvent>
+#include <QEnterEvent>
 
 namespace {
 constexpr int kThumb = 38;   // thumbnail button size
 constexpr int kImage = 30;   // rendered image size inside it
+
+class ImageThumbnailButton : public QToolButton {
+public:
+    explicit ImageThumbnailButton(QWidget *parent) : QToolButton(parent) {
+        closeButton = new QToolButton(this);
+        closeButton->setObjectName("imageCloseButton");
+        closeButton->setText(QString::fromUtf8("×"));
+        closeButton->setGeometry(kThumb - 17, 1, 16, 16);
+        closeButton->setToolTip(TR("Fermer"));
+        closeButton->setAccessibleName(TR("Fermer"));
+        closeButton->setStyleSheet(
+            "QToolButton { color: white; background: #555; border: 1px solid white;"
+            " border-radius: 2px; padding: 0; font-size: 14px; }"
+            "QToolButton:hover { background: #c42b1c; }"
+            "QToolButton:pressed { background: #8f1f14; }");
+        closeButton->hide();
+    }
+
+    QToolButton *closeButton;
+
+protected:
+    void enterEvent(QEnterEvent *event) override {
+        closeButton->show();
+        QToolButton::enterEvent(event);
+    }
+    void leaveEvent(QEvent *event) override {
+        closeButton->hide();
+        QToolButton::leaveEvent(event);
+    }
+};
 }
 
 ImageListBar::ImageListBar(QWidget *parent) : QWidget(parent) {
@@ -41,7 +72,7 @@ void ImageListBar::rebuild() {
         Document *doc = m_docs[i];
         if (!doc) continue;
 
-        auto *btn = new QToolButton(this);
+        auto *btn = new ImageThumbnailButton(this);
         btn->setFixedSize(kThumb, kThumb);
         btn->setCheckable(true);
         btn->setChecked(i == m_active);
@@ -52,6 +83,9 @@ void ImageListBar::rebuild() {
         connect(btn, &QToolButton::clicked, this, [this, i]() { emit imageSelected(i); });
         btn->setProperty("imageIndex", i);
         btn->installEventFilter(this);   // middle-click closes the image
+        btn->closeButton->setProperty("imageIndex", i);
+        btn->closeButton->installEventFilter(this);
+        connect(btn->closeButton, &QToolButton::clicked, this, [this, i]() { emit imageCloseRequested(i); });
         m_layout->addWidget(btn);
     }
 }
@@ -85,6 +119,9 @@ void ImageListBar::updateButton(QToolButton *button, Document *document, int ind
 }
 
 bool ImageListBar::eventFilter(QObject *obj, QEvent *event) {
+    if (event->type() == QEvent::MouseButtonPress
+        && static_cast<QMouseEvent *>(event)->button() == Qt::MiddleButton)
+        return true;
     if (event->type() == QEvent::MouseButtonRelease) {
         auto *me = static_cast<QMouseEvent*>(event);
         if (me->button() == Qt::MiddleButton) {

@@ -262,6 +262,9 @@ MainWindow::MainWindow(QWidget *parent) : QMainWindow(parent) {
 }
 
 MainWindow::~MainWindow() {
+    // Detach while tools and documents still exist, before QWidget destroys children.
+    m_canvas->setCurrentTool(nullptr);
+    m_canvas->setDocument(nullptr);
 }
 
 void MainWindow::loadUiState() {
@@ -2218,27 +2221,33 @@ void MainWindow::fillSelection() {
 }
 
 void MainWindow::selectAll() {
+    m_canvas->cancelSelectionDrag();
     if (!m_document->finishFloatingPixels(false)) return;
+    const Selection before = m_document->selection();
     m_document->selection().selectAll();
-    emit m_document->selectionChanged();
+    m_document->recordSelectionChange(before, "Select All");
     m_canvas->update();
 }
 
 void MainWindow::deselectAll() {
+    m_canvas->cancelSelectionDrag();
     if (m_document->floatingPixelSession()) {
         if (m_currentTool) m_currentTool->deactivate(*m_canvas);
         m_document->finishFloatingPixels();
         return;
     }
+    const Selection before = m_document->selection();
     m_document->selection().clear();
-    emit m_document->selectionChanged();
+    m_document->recordSelectionChange(before, "Deselect");
     m_canvas->update();
 }
 
 void MainWindow::invertSelection() {
+    m_canvas->cancelSelectionDrag();
     if (!m_document->finishFloatingPixels(false)) return;
+    const Selection before = m_document->selection();
     m_document->selection().invert();
-    emit m_document->selectionChanged();
+    m_document->recordSelectionChange(before, "Invert Selection");
     m_canvas->update();
 }
 
@@ -2366,38 +2375,44 @@ void MainWindow::showRotateZoomLayerDialog() {
 }
 
 void MainWindow::growSelection() {
+    m_canvas->cancelSelectionDrag();
     if (!m_document || !m_document->selection().hasSelection()) return;
     bool ok = false;
     const int px = QInputDialog::getInt(this, TR("Agrandir la sélection"),
                                         TR("Agrandir de (pixels) :"), 1, 1, 500, 1, &ok);
     if (!ok) return;
     if (!m_document->finishFloatingPixels(false)) return;
+    const Selection before = m_document->selection();
     m_document->selection().expand(px);
-    emit m_document->selectionChanged();
+    m_document->recordSelectionChange(before, "Grow Selection");
     m_canvas->update();
 }
 
 void MainWindow::shrinkSelection() {
+    m_canvas->cancelSelectionDrag();
     if (!m_document || !m_document->selection().hasSelection()) return;
     bool ok = false;
     const int px = QInputDialog::getInt(this, TR("Rétrécir la sélection"),
                                         TR("Rétrécir de (pixels) :"), 1, 1, 500, 1, &ok);
     if (!ok) return;
     if (!m_document->finishFloatingPixels(false)) return;
+    const Selection before = m_document->selection();
     m_document->selection().contract(px);
-    emit m_document->selectionChanged();
+    m_document->recordSelectionChange(before, "Shrink Selection");
     m_canvas->update();
 }
 
 void MainWindow::featherSelection() {
+    m_canvas->cancelSelectionDrag();
     if (!m_document || !m_document->selection().hasSelection()) return;
     bool ok = false;
     const int px = QInputDialog::getInt(this, TR("Adoucir la sélection"),
                                         TR("Rayon d'adoucissement (pixels) :"), 2, 1, 200, 1, &ok);
     if (!ok) return;
     if (!m_document->finishFloatingPixels(false)) return;
+    const Selection before = m_document->selection();
     m_document->selection().feather(px);
-    emit m_document->selectionChanged();
+    m_document->recordSelectionChange(before, "Feather Selection");
     m_canvas->update();
 }
 

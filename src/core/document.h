@@ -19,6 +19,9 @@ public:
     explicit Document(int width = 800, int height = 600, QObject *parent = nullptr);
     explicit Document(const QString &filePath, QObject *parent = nullptr);
 
+    // Record a completed selection-only edit; unchanged masks create no entry.
+    void recordSelectionChange(const Selection &before, const QString &description);
+
     // Size
     int width() const { return m_width; }
     int height() const { return m_height; }

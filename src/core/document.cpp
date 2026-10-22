@@ -1544,3 +1544,9 @@ void Document::swapColors() {
     emit primaryColorChanged(m_primaryColor);
     emit secondaryColorChanged(m_secondaryColor);
 }
+
+void Document::recordSelectionChange(const Selection &before, const QString &description) {
+    if (before.hasSelection() == m_selection.hasSelection() && before.mask() == m_selection.mask()) return;
+    m_history.push(std::make_unique<SelectionChangeCommand>(this, before, m_selection, description));
+    emit selectionChanged();
+}

@@ -1007,9 +1007,12 @@ static void floatingPlacementAndSoftClipboard() {
     Document reopened;
     CHECK(reopened.loadNative(dir.filePath("soft.psw")) && reopened.flatten() == appearance);
     CHECK(reopened.floatingPixelSession()->sourceCoverage() == coverage.copy(selected));
+    const QImage beforeSelectAll = other->selection().mask();
     invoke(target, "selectAll");
     CHECK(!other->floatingPixelSession());
     invoke(target, "undo");
+    CHECK(!other->floatingPixelSession() && other->selection().mask() == beforeSelectAll);
+    invoke(target, "undo"); // Finish precedes the separate Select All history entry.
     CHECK(other->floatingPixelSession() && other->flatten() == appearance);
     CHECK(QMetaObject::invokeMethod(&target, "selectTool", Qt::DirectConnection,
                                    Q_ARG(ToolType, ToolType::MoveSelection)));
@@ -1548,6 +1551,68 @@ static void thumbnailCloseWorkflow() {
     }
 }
 
+static void selectionHistoryWorkflow() {
+    MainWindow window;
+    auto *canvas = window.findChild<CanvasWidget *>();
+    auto *doc = canvas->document();
+    invoke(window, "selectAll");
+    CHECK(doc->selection().hasSelection());
+    CHECK(doc->history().currentIndex() == 1);
+    const QImage selected = doc->selection().mask();
+    auto triggerShortcut = [&](const QKeySequence &sequence) {
+        for (auto *action : window.findChildren<QAction *>()) {
+            if (action->shortcuts().contains(sequence)) {
+                action->trigger();
+                return;
+            }
+        }
+        CHECK(false);
+    };
+    triggerShortcut(QKeySequence("Ctrl+D"));
+    CHECK(!doc->selection().hasSelection());
+    CHECK(doc->history().currentIndex() == 2);
+    doc->history().undo();
+    CHECK(doc->selection().mask() == selected);
+    doc->history().redo();
+    CHECK(!doc->selection().hasSelection());
+    doc->history().undo();
+    triggerShortcut(QKeySequence("Return"));
+    CHECK(!doc->selection().hasSelection());
+    CHECK(doc->history().currentIndex() == 2);
+    doc->history().undo();
+    CHECK(doc->selection().mask() == selected);
+    invoke(window, "invertSelection");
+    CHECK(!doc->selection().hasSelection());
+    doc->history().goToIndex(0);
+    CHECK(!doc->selection().hasSelection());
+    doc->history().goToIndex(1);
+    CHECK(doc->selection().mask() == selected);
+    // Selection history must interleave correctly with actual image edits.
+    doc->activeLayer()->image().fill(Qt::blue);
+    const QImage beforePixels = doc->activeLayer()->image();
+    QKeyEvent erase(QEvent::KeyPress, Qt::Key_Delete, Qt::NoModifier);
+    QApplication::sendEvent(canvas, &erase);
+    doc->history().undo();
+    CHECK(doc->activeLayer()->image() == beforePixels);
+    CHECK(doc->selection().mask() == selected);
+    // Finishing pasted pixels already owns its selection state and needs no extra Deselect.
+    QImage pixels(8, 8, QImage::Format_ARGB32_Premultiplied); pixels.fill(Qt::red);
+    QImage mask(8, 8, QImage::Format_Grayscale8); mask.fill(255);
+    CHECK(doc->pasteFloatingPixels(pixels, mask, QPoint(3, 4)));
+    const int index = doc->history().currentIndex();
+    invoke(window, "deselectAll");
+    CHECK(!doc->floatingPixelSession() && !doc->selection().hasSelection());
+    CHECK(doc->history().currentIndex() == index + 1);
+    doc->history().undo();
+    CHECK(doc->floatingPixelSession() && doc->selection().hasSelection());
+    // The selected tool exposes the mode control after floating-context changes.
+    CHECK(QMetaObject::invokeMethod(&window, "selectTool", Qt::DirectConnection,
+                                    Q_ARG(ToolType, ToolType::RectSelection)));
+    auto *modes = window.findChild<QWidget *>("selectionCombineGroup");
+    CHECK(modes != nullptr);
+    if (modes) CHECK(!modes->isHidden());
+}
+
 int main(int argc, char **argv) {
     // Real MainWindow integration must never read/write a developer's UI state
     // or autosave recovery files, including when this executable is run alone.
@@ -1568,6 +1633,7 @@ int main(int argc, char **argv) {
         for (auto mode:{FloatingPixelSession::Sampling::Nearest,FloatingPixelSession::Sampling::Bilinear,FloatingPixelSession::Sampling::Bicubic}) benchmarkStage4A(mode);
         return failures ? 1 : 0;
     }
+    selectionHistoryWorkflow();
     thumbnailCloseWorkflow();
     pasteDialogStyles();
     utilityPanelPreferences();

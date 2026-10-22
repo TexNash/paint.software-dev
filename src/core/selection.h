@@ -20,9 +20,10 @@ enum class SelectionMode {
 //   Alt             = subtract (exclude)
 //   Alt + right-btn = intersect
 //   Ctrl + right-btn= invert (xor)
-//   nothing         = replace
+//   nothing         = toolbar mode (Replace by default)
 inline SelectionMode selectionModeFor(Qt::KeyboardModifiers mods,
-                                      Qt::MouseButton button = Qt::LeftButton) {
+                                      Qt::MouseButton button = Qt::LeftButton,
+                                      SelectionMode fallback = SelectionMode::Replace) {
     const bool alt = mods & Qt::AltModifier;
     const bool ctrl = mods & Qt::ControlModifier;
     const bool right = button == Qt::RightButton;
@@ -30,7 +31,7 @@ inline SelectionMode selectionModeFor(Qt::KeyboardModifiers mods,
     if (right && ctrl) return SelectionMode::Invert;
     if (ctrl) return SelectionMode::Add;
     if (alt) return SelectionMode::Subtract;
-    return SelectionMode::Replace;
+    return fallback;
 }
 
 class Selection {

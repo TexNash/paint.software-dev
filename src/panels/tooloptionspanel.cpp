@@ -18,6 +18,8 @@
 
 #include <QHBoxLayout>
 #include <QMouseEvent>
+#include <QButtonGroup>
+#include <QPainter>
 
 namespace {
 // The tool list shown in the dropdown, in paint.net's documented group order.
@@ -378,6 +380,47 @@ ToolOptionsPanel::ToolOptionsPanel(QWidget *parent) : QWidget(parent) {
     connect(m_selectionHSpin, QOverload<int>::of(&QSpinBox::valueChanged),
             this, &ToolOptionsPanel::onSelectionSizeChanged);
 
+    m_selectionCombineGroup = new QWidget(this);
+    m_selectionCombineGroup->setObjectName("selectionCombineGroup");
+    auto *combineLayout = new QHBoxLayout(m_selectionCombineGroup);
+    combineLayout->setContentsMargins(0, 0, 0, 0);
+    combineLayout->setSpacing(1);
+    auto *combineButtons = new QButtonGroup(this);
+    combineButtons->setExclusive(true);
+    for (int i = 0; i < 5; ++i) {
+        auto *button = new QToolButton(m_selectionCombineGroup);
+        button->setObjectName(QString("selectionCombine%1").arg(i));
+        button->setCheckable(true);
+        button->setChecked(i == 0);
+        button->setFocusPolicy(Qt::NoFocus);
+        // Original geometric symbols: two dashed regions and their resulting coverage.
+        QPixmap pixmap(24, 20);
+        pixmap.fill(Qt::transparent);
+        QPainter painter(&pixmap);
+        const QRegion a(QRect(2, 2, 12, 12)), b(QRect(9, 7, 12, 12));
+        const QRegion result = i == 0 ? b : i == 1 ? a.united(b) : i == 2 ? a.subtracted(b)
+                            : i == 3 ? a.intersected(b) : a.xored(b);
+        painter.setPen(Qt::NoPen);
+        painter.setBrush(QColor(70, 145, 220));
+        for (const QRect &rect : result) painter.drawRect(rect);
+        painter.setBrush(Qt::NoBrush);
+        painter.setPen(QPen(QColor(70, 70, 70), 1, Qt::DashLine));
+        painter.drawRect(QRect(2, 2, 12, 12));
+        painter.drawRect(QRect(9, 7, 12, 12));
+        painter.end();
+        button->setIcon(QIcon(pixmap));
+        button->setIconSize(QSize(24, 20));
+        combineButtons->addButton(button, i);
+        combineLayout->addWidget(button);
+        m_selectionCombineButtons[i] = button;
+        connect(button, &QToolButton::clicked, this, [this, i]() {
+            m_selectionCombineMode = static_cast<SelectionMode>(i);
+            if (m_tool) m_tool->setSelectionMode(m_selectionCombineMode);
+            emit toolOptionsChanged();
+        });
+    }
+    retranslateSelectionModes();
+    layout->addWidget(m_selectionCombineGroup);
     layout->addStretch();
 }
 
@@ -428,6 +471,7 @@ QWidget *ToolOptionsPanel::createSep() {
 
 void ToolOptionsPanel::setTool(Tool *tool) {
     m_tool = tool;
+    if (m_tool) m_tool->setSelectionMode(m_selectionCombineMode);
     updateFromTool();
 }
 
@@ -556,6 +600,10 @@ void ToolOptionsPanel::updateFromTool() {
         m_curveTypeCombo->setCurrentIndex(static_cast<int>(line->curveType()));
         m_curveTypeCombo->blockSignals(false);
     }
+
+    m_selectionCombineGroup->setVisible(m_tool->type() == ToolType::RectSelection
+        || m_tool->type() == ToolType::EllipseSelection || m_tool->type() == ToolType::LassoSelection
+        || m_tool->type() == ToolType::MagicWand);
 
     // Selection constraint visibility: shown for rect/ellipse selection tools only.
     const bool isSelection = (m_tool->type() == ToolType::RectSelection
@@ -865,6 +913,7 @@ void ToolOptionsPanel::onTextStyleChanged() {
 }
 
 void ToolOptionsPanel::retranslate() {
+    retranslateSelectionModes();
     m_brushSizeLabel->setText(TR("Largeur :"));
     m_hardnessLabel->setText(TR("Dureté :"));
     m_spacingLabel->setText(TR("Espacement :"));
@@ -968,4 +1017,15 @@ void ToolOptionsPanel::retranslate() {
         m_toolCombo->addItem(ToolIcons::forTool(e.type), TR(QString::fromUtf8(e.name)));
     m_toolCombo->setCurrentIndex(cur);
     m_toolCombo->blockSignals(false);
+}
+
+void ToolOptionsPanel::retranslateSelectionModes() {
+    const QString names[] = {TR("Remplacer"), TR("Ajouter (union)"), TR("Soustraire"),
+                             TR("Intersection"), TR("Inverser (XOR)")};
+    const QString shortcuts[] = {QString(), "Ctrl + Left", "Alt + Left", "Alt + Right", "Ctrl + Right"};
+    for (int i = 0; i < 5; ++i) {
+        m_selectionCombineButtons[i]->setAccessibleName(names[i]);
+        m_selectionCombineButtons[i]->setToolTip(shortcuts[i].isEmpty() ? names[i]
+            : names[i] + " (" + shortcuts[i] + ")");
+    }
 }

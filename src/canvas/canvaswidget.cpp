@@ -13,6 +13,9 @@
 
 bool CanvasWidget::event(QEvent *event)
 {
+    if (event->type() == QEvent::WindowDeactivate || event->type() == QEvent::UngrabMouse
+        || event->type() == QEvent::Hide) cancelSelectionDrag();
+
     // Track when the stylus is within range of the tablet. While it hovers there
     // (in proximity but tip not touching), nothing draws — not even a barrel/
     // right-button press, which otherwise painted a hover blob (issue #17). The
@@ -47,12 +50,16 @@ CanvasWidget::CanvasWidget(QWidget *parent)
 
     connect(&m_marchingTimer, &QTimer::timeout, this, &CanvasWidget::updateMarchingAnts);
     m_marchingTimer.start(150);
+    m_selectionPanTimer.setInterval(16);
+    m_selectionPanTimer.setTimerType(Qt::PreciseTimer);
+    connect(&m_selectionPanTimer, &QTimer::timeout, this, &CanvasWidget::panSelectionDrag);
     m_floatingMoveTimer.setSingleShot(true);
     m_floatingMoveTimer.setInterval(16);
     connect(&m_floatingMoveTimer, &QTimer::timeout, this, &CanvasWidget::flushFloatingMove);
 }
 
 void CanvasWidget::setDocument(Document *doc) {
+    cancelSelectionDrag();
     flushFloatingMove();
     if (m_document) disconnect(&m_document->history(), nullptr, this, nullptr);
     if (m_document && m_document != doc && m_currentTool)
@@ -63,6 +70,7 @@ void CanvasWidget::setDocument(Document *doc) {
     m_selectionOutlineKey = -1;
     m_document = doc;
     if (doc) {
+        connect(&doc->history(), &HistoryManager::historyAboutToChange, this, &CanvasWidget::cancelSelectionDrag);
         connect(&doc->history(), &HistoryManager::historyChanged, this, [this]() {
             m_floatingMoveTimer.stop();
             m_pendingFloatingMove = false;
@@ -100,6 +108,7 @@ void CanvasWidget::setDocument(Document *doc) {
 }
 
 bool CanvasWidget::setCurrentTool(Tool *tool) {
+    if (tool != m_currentTool) cancelSelectionDrag();
     flushFloatingMove();
     if (m_currentTool && m_currentTool != tool) {
         m_currentTool->deactivate(*this);   // commit any pending edit before switching
@@ -507,18 +516,21 @@ void CanvasWidget::mousePressEvent(QMouseEvent *event) {
     // selection-subtract key and the two would collide.
     if (event->button() == Qt::MiddleButton
         || (event->button() == Qt::LeftButton && m_spaceDown)) {
+        cancelSelectionDrag();
         m_isPanning = true;
         m_lastPanPos = event->pos();
         setCursor(Qt::ClosedHandCursor);
         return;
     }
 
-    // Only a *bare* right-click opens the selection context menu. Alt+right and
-    // Ctrl+right are selection-combine gestures (intersect / invert) and must
-    // reach the active tool instead.
+    // Shape selection tools use either button to draw. Other tools retain the
+    // context menu on bare right-click; combination gestures always reach tools.
     if (event->button() == Qt::RightButton && event->modifiers() == Qt::NoModifier
         && m_document && m_document->selection().hasSelection()
-        && !(m_currentTool && m_currentTool->type() == ToolType::Move)) {
+        && !(m_currentTool && (m_currentTool->type() == ToolType::Move
+            || m_currentTool->type() == ToolType::RectSelection
+            || m_currentTool->type() == ToolType::EllipseSelection
+            || m_currentTool->type() == ToolType::LassoSelection))) {
         QPoint canvasPos = widgetToCanvas(event->position()).toPoint();
         if (m_document->selection().isSelected(canvasPos.x(), canvasPos.y())) {
             emit selectionContextMenuRequested(event->globalPosition().toPoint());
@@ -561,6 +573,12 @@ void CanvasWidget::mousePressEvent(QMouseEvent *event) {
         }
         QPointF canvasPos = widgetToCanvas(event->position());
         m_currentTool->mousePressEvent(canvasPos, event, *this);
+        if (m_currentTool->selectionGestureActive() && type != ToolType::MoveSelection) {
+            m_selectionPointer = event->position();
+            m_selectionButtons = event->buttons();
+            m_selectionModifiers = event->modifiers();
+            m_selectionPanTimer.start();
+        }
         if (!m_currentTool->updatesCanvasRegion()
             && !(m_currentTool->type() == ToolType::Move && m_document->floatingPixelSession())) m_cacheValid = false;
         update();
@@ -568,6 +586,9 @@ void CanvasWidget::mousePressEvent(QMouseEvent *event) {
 }
 
 void CanvasWidget::mouseMoveEvent(QMouseEvent *event) {
+    m_selectionPointer = event->position();
+    m_selectionButtons = event->buttons();
+    m_selectionModifiers = event->modifiers();
     if (m_isPanning) {
         QPoint delta = event->pos() - m_lastPanPos;
         m_pan += QPointF(delta);
@@ -636,6 +657,7 @@ void CanvasWidget::mouseReleaseEvent(QMouseEvent *event) {
 
     if (m_currentTool && m_document) {
         m_currentTool->mouseReleaseEvent(widgetToCanvas(event->position()), event, *this);
+        if (!m_currentTool->selectionGestureActive()) m_selectionPanTimer.stop();
         if (!m_currentTool->updatesCanvasRegion()
             && !(m_currentTool->type() == ToolType::Move && m_document->floatingPixelSession())) m_cacheValid = false;
         update();
@@ -655,6 +677,11 @@ void CanvasWidget::wheelEvent(QWheelEvent *event) {
 }
 
 void CanvasWidget::keyPressEvent(QKeyEvent *event) {
+    if (event->key() == Qt::Key_Escape && m_currentTool && m_currentTool->selectionGestureActive()) {
+        cancelSelectionDrag();
+        event->accept();
+        return;
+    }
     if (m_document && m_document->floatingPixelSession()
         && (event->key() == Qt::Key_Escape || event->key() == Qt::Key_Return || event->key() == Qt::Key_Enter)
         && !(m_currentTool && m_currentTool->wantsKeyInput())) {
@@ -744,4 +771,38 @@ void CanvasWidget::tabletEvent(QTabletEvent *event) {
     // Ignore so Qt still synthesises the compatibility mouse events that drive
     // the tools; the contact gate above decides whether they actually draw.
     event->ignore();
+}
+
+void CanvasWidget::cancelSelectionDrag() {
+    m_selectionPanTimer.stop();
+    m_selectionButtons = Qt::NoButton;
+    if (m_currentTool) m_currentTool->cancelSelectionGesture(*this);
+    update();
+}
+
+void CanvasWidget::panSelectionDrag() {
+    if (!m_document || !m_currentTool || !m_currentTool->selectionGestureActive()
+        || m_selectionButtons == Qt::NoButton) {
+        cancelSelectionDrag();
+        return;
+    }
+    const double rs = rulerSize();
+    auto step = [](double pointer, double low, double high, double imageLow, double imageHigh) {
+        if (pointer < low && imageLow < low)
+            return qMin(qBound(1.0, (low - pointer) * 0.2, 24.0), low - imageLow);
+        if (pointer > high && imageHigh > high)
+            return -qMin(qBound(1.0, (pointer - high) * 0.2, 24.0), imageHigh - high);
+        return 0.0;
+    };
+    const QPointF delta(step(m_selectionPointer.x(), rs, width(), rs + m_pan.x(),
+                             rs + m_pan.x() + m_document->width() * m_zoom),
+                        step(m_selectionPointer.y(), rs, height(), rs + m_pan.y(),
+                             rs + m_pan.y() + m_document->height() * m_zoom));
+    if (delta.isNull()) return;
+    setPan(m_pan + delta);
+    QMouseEvent move(QEvent::MouseMove, m_selectionPointer, mapToGlobal(m_selectionPointer.toPoint()),
+                     Qt::NoButton, m_selectionButtons, m_selectionModifiers);
+    const QPointF pos = widgetToCanvas(m_selectionPointer);
+    m_currentTool->mouseMoveEvent(pos, &move, *this);
+    emit cursorPositionChanged(toPixelPos(pos));
 }

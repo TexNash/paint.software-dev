@@ -18,7 +18,13 @@ public:
     void mouseReleaseEvent(const QPointF &canvasPos, QMouseEvent *event, CanvasWidget &canvas) override;
     void drawOverlay(QPainter &painter, const CanvasWidget &canvas) override;
 
+    bool selectionGestureActive() const override { return m_moving || m_resizing || m_rotating; }
+    void cancelSelectionGesture(CanvasWidget &canvas) override;
+    void deactivate(CanvasWidget &canvas) override { cancelSelectionGesture(canvas); }
+
 private:
+    Selection m_before;
+    Qt::MouseButton m_button = Qt::NoButton;
     bool m_moving = false;
     bool m_resizing = false;
     bool m_rotating = false;

@@ -31,6 +31,10 @@ public:
     void setConstraintW(double v) { m_cw = qMax(1.0, v); }
     void setConstraintH(double v) { m_ch = qMax(1.0, v); }
 
+    bool selectionGestureActive() const override { return m_selecting; }
+    void cancelSelectionGesture(CanvasWidget &) override { m_selecting = false; }
+    void deactivate(CanvasWidget &canvas) override { cancelSelectionGesture(canvas); }
+
 private:
     QPointF applyConstraint(const QPointF &start, const QPointF &current) const;
 
@@ -38,6 +42,7 @@ private:
     SelectionConstraint m_constraint = SelectionConstraint::Normal;
     double m_cw = 1.0;
     double m_ch = 1.0;
+    SelectionMode m_gestureMode = SelectionMode::Replace;
     bool m_selecting = false;
     Qt::MouseButton m_button = Qt::LeftButton;
     QPointF m_startPos;

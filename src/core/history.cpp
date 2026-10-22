@@ -208,6 +208,16 @@ void LayerPropertyCommand::apply(const Props &p) {
 void LayerPropertyCommand::undo() { apply(m_before); }
 void LayerPropertyCommand::redo() { if (m_hasAfter) apply(m_after); }
 
+SelectionChangeCommand::SelectionChangeCommand(Document *doc, const Selection &before,
+                                               const Selection &after, QString description)
+    : m_doc(doc), m_before(before), m_after(after), m_description(std::move(description)) {}
+void SelectionChangeCommand::apply(const Selection &selection) {
+    m_doc->selection() = selection;
+    emit m_doc->selectionChanged();
+}
+void SelectionChangeCommand::undo() { apply(m_before); }
+void SelectionChangeCommand::redo() { apply(m_after); }
+
 // HistoryManager
 HistoryManager::HistoryManager(QObject *parent) : QObject(parent) {}
 
@@ -224,6 +234,7 @@ void HistoryManager::push(std::unique_ptr<HistoryCommand> cmd) {
 }
 
 void HistoryManager::undo() {
+    emit historyAboutToChange();
     if (m_undoStack.empty()) return;
     auto cmd = std::move(m_undoStack.back());
     m_undoStack.pop_back();
@@ -233,6 +244,7 @@ void HistoryManager::undo() {
 }
 
 void HistoryManager::redo() {
+    emit historyAboutToChange();
     if (m_redoStack.empty()) return;
     auto cmd = std::move(m_redoStack.back());
     m_redoStack.pop_back();

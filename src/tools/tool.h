@@ -1,5 +1,6 @@
 #pragma once
 
+#include "core/selection.h"
 #include <QPointF>
 #include <QPainter>
 #include <QMouseEvent>
@@ -75,6 +76,11 @@ public:
     // Other tools retain the conservative full-cache invalidation path.
     virtual bool updatesCanvasRegion() const { return false; }
 
+    virtual bool selectionGestureActive() const { return false; }
+    virtual void cancelSelectionGesture(CanvasWidget &) {}
+    SelectionMode selectionMode() const { return m_selectionMode; }
+    void setSelectionMode(SelectionMode mode) { m_selectionMode = mode; }
+
     // Tool options
     // Brush size is fractional and ranges 1..2000, matching Paint.NET (which
     // antialiases sub-integer sizes). The drawing code already works in doubles.
@@ -138,6 +144,7 @@ protected:
     // from the original. Used by tools that rebuild the whole image.
     static QImage maskEditToSelection(Document *doc, const QImage &before, const QImage &after);
 
+    SelectionMode m_selectionMode = SelectionMode::Replace;
     double m_brushSize = 10;
     int m_hardness = 100;
     int m_opacity = 100;

@@ -41,8 +41,8 @@ QPointF SelectionTool::applyConstraint(const QPointF &start, const QPointF &curr
 }
 
 void SelectionTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, CanvasWidget &) {
-    if (event->button() != Qt::LeftButton && event->button() != Qt::RightButton) return;
-    if (event->button() == Qt::RightButton && event->modifiers() == Qt::NoModifier) return;
+    if (m_selecting || (event->button() != Qt::LeftButton && event->button() != Qt::RightButton)) return;
+    m_gestureMode = selectionModeFor(event->modifiers(), event->button(), selectionMode());
     m_button = event->button();
     m_selecting = true;
     m_startPos = canvasPos;
@@ -55,24 +55,25 @@ void SelectionTool::mouseMoveEvent(const QPointF &canvasPos, QMouseEvent *, Canv
 }
 
 void SelectionTool::mouseReleaseEvent(const QPointF &canvasPos, QMouseEvent *event, CanvasWidget &canvas) {
-    if (!m_selecting) return;
+    if (!m_selecting || event->button() != m_button) return;
     m_selecting = false;
     m_currentPos = applyConstraint(m_startPos, canvasPos);
 
     auto *doc = canvas.document();
     if (!doc) return;
 
+    const Selection before = doc->selection();
     QRect rect = QRect(toPixelPos(m_startPos), toPixelPos(m_currentPos)).normalized();
     if (rect.width() < 2 && rect.height() < 2) {
         doc->selection().clear();
     } else {
-        const SelectionMode mode = selectionModeFor(event->modifiers(), m_button);
+        const SelectionMode mode = m_gestureMode;
         if (m_shape == SelectionShape::Rectangle)
             doc->selection().selectRect(rect, mode);
         else
             doc->selection().selectEllipse(rect, mode);
     }
-    emit doc->selectionChanged();
+    doc->recordSelectionChange(before, "Select");
 }
 
 void SelectionTool::drawOverlay(QPainter &painter, const CanvasWidget &canvas) {

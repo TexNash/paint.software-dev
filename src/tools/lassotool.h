@@ -14,10 +14,14 @@ public:
     void mouseReleaseEvent(const QPointF &canvasPos, QMouseEvent *event, CanvasWidget &canvas) override;
     void drawOverlay(QPainter &painter, const CanvasWidget &canvas) override;
 
+    bool selectionGestureActive() const override { return m_selecting; }
+    void cancelSelectionGesture(CanvasWidget &) override { m_selecting = false; }
+    void deactivate(CanvasWidget &canvas) override { cancelSelectionGesture(canvas); }
+
 private:
     bool m_selecting = false;
     QPolygonF m_lasso;
-    // Captured at press: the modifier state can change before release.
-    Qt::KeyboardModifiers m_modifiers = Qt::NoModifier;
+    // Resolve the toolbar mode and temporary modifiers when the gesture begins.
+    SelectionMode m_gestureMode = SelectionMode::Replace;
     Qt::MouseButton m_button = Qt::LeftButton;   // button that started the lasso (combine mode)
 };

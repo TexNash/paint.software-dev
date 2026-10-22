@@ -5261,6 +5261,197 @@ int main(int argc, char **argv) {
         CHECK(clip.pasteOrigin(view,canvas) == QPoint(175,175), "sample larger than viewport centres without shrinking");
     }
 
+
+    SECTION("Selection gestures record exact masks and preserve pixels");
+    {
+        Document doc(96, 80);
+        CanvasWidget canvas;
+        SelectionTool rect;
+        canvas.setDocument(&doc);
+        canvas.setCurrentTool(&rect);
+        const QImage pixels = doc.activeLayer()->image();
+        auto gesture = [&](Tool &tool, QPointF a, QPointF b, Qt::MouseButton button,
+                           Qt::KeyboardModifiers modifiers = Qt::NoModifier) {
+            QMouseEvent press(QEvent::MouseButtonPress, a, a, button, button, modifiers);
+            tool.mousePressEvent(a, &press, canvas);
+            QMouseEvent move(QEvent::MouseMove, (a+b)/2, (a+b)/2, Qt::NoButton, button, modifiers);
+            tool.mouseMoveEvent((a+b)/2, &move, canvas);
+            QMouseEvent release(QEvent::MouseButtonRelease, b, b, button, Qt::NoButton, modifiers);
+            tool.mouseReleaseEvent(b, &release, canvas);
+        };
+        gesture(rect, {8,8}, {30,30}, Qt::RightButton);
+        const QImage first = doc.selection().mask();
+        CHECK(doc.history().currentIndex() == 1 && doc.selection().isSelected(20,20),
+              "bare right drag creates selection and one entry");
+        rect.setSelectionMode(SelectionMode::Add);
+        gesture(rect, {40,40}, {60,60}, Qt::LeftButton);
+        CHECK(doc.selection().isSelected(20,20) && doc.selection().isSelected(50,50),
+              "unmodified gesture uses toolbar mode");
+        doc.history().undo();
+        CHECK(doc.selection().mask() == first, "undo combination restores exact mask");
+        doc.history().redo();
+        const QImage combined = doc.selection().mask();
+        gesture(rect, {10,10}, {25,25}, Qt::LeftButton, Qt::AltModifier);
+        CHECK(!doc.selection().isSelected(15,15) && doc.selection().isSelected(50,50),
+              "Alt temporarily overrides persistent Add mode");
+        CHECK(rect.selectionMode() == SelectionMode::Add, "modifier does not change stored mode");
+        doc.history().undo();
+        CHECK(doc.selection().mask() == combined, "undo override restores exact mask");
+        Selection before = doc.selection();
+        doc.selection().clear();
+        doc.recordSelectionChange(before, "Deselect");
+        CHECK(!doc.history().canRedo(), "selection edit after undo discards redo branch");
+        doc.history().undo();
+        CHECK(doc.selection().mask() == combined, "undo deselect restores selection");
+        doc.history().redo();
+        CHECK(!doc.selection().hasSelection(), "redo deselect removes selection");
+        int index = doc.history().currentIndex();
+        doc.recordSelectionChange(doc.selection(), "Unchanged");
+        CHECK(doc.history().currentIndex() == index, "unchanged selection adds no history");
+        SelectionTool ellipse(SelectionShape::Ellipse);
+        canvas.setCurrentTool(&ellipse);
+        gesture(ellipse, {4,5}, {31,29}, Qt::LeftButton);
+        const QImage curved = doc.selection().mask();
+        before = doc.selection();
+        doc.selection().feather(2);
+        doc.recordSelectionChange(before, "Feather Selection");
+        const QImage feathered = doc.selection().mask();
+        doc.history().undo();
+        CHECK(doc.selection().mask() == curved, "undo feather restores antialiased ellipse");
+        doc.history().redo();
+        CHECK(doc.selection().mask() == feathered, "redo restores partial selection coverage");
+        LassoTool lasso;
+        canvas.setCurrentTool(&lasso);
+        gesture(lasso, {40,5}, {65,35}, Qt::RightButton);
+        CHECK(!lasso.selectionGestureActive(), "right lasso completes");
+        // Use a non-collinear path to test actual lasso history.
+        QMouseEvent lp(QEvent::MouseButtonPress, QPointF(40,5), QPointF(40,5), Qt::RightButton, Qt::RightButton, Qt::NoModifier);
+        lasso.mousePressEvent({40,5}, &lp, canvas);
+        QMouseEvent lm(QEvent::MouseMove, QPointF(65,5), QPointF(65,5), Qt::NoButton, Qt::RightButton, Qt::NoModifier);
+        lasso.mouseMoveEvent({65,5}, &lm, canvas);
+        QMouseEvent lr(QEvent::MouseButtonRelease, QPointF(55,35), QPointF(55,35), Qt::RightButton, Qt::NoButton, Qt::NoModifier);
+        index = doc.history().currentIndex();
+        lasso.mouseReleaseEvent({55,35}, &lr, canvas);
+        CHECK(doc.history().currentIndex() == index + 1 && doc.selection().isSelected(55,10),
+              "right lasso creates region and history");
+        MoveSelectionTool move;
+        canvas.setCurrentTool(&move);
+        const QImage original = doc.selection().mask();
+        index = doc.history().currentIndex();
+        gesture(move, {55,12}, {60,17}, Qt::LeftButton);
+        CHECK(doc.history().currentIndex() == index + 1, "move selection records one entry");
+        doc.history().undo();
+        CHECK(doc.selection().mask() == original, "undo move restores exact original selection");
+        CHECK(doc.activeLayer()->image() == pixels && !doc.isModified(),
+              "selection-only history leaves pixels and modified flag unchanged");
+        MagicWandTool wand;
+        canvas.setCurrentTool(&wand);
+        index = doc.history().currentIndex();
+        gesture(wand, {80,60}, {80,60}, Qt::LeftButton);
+        CHECK(doc.history().currentIndex() == index + 1, "wand click records one selection entry");
+        doc.history().undo();
+        CHECK(doc.selection().mask() == original, "undo wand restores preceding mask");
+        canvas.setCurrentTool(nullptr);
+    }
+
+    SECTION("Selection toolbar shares modes across selection tools");
+    {
+        ToolOptionsPanel panel;
+        SelectionTool rect, ellipse(SelectionShape::Ellipse);
+        LassoTool lasso;
+        MagicWandTool wand;
+        BrushTool brush;
+        panel.setTool(&rect);
+        auto *group = panel.findChild<QWidget *>("selectionCombineGroup");
+        auto *add = panel.findChild<QToolButton *>("selectionCombine1");
+        auto *replace = panel.findChild<QToolButton *>("selectionCombine0");
+        CHECK(group && !group->isHidden() && replace && replace->isChecked(), "Replace selected initially");
+        add->click();
+        for (Tool *tool : std::initializer_list<Tool *>{&ellipse, &lasso, &wand, &rect}) {
+            panel.setTool(tool);
+            CHECK(tool->selectionMode() == SelectionMode::Add && add->isChecked(),
+                  "persistent mode follows selection tool switches");
+        }
+        panel.setTool(&brush);
+        CHECK(group->isHidden(), "mode group hidden for painting tools");
+        CHECK(selectionModeFor(Qt::ShiftModifier, Qt::RightButton, SelectionMode::Subtract) == SelectionMode::Subtract,
+              "non-combination modifier retains toolbar mode");
+    }
+
+    SECTION("Selection auto pan continues outside viewport and stops cleanly");
+    {
+        Document doc(1000, 800);
+        SelectionTool rect;
+        LassoTool lasso;
+        CanvasWidget canvas;
+        canvas.resize(240, 180);
+        canvas.setDocument(&doc);
+        canvas.setCurrentTool(&rect);
+        canvas.setShowRulers(true);
+        canvas.setZoom(1.0);
+        canvas.setPan({0,0});
+        auto send = [&](QEvent::Type type, QPointF pos, Qt::MouseButton button, Qt::MouseButtons buttons) {
+            QMouseEvent event(type, pos, pos, button, buttons, Qt::NoModifier);
+            QApplication::sendEvent(&canvas, &event);
+        };
+        auto tick = [&]() {
+            QElapsedTimer timer; timer.start();
+            while (timer.elapsed() < 55) { QApplication::processEvents(); QThread::msleep(1); }
+        };
+        send(QEvent::MouseButtonPress, {40,40}, Qt::LeftButton, Qt::LeftButton);
+        send(QEvent::MouseMove, {280,220}, Qt::NoButton, Qt::LeftButton);
+        tick();
+        const QPointF first = canvas.pan();
+        CHECK(first.x() < 0 && first.y() < 0, "outside bottom-right pans diagonally");
+        tick();
+        CHECK(canvas.pan().x() < first.x(), "stationary pointer keeps panning");
+        send(QEvent::MouseButtonRelease, {280,220}, Qt::LeftButton, Qt::NoButton);
+        const QPointF stopped = canvas.pan();
+        tick();
+        CHECK(canvas.pan() == stopped && doc.history().currentIndex() == 1,
+              "release stops pan and commits one selection entry");
+        CHECK(doc.selection().boundingRect().right() > 260, "pan extends selection beyond initial visible image");
+        const QImage original = doc.selection().mask();
+        canvas.setZoom(2.0);
+        canvas.setPan({-100,-100});
+        send(QEvent::MouseButtonPress, {80,80}, Qt::RightButton, Qt::RightButton);
+        send(QEvent::MouseMove, {5,5}, Qt::NoButton, Qt::RightButton);
+        tick();
+        CHECK(canvas.pan().x() > -100 && canvas.pan().y() > -100, "ruler-side overflow pans left and up at zoom");
+        QKeyEvent escape(QEvent::KeyPress, Qt::Key_Escape, Qt::NoModifier);
+        QApplication::sendEvent(&canvas, &escape);
+        CHECK(!rect.selectionGestureActive() && doc.selection().mask() == original,
+              "Escape cancels gesture preserving previous selection");
+        const QPointF cancelled = canvas.pan(); tick();
+        CHECK(canvas.pan() == cancelled && doc.history().currentIndex() == 1, "cancel stops timer without history");
+        canvas.setCurrentTool(&lasso);
+        send(QEvent::MouseButtonPress, {80,80}, Qt::LeftButton, Qt::LeftButton);
+        send(QEvent::MouseMove, {280,100}, Qt::NoButton, Qt::LeftButton);
+        tick();
+        CHECK(lasso.selectionGestureActive(), "lasso supports timed drag");
+        canvas.setCurrentTool(&rect);
+        CHECK(!lasso.selectionGestureActive(), "tool switch cancels lasso");
+        const QPointF switched = canvas.pan(); tick();
+        CHECK(canvas.pan() == switched, "tool switch stops automatic pan");
+        // At image edges there is no further image to expose.
+        canvas.setPan({0,0});
+        send(QEvent::MouseButtonPress, {50,50}, Qt::LeftButton, Qt::LeftButton);
+        send(QEvent::MouseMove, {-40,-40}, Qt::NoButton, Qt::LeftButton);
+        tick();
+        CHECK(canvas.pan() == QPointF(0,0), "pan stops at top-left image boundary");
+        QEvent ungrab(QEvent::UngrabMouse);
+        QApplication::sendEvent(&canvas, &ungrab);
+        CHECK(!rect.selectionGestureActive(), "capture loss cancels selection");
+        send(QEvent::MouseButtonPress, {50,50}, Qt::LeftButton, Qt::LeftButton);
+        send(QEvent::MouseMove, {280,220}, Qt::NoButton, Qt::LeftButton);
+        QEvent deactivate(QEvent::WindowDeactivate);
+        QApplication::sendEvent(&canvas, &deactivate);
+        const QPointF inactive = canvas.pan(); tick();
+        CHECK(!rect.selectionGestureActive() && canvas.pan() == inactive, "deactivation stops drag and timer");
+        // Undo first cancels any in-progress mask preview, then restores history.
+        canvas.setCurrentTool(nullptr);
+    }
+
     // ---------- RESULT ----------
     printf("\n=====================================\n");
     printf("PASSED: %d   FAILED: %d\n", g_pass, g_fail);

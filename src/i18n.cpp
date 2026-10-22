@@ -15,6 +15,11 @@ I18n::Lang g_lang = I18n::Lang::English;
 // in both languages.
 const QHash<QString, QString> &table() {
     static const QHash<QString, QString> m = {
+        {"Remplacer", "Replace"},
+        {"Ajouter (union)", "Add (union)"},
+        {"Soustraire", "Subtract"},
+        {"Intersection", "Intersect"},
+        {"Inverser (XOR)", "Invert (XOR)"},
         // ---- Menu bar ----
         {"&Fichier", "&File"},
         {"É&dition", "&Edit"},

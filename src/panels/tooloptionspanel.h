@@ -73,6 +73,10 @@ private:
                              QLabel *&valueLabel, int min, int max, int value);
 
     Tool *m_tool = nullptr;
+    SelectionMode m_selectionCombineMode = SelectionMode::Replace;
+    QWidget *m_selectionCombineGroup;
+    QToolButton *m_selectionCombineButtons[5];
+    void retranslateSelectionModes();
 
     QComboBox *m_toolCombo;
 

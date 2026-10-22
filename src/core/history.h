@@ -185,6 +185,19 @@ private:
     bool m_hasAfter = false;
 };
 
+class SelectionChangeCommand : public HistoryCommand {
+public:
+    SelectionChangeCommand(Document *doc, const Selection &before, const Selection &after, QString description);
+    void undo() override;
+    void redo() override;
+    QString description() const override { return m_description; }
+private:
+    void apply(const Selection &selection);
+    Document *m_doc;
+    Selection m_before, m_after;
+    QString m_description;
+};
+
 class HistoryManager : public QObject {
     Q_OBJECT
 public:
@@ -211,6 +224,7 @@ public:
     void clear();
 
 signals:
+    void historyAboutToChange();
     void historyChanged();
 
 private:

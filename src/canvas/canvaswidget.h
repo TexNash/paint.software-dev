@@ -40,6 +40,9 @@ public:
     QPointF widgetToCanvas(const QPointF &widgetPos) const;
     QPointF canvasToWidget(const QPointF &canvasPos) const;
 
+    // Cancel an unfinished marquee gesture, restoring any previewed mask.
+    void cancelSelectionDrag();
+
     // Rendering
     void setPreviewImage(const QImage &image) { m_previewImage = image; update(); }
     void clearPreviewImage() { m_previewImage = QImage(); updateCanvas(); }
@@ -87,6 +90,12 @@ protected:
     void tabletEvent(QTabletEvent *event) override;
 
 private:
+    void panSelectionDrag();
+    QTimer m_selectionPanTimer;
+    QPointF m_selectionPointer;
+    Qt::MouseButtons m_selectionButtons = Qt::NoButton;
+    Qt::KeyboardModifiers m_selectionModifiers = Qt::NoModifier;
+
     void drawCheckerboard(QPainter &painter, const QRect &rect);
     void drawSelectionMarching(QPainter &painter);
     void updateMarchingAnts();

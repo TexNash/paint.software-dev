@@ -10,11 +10,13 @@
 #include <cmath>
 
 void MoveSelectionTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, CanvasWidget &canvas) {
-    if (event->button() != Qt::LeftButton && event->button() != Qt::RightButton) return;
+    if (selectionGestureActive() || (event->button() != Qt::LeftButton && event->button() != Qt::RightButton)) return;
 
     Document *doc = canvas.document();
     if (!doc || !doc->selection().hasSelection()) return;
 
+    m_before = doc->selection();
+    m_button = event->button();
     m_originalSelectionRect = doc->selection().boundingRect();
     m_previewSelectionRect = m_originalSelectionRect;
     m_rotCenter = QRectF(m_originalSelectionRect).center();
@@ -83,7 +85,8 @@ void MoveSelectionTool::mouseMoveEvent(const QPointF &canvasPos, QMouseEvent *ev
 }
 
 void MoveSelectionTool::mouseReleaseEvent(const QPointF &, QMouseEvent *event, CanvasWidget &canvas) {
-    if (event->button() != Qt::LeftButton && event->button() != Qt::RightButton) return;
+    if (event->button() != m_button) return;
+    const bool active = selectionGestureActive();
 
     if (m_rotating) {
         Document *doc = canvas.document();
@@ -96,6 +99,7 @@ void MoveSelectionTool::mouseReleaseEvent(const QPointF &, QMouseEvent *event, C
         }
         m_rotating = false;
         m_activeHandle = SelHandles::Handle::None;
+        if (doc) doc->recordSelectionChange(m_before, "Rotate Selection");
         return;
     }
 
@@ -118,6 +122,7 @@ void MoveSelectionTool::mouseReleaseEvent(const QPointF &, QMouseEvent *event, C
 
     if (event->button() == Qt::LeftButton)
         m_moving = false;
+    if (active && canvas.document()) canvas.document()->recordSelectionChange(m_before, "Move Selection");
 }
 
 void MoveSelectionTool::drawOverlay(QPainter &painter, const CanvasWidget &canvas) {
@@ -165,4 +170,13 @@ void MoveSelectionTool::drawOverlay(QPainter &painter, const CanvasWidget &canva
         painter.drawRect(QRectF(handleTopLeft, handleBottomRight).normalized());
     }
     painter.restore();
+}
+
+void MoveSelectionTool::cancelSelectionGesture(CanvasWidget &canvas) {
+    if (selectionGestureActive() && canvas.document()) {
+        canvas.document()->selection() = m_before;
+        emit canvas.document()->selectionChanged();
+    }
+    m_moving = m_resizing = m_rotating = false;
+    m_activeHandle = SelHandles::Handle::None;
 }

@@ -31,7 +31,8 @@ void MagicWandTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event
     }
     if (!image.valid(pos)) return;
 
-    const SelectionMode mode = selectionModeFor(event->modifiers(), event->button());
+    const Selection before = doc->selection();
+    const SelectionMode mode = selectionModeFor(event->modifiers(), event->button(), selectionMode());
 
     if (m_global) {
         // Select all pixels of the same color globally
@@ -68,7 +69,7 @@ void MagicWandTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event
         doc->selection().selectByColor(image, pos, toleranceDistance(), mode);
     }
 
-    emit doc->selectionChanged();
+    doc->recordSelectionChange(before, "Magic Wand");
 }
 
 void MagicWandTool::mouseMoveEvent(const QPointF &, QMouseEvent *, CanvasWidget &) {}

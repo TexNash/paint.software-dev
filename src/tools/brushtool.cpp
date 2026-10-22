@@ -147,9 +147,9 @@ void BrushTool::drawBrushDab(const QPointF &pos, const QColor &color) {
 
 QRect BrushTool::compositeStroke(Document *doc, Layer *layer, const QColor &color) {
     m_segmentBounds = m_segmentBounds.united(m_dirtyRect);
-    const qint64 selectionKey = doc->selection().mask().cacheKey();
+    const qint64 selectionKey = doc->selection().mask().cacheKey() * 2 + int(doc->selectionClippingMode());
     if (selectionKey != m_selectionKey) {
-        m_selectionRegion = doc->selection().region().translated(-layer->offset());
+        m_selectionRegion = doc->selection().region(true).translated(-layer->offset());
         if (layer->image().size() != doc->size() || !layer->offset().isNull()) {
             const QRegion visible(QRect(QPoint(), doc->size()).translated(-layer->offset()));
             m_selectionRegion = doc->selection().hasSelection() ? m_selectionRegion.intersected(visible) : visible;
@@ -175,10 +175,12 @@ QRect BrushTool::compositeStroke(Document *doc, Layer *layer, const QColor &colo
     QPainter painter(&layer->image());
     painter.setCompositionMode(QPainter::CompositionMode_Source);
     painter.drawImage(dirty, m_baseImage, dirty);
-    if (!m_selectionRegion.isEmpty()) painter.setClipRegion(m_selectionRegion);
+    if (doc->selection().hasSelection() || !m_selectionRegion.isEmpty()) painter.setClipRegion(m_selectionRegion);
     painter.setOpacity((m_opacity / 100.0) * color.alphaF());
     painter.setCompositionMode(brushCompositionMode());
     painter.drawImage(dirty, m_strokeBuffer, dirty);
+    painter.end();
+    clipImageEdit(doc, m_baseImage, layer->image(), dirty);
     return dirty;
 }
 
@@ -207,6 +209,8 @@ void BrushTool::compositeOverwrite(Document *doc, Layer *layer, const QColor &co
     QPainter painter(&layer->image());
     painter.setCompositionMode(QPainter::CompositionMode_Source);
     painter.drawImage(dirty.topLeft(), result.convertToFormat(QImage::Format_ARGB32_Premultiplied));
+    painter.end();
+    clipImageEdit(doc, m_baseImage, layer->image(), dirty);
 }
 
 QPainter::CompositionMode BrushTool::brushCompositionMode() const {

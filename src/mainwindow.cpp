@@ -1477,6 +1477,14 @@ void MainWindow::createDockPanels() {
             this, &MainWindow::selectTool);
     connect(m_toolOptionsPanel, &ToolOptionsPanel::toolOptionsChanged,
             this, [this]() { if (m_canvas) m_canvas->update(); });
+    connect(m_toolOptionsPanel, &ToolOptionsPanel::selectionClippingChanged, this, [this](int mode) {
+        if (m_canvas) m_canvas->flushFloatingMove();
+        if (m_currentTool && m_canvas && m_currentTool->type() == ToolType::Move)
+            m_currentTool->deactivate(*m_canvas);
+        for (auto *doc : m_documents) doc->setSelectionClippingMode(static_cast<SelectionClippingMode>(mode));
+        if (m_document) m_document->setSelectionClippingMode(static_cast<SelectionClippingMode>(mode));
+        if (m_canvas) m_canvas->updateCanvas();
+    });
     connect(m_toolOptionsPanel,&ToolOptionsPanel::resamplingChanged,this,[this](int mode) {
         if (!m_document || !m_canvas || !m_document->floatingPixelSession()) return;
         m_canvas->flushFloatingMove();
@@ -1691,6 +1699,7 @@ void MainWindow::createStatusBar() {
 // ---- File operations ----
 
 void MainWindow::wireDocumentSignals() {
+    m_document->setSelectionClippingMode(m_toolOptionsPanel->selectionClippingMode(), false);
     m_canvas->setDocument(m_document);
     m_layersPanel->setDocument(m_document);
     m_colorsPanel->setDocument(m_document);
@@ -2050,7 +2059,7 @@ void MainWindow::copy() {
     if (session && !m_document->selection().hasSelection()) return;
     if (session && !session->isSuspended() && session->targets(m_document->activeLayer())) {
         const QRect bounds = m_document->selection().boundingRect();
-        pixels = ClipboardPixels{session->transformedSource(bounds), session->renderCoverage(bounds), bounds.topLeft()};
+        pixels = ClipboardPixels{session->transformedSource(bounds), Selection::clippedMask(session->renderCoverage(bounds), m_document->selectionClippingMode()), bounds.topLeft(), m_document->selectionClippingMode()};
     } else {
         pixels = ClipboardPixels::capture(m_document->activeLayer()->image(), m_document->activeLayer()->offset(), m_document->selection());
     }
@@ -2155,7 +2164,7 @@ void MainWindow::pastePixels(bool intoNewLayer) {
     auto sampling=FloatingPixelSession::Sampling::Bicubic;
     for (const auto &tool:m_tools)
         if (auto *move=dynamic_cast<MoveTool *>(tool.get())) sampling=move->sampling();
-    if (!m_document->pasteFloatingPixels(pixels->pixels, pixels->coverage, origin, intoNewLayer, canvas,sampling)) {
+    if (!m_document->pasteFloatingPixels(pixels->pixels, pixels->coverage, origin, intoNewLayer, canvas,sampling,pixels->clippingMode)) {
         m_canvas->setCurrentTool(m_currentTool);
         statusBar()->showMessage(TR("Unable to allocate the pasted image."), 5000);
         return;

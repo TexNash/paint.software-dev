@@ -170,6 +170,7 @@ void LineTool::commit(CanvasWidget &canvas) {
     paintCurve(painter, m_color, m_antialiased);
     painter.end();
 
+    clipImageEdit(doc, m_beforeImage, layer->image());
     doc->pushImageEdit(doc->activeLayerIndex(), m_beforeImage, "Line / Curve");
     m_state = State::Idle;
     m_activeNode = -1;

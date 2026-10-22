@@ -24,6 +24,7 @@ public:
     explicit ToolOptionsPanel(QWidget *parent = nullptr);
 
     void setTool(Tool *tool);
+    SelectionClippingMode selectionClippingMode() const { return static_cast<SelectionClippingMode>(m_selectionClippingCombo->currentIndex()); }
     // Reveals the Pressure toggle once a graphics tablet has been detected, as
     // Paint.NET does (the control is hidden until then).
     void setTabletPresent(bool present);
@@ -34,6 +35,7 @@ signals:
     void toolOptionsChanged();
     void toolChangeRequested(ToolType type);
     void resamplingChanged(int mode);
+    void selectionClippingChanged(int mode);
 
 private slots:
     void onBrushSizeChanged();
@@ -102,6 +104,8 @@ private:
     QWidget *m_toleranceGroup;
 
     QCheckBox *m_antialiasCheck;
+    QLabel *m_selectionClippingLabel;
+    QComboBox *m_selectionClippingCombo;
     QCheckBox *m_pressureCheck;   // stylus pressure varies dab size (Paint.NET)
     bool m_tabletPresent = false;   // Pressure toggle is shown only once a tablet is seen
 

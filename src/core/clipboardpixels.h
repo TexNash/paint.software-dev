@@ -1,5 +1,6 @@
 #pragma once
 
+#include "selection.h"
 #include <QImage>
 #include <QMimeData>
 #include <QPoint>
@@ -15,6 +16,7 @@ struct ClipboardPixels {
     QImage pixels;
     QImage coverage;
     QPoint sourceOrigin;
+    SelectionClippingMode clippingMode = SelectionClippingMode::Antialiased;
 
     static const char *mimeType();
     static std::optional<ClipboardPixels> capture(const QImage &image, QPoint imageOffset,

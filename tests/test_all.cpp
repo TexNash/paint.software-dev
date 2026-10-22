@@ -24,6 +24,7 @@
 #include <tuple>
 
 #include "core/document.h"
+#include "core/imageoperation.h"
 #include "core/clipboardpixels.h"
 #include <QtEndian>
 #include "core/layer.h"
@@ -5450,6 +5451,168 @@ int main(int argc, char **argv) {
         CHECK(!rect.selectionGestureActive() && canvas.pan() == inactive, "deactivation stops drag and timer");
         // Undo first cancels any in-progress mask preview, then restores history.
         canvas.setCurrentTool(nullptr);
+    }
+
+    SECTION("Selection clipping snapshots preserve pixels and transparency");
+    {
+        Selection selection(4, 1);
+        QImage mask(4, 1, QImage::Format_Grayscale8); mask.fill(0);
+        mask.scanLine(0)[0] = 64; mask.scanLine(0)[1] = 127;
+        mask.scanLine(0)[2] = 128; mask.scanLine(0)[3] = 255;
+        selection.setMaskImage(mask);
+        QImage source(4, 1, QImage::Format_ARGB32_Premultiplied);
+        source.fill(QColor(180, 70, 30, 128));
+        auto aa = ClipboardPixels::capture(source, {}, selection);
+        selection.setClippingMode(SelectionClippingMode::Pixelated);
+        const QImage binary = selection.clippingMask();
+        CHECK(binary.constScanLine(0)[0] == 0 && binary.constScanLine(0)[1] == 0
+              && binary.constScanLine(0)[2] == 255 && binary.constScanLine(0)[3] == 255,
+              "Pixelated clipping resolves coverage at half a pixel");
+        CHECK(selection.mask() == mask && aa->coverage == mask, "switching mode preserves geometry and prior copy");
+        auto hard = ClipboardPixels::capture(source, {}, selection);
+        CHECK(hard && hard->standardImage().pixel(0, 0) == 0
+              && hard->standardImage().pixel(2, 0) == source.pixel(2, 0),
+              "Pixelated copy excludes outside pixels and preserves included premultiplied source exactly");
+        auto mime = hard->mimeData();
+        selection.setClippingMode(SelectionClippingMode::Antialiased);
+        auto decoded = ClipboardPixels::decode(*mime);
+        CHECK(decoded && decoded->clippingMode == SelectionClippingMode::Pixelated && decoded->coverage == binary,
+              "clipboard retains captured clipping policy independently of subsequent mode");
+        QImage erased = source; selection.setClippingMode(SelectionClippingMode::Pixelated);
+        selection.eraseFromImage(erased);
+        CHECK(erased.pixel(0, 0) == source.pixel(0, 0) && erased.pixel(2, 0) == 0,
+              "Pixelated delete matches copied coverage");
+        selection.feather(1);
+        const QImage feathered = selection.clippingMask();
+        bool hardOnly = true;
+        for (int x = 0; x < 4; ++x) hardOnly &= feathered.constScanLine(0)[x] == 0 || feathered.constScanLine(0)[x] == 255;
+        CHECK(hardOnly, "Pixelated mode never exposes feathered coverage");
+    }
+
+    SECTION("Pixelated floating boundaries stay hard with all sampling modes");
+    {
+        Document doc(32, 32);
+        doc.activeLayer()->clear(Qt::green);
+        Selection selection(12, 12); selection.selectEllipse(QRect(1, 1, 10, 10));
+        selection.setClippingMode(SelectionClippingMode::Pixelated);
+        QImage source(12, 12, QImage::Format_ARGB32_Premultiplied); source.fill(Qt::red);
+        const auto pixels = ClipboardPixels::capture(source, {}, selection);
+        for (auto sampling : {FloatingPixelSession::Sampling::Nearest, FloatingPixelSession::Sampling::Bilinear, FloatingPixelSession::Sampling::Bicubic}) {
+            auto session = FloatingPixelSession::create(doc.snapshotLayers()[0], pixels->pixels, pixels->coverage, {}, sampling, pixels->clippingMode);
+            QTransform transform; transform.translate(8.25, 5.75); transform.rotate(19); transform.scale(0.83, 1.2);
+            CHECK(session && session->setTransform(transform), "hard selection accepts transformed sampling");
+            const QImage coverage = session->renderCoverage(QRect(0, 0, 32, 32));
+            const QImage rendered = session->render(QRect(0, 0, 32, 32));
+            bool binary = true, exact = true;
+            for (int y = 0; y < 32; ++y) for (int x = 0; x < 32; ++x) {
+                int value = coverage.constScanLine(y)[x];
+                binary &= value == 0 || value == 255;
+                exact &= rendered.pixelColor(x, y) == (value ? QColor(Qt::red) : QColor(Qt::green));
+            }
+            CHECK(binary && exact, "resampling colours cannot soften Pixelated clipping or alter pixels outside boundary");
+        }
+        CHECK(doc.pasteFloatingPixels(pixels->pixels, pixels->coverage, {6, 6}, false, {},
+                                     FloatingPixelSession::Sampling::Bilinear, pixels->clippingMode), "paste stores captured hard clipping");
+        doc.setSelectionClippingMode(SelectionClippingMode::Antialiased);
+        doc.history().undo(); doc.history().redo();
+        CHECK(doc.floatingPixelSession() && doc.floatingPixelSession()->clippingMode() == SelectionClippingMode::Pixelated,
+              "paste undo/redo preserves captured clipping despite current preference");
+        QTemporaryDir dir; const QString path = dir.filePath("clipping.psw");
+        CHECK(doc.save(path), "save hard floating selection");
+        Document reopened(path);
+        CHECK(reopened.floatingPixelSession() && reopened.floatingPixelSession()->clippingMode() == SelectionClippingMode::Pixelated
+              && reopened.flatten() == doc.flatten(), "native reopen preserves hard floating boundary");
+    }
+
+    SECTION("Selection clipping applies to tools and image operations");
+    {
+        for (auto clipping : {SelectionClippingMode::Antialiased, SelectionClippingMode::Pixelated}) {
+            for (int kind = 0; kind < 5; ++kind) {
+                Document doc(16, 16); CanvasWidget canvas; canvas.setDocument(&doc);
+                doc.activeLayer()->clear(Qt::white); doc.setPrimaryColor(Qt::red);
+                QImage mask(16, 16, QImage::Format_Grayscale8); mask.fill(127);
+                mask.scanLine(8)[8] = 128;
+                doc.selection().setMaskImage(mask); doc.setSelectionClippingMode(clipping);
+                std::unique_ptr<Tool> tool;
+                if (kind == 0) tool = std::make_unique<BrushTool>();
+                if (kind == 1) tool = std::make_unique<EraserTool>();
+                if (kind == 2) tool = std::make_unique<FillTool>();
+                if (kind == 3) tool = std::make_unique<PencilTool>();
+                if (kind == 4) tool = std::make_unique<GradientTool>();
+                tool->setBrushSize(12); tool->setHardness(100);
+                canvas.setCurrentTool(tool.get());
+                QMouseEvent press(QEvent::MouseButtonPress, QPointF(8,8), QPointF(8,8), Qt::LeftButton, Qt::LeftButton, Qt::NoModifier);
+                QMouseEvent release(QEvent::MouseButtonRelease, QPointF(8,8), QPointF(8,8), Qt::LeftButton, Qt::NoButton, Qt::NoModifier);
+                tool->mousePressEvent({8,8}, &press, canvas);
+                tool->mouseReleaseEvent({8,8}, &release, canvas);
+                const QColor inside = doc.activeLayer()->image().pixelColor(8,8);
+                const QColor outside = doc.activeLayer()->image().pixelColor(7,8);
+                if (clipping == SelectionClippingMode::Pixelated) {
+                    CHECK(outside == QColor(Qt::white), "Pixelated tool preserves excluded boundary pixels");
+                    CHECK(kind == 1 ? inside.alpha() == 0 : inside == QColor(Qt::red), "Pixelated tool fully edits included boundary pixel");
+                } else {
+                    CHECK(kind == 1 ? inside.alpha() > 0 && inside.alpha() < 255 : inside.green() > 0 && inside.green() < 255,
+                          "Antialiased tool applies partial boundary coverage");
+                }
+                canvas.setCurrentTool(nullptr);
+            }
+            Document doc(4, 1); doc.setSelectionClippingMode(clipping);
+            QImage mask(4, 1, QImage::Format_Grayscale8); mask.fill(127); mask.scanLine(0)[2] = 128;
+            doc.selection().setMaskImage(mask);
+            QImage source(4, 1, QImage::Format_ARGB32_Premultiplied); source.fill(Qt::white);
+            const QImage result = adjustedImage(source, {}, doc.selection(), [](const QImage &input) {
+                QImage output = input; output.fill(Qt::black); return output;
+            });
+            CHECK(clipping == SelectionClippingMode::Pixelated ? result.pixelColor(0,0) == QColor(Qt::white) && result.pixelColor(2,0) == QColor(Qt::black)
+                  : result.pixelColor(0,0).red() > 0 && result.pixelColor(0,0).red() < 255,
+                  "effects and adjustments use the shared clipping policy");
+        }
+        // A live move switches clipping immediately, but a clipboard value
+        // captured before the switch must still initialize an AA paste.
+        Document moving(24, 24);
+        moving.selection().selectEllipse(QRect(2, 2, 12, 12));
+        auto copied = ClipboardPixels::capture(moving.activeLayer()->image(), {}, moving.selection());
+        CHECK(moving.prepareFloatingPixelGesture(), "lift AA ellipse for clipping change");
+        CHECK(moving.setFloatingPixelTransform(QTransform::fromTranslate(6, 5)), "move ellipse away from its source hole");
+        moving.setSelectionClippingMode(SelectionClippingMode::Pixelated);
+        CHECK(moving.floatingPixelSession()->clippingMode() == SelectionClippingMode::Pixelated,
+              "clipping option immediately updates a live move");
+        const QImage hardMove = moving.flatten();
+        bool hardHole = true;
+        for (int y = 0; y < hardMove.height(); ++y) for (int x = 0; x < hardMove.width(); ++x)
+            hardHole &= qAlpha(hardMove.pixel(x,y)) == 0 || qAlpha(hardMove.pixel(x,y)) == 255;
+        CHECK(hardHole, "changing a live move to Pixelated also hardens its original cutout");
+        moving.history().undo();
+        CHECK(moving.floatingPixelSession()->clippingMode() == SelectionClippingMode::Antialiased,
+              "undo restores previous live clipping policy");
+        moving.history().redo();
+        CHECK(moving.flatten() == hardMove, "redo restores hard move and cutout");
+        Document reversible(24,24);
+        reversible.selection().selectEllipse(QRect(2,2,12,12));
+        const QImage originalCoverage = reversible.selection().mask().copy(reversible.selection().boundingRect());
+        reversible.setSelectionClippingMode(SelectionClippingMode::Pixelated);
+        CHECK(reversible.prepareFloatingPixelGesture(), "lift Pixelated selection retains original geometry");
+        reversible.setSelectionClippingMode(SelectionClippingMode::Antialiased);
+        CHECK(reversible.floatingPixelSession()->sourceCoverage() == originalCoverage,
+              "live move can restore original AA geometry after Pixelated clipping");
+        Document pasted(24,24); pasted.setSelectionClippingMode(SelectionClippingMode::Pixelated);
+        CHECK(pasted.pasteFloatingPixels(copied->pixels, copied->coverage, {}, false, {},
+                                        FloatingPixelSession::Sampling::Nearest, copied->clippingMode)
+              && pasted.floatingPixelSession()->sourceCoverage() == copied->coverage
+              && pasted.floatingPixelSession()->clippingMode() == SelectionClippingMode::Antialiased,
+              "paste uses copied AA policy even when the current clipping preference is Pixelated");
+        const Selection before = pasted.selection(); pasted.selection().clear();
+        pasted.recordSelectionChange(before, "Deselect"); pasted.history().undo();
+        CHECK(pasted.selection().clippingMode() == SelectionClippingMode::Pixelated,
+              "selection undo preserves current clipping preference");
+
+        ToolOptionsPanel panel; SelectionTool rect; BrushTool brush;
+        panel.setTool(&rect);
+        auto *combo = panel.findChild<QComboBox *>("SelectionClippingMode");
+        CHECK(combo && !combo->isHidden(), "selection tools expose clipping selector");
+        combo->setCurrentIndex(1); panel.setTool(&brush);
+        CHECK(!combo->isHidden() && panel.selectionClippingMode() == SelectionClippingMode::Pixelated,
+              "clipping selector persists when switching to painting tools");
     }
 
     // ---------- RESULT ----------

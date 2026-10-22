@@ -319,6 +319,16 @@ ToolOptionsPanel::ToolOptionsPanel(QWidget *parent) : QWidget(parent) {
     connect(m_alignCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
             this, &ToolOptionsPanel::onTextStyleChanged);
 
+    m_selectionClippingLabel = new QLabel(TR("Découpage de sélection :"));
+    layout->addWidget(m_selectionClippingLabel);
+    m_selectionClippingCombo = new QComboBox;
+    m_selectionClippingCombo->setObjectName("SelectionClippingMode");
+    m_selectionClippingCombo->addItems({TR("Anticrénelé"), TR("Pixelisé")});
+    m_selectionClippingCombo->setFixedHeight(20);
+    layout->addWidget(m_selectionClippingCombo);
+    connect(m_selectionClippingCombo, QOverload<int>::of(&QComboBox::currentIndexChanged),
+            this, &ToolOptionsPanel::selectionClippingChanged);
+
     // --- Antialiasing ---
     m_antialiasCheck = new QCheckBox(TR("Anticrénelage"));
     m_antialiasCheck->setStyleSheet("font-size: 11px;");
@@ -693,6 +703,9 @@ void ToolOptionsPanel::updateFromTool() {
     m_strikeBtn->setVisible(hasText);
     m_alignCombo->setVisible(hasText);
 
+    const bool hasClipping = t != ToolType::Zoom && t != ToolType::Pan && t != ToolType::ColorPicker;
+    m_selectionClippingLabel->setVisible(hasClipping);
+    m_selectionClippingCombo->setVisible(hasClipping);
     m_antialiasCheck->setVisible(hasAA);
     // Shown only when a tablet has been detected (Paint.NET), on brush-like tools.
     m_pressureCheck->setVisible(isBrushLike && m_tabletPresent);
@@ -986,6 +999,9 @@ void ToolOptionsPanel::retranslate() {
         m_selectionModeCombo->blockSignals(false);
     }
 
+    m_selectionClippingLabel->setText(TR("Découpage de sélection :"));
+    m_selectionClippingCombo->setItemText(0, TR("Anticrénelé"));
+    m_selectionClippingCombo->setItemText(1, TR("Pixelisé"));
     m_antialiasCheck->setText(TR("Anticrénelage"));
     m_pressureCheck->setText(TR("Pression"));
     m_pressureCheck->setToolTip(TR("Sensibilité à la pression du stylet (varie la taille du point)"));

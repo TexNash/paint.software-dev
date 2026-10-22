@@ -76,7 +76,7 @@ void RecolorTool::recolorAt(const QPointF &pos, CanvasWidget &canvas) {
                 double factor = (tol > 0 && diff > 0) ? 1.0 - (double)diff / (tol * 3.0) : 1.0;
                 // Tool opacity scales how strongly the new colour replaces the
                 // old one (pressure varies the tip size, not the blend).
-                factor *= (m_opacity / 100.0);
+                factor *= (m_opacity / 100.0) * imageSelectionCoverage(doc, px, py) / 255.0;
                 // Radial soft-edge falloff scales the replacement strength.
                 if (radius > 0 && hardRatio < 1.0) {
                     const double norm = std::sqrt((double)dist2) / radius;   // 0..1

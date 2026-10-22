@@ -37,6 +37,7 @@ std::optional<ClipboardPixels> ClipboardPixels::capture(const QImage &image, QPo
                                                        const Selection &selection) {
     if (image.isNull()) return std::nullopt;
     ClipboardPixels result;
+    result.clippingMode = selection.clippingMode();
     const QImage normalized = image.convertToFormat(QImage::Format_ARGB32_Premultiplied);
     if (normalized.isNull()) return std::nullopt;
     if (selection.hasSelection()) {
@@ -58,7 +59,7 @@ std::optional<ClipboardPixels> ClipboardPixels::capture(const QImage &image, QPo
                             normalized.constScanLine(int(sourceY)) + (sourceX + left) * 4,
                             size_t(right - left) * 4);
             }
-        result.coverage = selection.mask().copy(bounds);
+        result.coverage = selection.clippingMask().copy(bounds);
         result.sourceOrigin = bounds.topLeft();
         if (result.coverage.isNull()) return std::nullopt;
         // Do not put unselected colours inside holes onto the private clipboard.
@@ -115,6 +116,7 @@ std::unique_ptr<QMimeData> ClipboardPixels::mimeData() const {
     auto mime = std::make_unique<QMimeData>();
     mime->setImageData(image);
     mime->setData(mimeType(), encoded);
+    mime->setData("application/x-paint-software-clipping", clippingMode == SelectionClippingMode::Pixelated ? "pixelated" : "antialiased");
     return mime;
 }
 
@@ -131,6 +133,8 @@ std::optional<ClipboardPixels> ClipboardPixels::decode(const QMimeData &mime) {
     const qint64 size = payloadSize(int(width), int(height));
     if (!size || size != data.size()) return std::nullopt;
     ClipboardPixels result;
+    const QByteArray clipping = mime.data("application/x-paint-software-clipping");
+    result.clippingMode = clipping == "pixelated" ? SelectionClippingMode::Pixelated : SelectionClippingMode::Antialiased;
     result.pixels = QImage(int(width), int(height), QImage::Format_ARGB32_Premultiplied);
     result.coverage = QImage(int(width), int(height), QImage::Format_Grayscale8);
     if (result.pixels.isNull() || result.coverage.isNull()) return std::nullopt;

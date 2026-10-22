@@ -82,6 +82,8 @@ public:
     void setLayerLocked(int index, bool locked);
 
     // Selection
+    void setSelectionClippingMode(SelectionClippingMode mode, bool updateFloating = true);
+    SelectionClippingMode selectionClippingMode() const { return m_selectionClippingMode; }
     Selection &selection() { return m_selection; }
     const Selection &selection() const { return m_selection; }
 
@@ -93,7 +95,8 @@ public:
     // by the caller. A previous session is materialized in the same history entry.
     bool pasteFloatingPixels(const QImage &source, const QImage &coverage, QPoint origin,
                              bool intoNewLayer = false, QSize canvasSize = QSize(),
-                             FloatingPixelSession::Sampling sampling = FloatingPixelSession::Sampling::Bicubic);
+                             FloatingPixelSession::Sampling sampling = FloatingPixelSession::Sampling::Bicubic,
+                             SelectionClippingMode clipping = SelectionClippingMode::Antialiased);
     // Read-only access ensures transform previews cannot bypass cache invalidation.
     const FloatingPixelSession *floatingPixelSession() const;
     // Preview an absolute transform and synchronize visible selection coverage.
@@ -180,6 +183,7 @@ private:
     int m_height;
     std::vector<std::shared_ptr<Layer>> m_layers;
     int m_activeLayer = 0;
+    SelectionClippingMode m_selectionClippingMode = SelectionClippingMode::Antialiased;
     Selection m_selection;
     std::unique_ptr<FloatingPixelSession> m_floatingPixelSession;
     HistoryManager m_history;

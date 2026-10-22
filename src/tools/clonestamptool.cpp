@@ -95,7 +95,7 @@ void CloneStampTool::cloneDab(const QPointF &pos, QImage &target, const QImage &
                 uchar *covLine = m_coverage.scanLine(ty);
                 if (cov <= covLine[tx]) continue;
                 covLine[tx] = static_cast<uchar>(cov);
-                double a = cov / 255.0;
+                double a = cov / 255.0 * imageSelectionCoverage(m_doc, tx, ty) / 255.0;
 
                 QColor srcPixel = source.pixelColor(sx, sy);        // straight-alpha
                 QColor basePixel = m_beforeImage.pixelColor(tx, ty);

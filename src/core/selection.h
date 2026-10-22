@@ -5,6 +5,8 @@
 #include <QPainterPath>
 #include <QPoint>
 
+enum class SelectionClippingMode { Antialiased, Pixelated };
+
 enum class SelectionMode {
     Replace,
     Add,
@@ -43,7 +45,11 @@ public:
     bool hasSelection() const { return !m_empty; }
 
     const QImage &mask() const { return m_mask; }
-    QRegion region() const;
+    SelectionClippingMode clippingMode() const { return m_clippingMode; }
+    void setClippingMode(SelectionClippingMode mode) { m_clippingMode = mode; }
+    QImage clippingMask() const;
+    static QImage clippedMask(const QImage &mask, SelectionClippingMode mode);
+    QRegion region(bool includePartial = false) const;
     QRect boundingRect() const;
 
     void clear();
@@ -79,6 +85,7 @@ private:
     void applyMode(const QImage &newMask, SelectionMode mode);
     void updateEmpty();
 
+    SelectionClippingMode m_clippingMode = SelectionClippingMode::Antialiased;
     QImage m_mask;
     bool m_empty = true;
     mutable qint64 m_boundsKey = -1;

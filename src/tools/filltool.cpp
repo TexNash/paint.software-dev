@@ -39,6 +39,7 @@ void FillTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, Can
     // Shift temporarily forces Global mode for this click (Paint.NET behaviour).
     const bool global = m_global || (event->modifiers() & Qt::ShiftModifier);
     floodFill(layer->image(), sampleSrc, pos, fillColor, doc, global);
+    clipImageEdit(doc, before, layer->image());
     doc->pushImageEdit(doc->activeLayerIndex(), before, "Paint Bucket");
 }
 

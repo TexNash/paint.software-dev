@@ -20,7 +20,10 @@ void PencilTool::mousePressEvent(const QPointF &canvasPos, QMouseEvent *event, C
     QImage &img = layer->image();
     if (img.rect().contains(m_lastPos)
         && imageSelectionAllows(canvas.document(), m_lastPos.x(), m_lastPos.y()))
+    {
         plot(img, m_lastPos.x(), m_lastPos.y(), color);
+        clipImageEdit(canvas.document(), m_beforeImage, img, QRect(m_lastPos, QSize(1, 1)));
+    }
 }
 
 void PencilTool::plot(QImage &img, int x, int y, const QColor &color) {
@@ -55,7 +58,12 @@ void PencilTool::mouseMoveEvent(const QPointF &canvasPos, QMouseEvent *event, Ca
     while (true) {
         if (x0 >= 0 && x0 < layer->image().width() && y0 >= 0 && y0 < layer->image().height()
             && imageSelectionAllows(canvas.document(), x0, y0))
+        {
+            if (imageSelectionCoverage(canvas.document(), x0, y0) < 255)
+                layer->image().setPixel(x0, y0, m_beforeImage.pixel(x0, y0));
             plot(layer->image(), x0, y0, color);
+            clipImageEdit(canvas.document(), m_beforeImage, layer->image(), QRect(x0, y0, 1, 1));
+        }
         if (x0 == x1 && y0 == y1) break;
         int e2 = 2 * err;
         if (e2 >= dy) { err += dy; x0 += sx; }

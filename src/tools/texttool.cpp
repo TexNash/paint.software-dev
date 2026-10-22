@@ -114,6 +114,7 @@ void TextTool::commitText(CanvasWidget &canvas) {
     }
     painter.end();
 
+    clipImageEdit(doc, before, layer->image());
     doc->pushImageEdit(doc->activeLayerIndex(), before, "Text");
     m_editing = false;
     m_text.clear();

@@ -198,4 +198,6 @@ void GradientTool::applyGradient(CanvasWidget &canvas) {
         break;
     }
     }
+    painter.end();
+    clipImageEdit(doc, m_beforeImage, layer->image());
 }

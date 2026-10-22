@@ -16,6 +16,7 @@
 // Magic number for the native layered format: 'P','S','W','1'.
 static const quint32 kPswMagic = 0x50535731;
 static const quint32 kFloatingMagic = 0x46505331; // Optional FPS1 trailer after legacy layers.
+static const quint32 kClippingMagic = 0x434c5031; // CLP1 floating clipping policy.
 static const quint32 kSamplingMagic = 0x534d5031; // Optional SMP1 policy after FPS1.
 
 static std::optional<QRect> imageBounds(const QRectF &bounds, double existingBytes = 0) {
@@ -32,6 +33,43 @@ static std::optional<QRect> imageBounds(const QRectF &bounds, double existingByt
     const int limit = QImageReader::allocationLimit();
     if (limit > 0 && bytes > qMax(double(limit) * 1024 * 1024, existingBytes * 2)) return std::nullopt;
     return QRect(int(left), int(top), int(right - left), int(bottom - top));
+}
+
+void Document::setSelectionClippingMode(SelectionClippingMode mode, bool updateFloating) {
+    if (mode == m_selectionClippingMode) return;
+    // A deliberate tool-option change affects the live move operation. Paste
+    // initialization instead uses the policy captured on the clipboard.
+    const auto *session = floatingPixelSession();
+    if (updateFloating && session && !session->isSuspended() && session->clippingMode() != mode) {
+        FloatingPixelSession preview = *session;
+        preview.m_clippingMode = mode;
+        preview.m_coverage = Selection::clippedMask(preview.m_unclippedCoverage, mode);
+        preview.m_fullCoverage = false;
+        // An existing lift also owns the hole at its original pose. Rebuild
+        // that hole from the original raster so cut and moved edges agree.
+        if (!preview.m_liftOriginal.isNull() && preview.m_base != preview.m_liftOriginal) {
+            FloatingPixelSession hole = preview;
+            if (!hole.setTransform(preview.m_liftTransform)) return;
+            Selection erased;
+            erased.setMaskImage(hole.renderCoverage(QRect(preview.m_baseOffset, preview.m_base.size())));
+            if (!erased.hasSelection()) return;
+            preview.m_base = preview.m_liftOriginal.copy();
+            erased.eraseFromImage(preview.m_base);
+        }
+        QImage mask = floatingCoverage(preview, QRect(QPoint(), size()));
+        if (mask.isNull()) return;
+        auto command = std::make_unique<DocumentSnapshotCommand>(this, "Selection Clipping");
+        *m_floatingPixelSession = std::move(preview);
+        m_selection.setMaskImage(mask);
+        m_floatingSelectionKey = m_selection.mask().cacheKey();
+        command->captureAfter();
+        m_history.push(std::move(command));
+        m_modified = true;
+        emit documentChanged();
+    }
+    m_selectionClippingMode = mode;
+    m_selection.setClippingMode(mode);
+    emit selectionChanged();
 }
 
 Document::Document(int width, int height, QObject *parent)
@@ -67,7 +105,7 @@ const FloatingPixelSession *Document::floatingPixelSession() const {
 }
 
 bool Document::pasteFloatingPixels(const QImage &source, const QImage &coverage, QPoint origin,
-                                   bool intoNewLayer, QSize canvasSize, FloatingPixelSession::Sampling sampling) {
+                                   bool intoNewLayer, QSize canvasSize, FloatingPixelSession::Sampling sampling, SelectionClippingMode clipping) {
     if (!FloatingPixelSession::validSampling(sampling) || !activeLayer() || (!intoNewLayer && activeLayer()->isLocked())
         || source.isNull() || coverage.isNull() || source.size() != coverage.size()
         || coverage.format() != QImage::Format_Grayscale8) return false;
@@ -110,7 +148,7 @@ bool Document::pasteFloatingPixels(const QImage &source, const QImage &coverage,
         ++target;
         prepared.insert(prepared.begin() + target, std::make_shared<Layer>(empty, "Pasted Layer"));
     }
-    auto session = FloatingPixelSession::create(prepared[target], source, coverage, origin, sampling);
+    auto session = FloatingPixelSession::create(prepared[target], source, coverage, origin, sampling, clipping);
     if (!session) return false;
     const QImage mask = session->renderCoverage(QRect(QPoint(), canvasSize));
     if (mask.isNull()) return false;
@@ -126,6 +164,7 @@ bool Document::pasteFloatingPixels(const QImage &source, const QImage &coverage,
     m_height = canvasSize.height();
     m_floatingPixelSession = std::move(session);
     m_selection = std::move(selected);
+    m_selection.setClippingMode(m_selectionClippingMode);
     m_floatingSelectionKey = m_selection.mask().cacheKey();
     command->captureAfter();
     m_history.push(std::move(command));
@@ -312,6 +351,7 @@ bool Document::prepareFloatingPixelGesture(bool copy, FloatingPixelSession::Samp
         const QImage geometryMask = session->renderCoverage(*bounds);
         if (geometryMask.isNull()) return false;
         geometry.setMaskImage(geometryMask);
+        geometry.setClippingMode(m_selectionClippingMode);
         if (!geometry.hasSelection()) return false;
         const qint64 dx = qint64(raster.offset().x()) - bounds->x();
         const qint64 dy = qint64(raster.offset().y()) - bounds->y();
@@ -322,11 +362,14 @@ bool Document::prepareFloatingPixelGesture(bool copy, FloatingPixelSession::Samp
     } else {
         // A selection belongs to the document; starting Move on another layer
         // lifts that layer's pixels. The previous target was materialized on switch.
-        source = ClipboardPixels::capture(raster.image(), raster.offset(), m_selection);
+        Selection geometry = m_selection;
+        geometry.setClippingMode(SelectionClippingMode::Antialiased);
+        source = ClipboardPixels::capture(raster.image(), raster.offset(), geometry);
+        if (source) source->clippingMode = m_selectionClippingMode;
     }
     if (!source) return false;
     auto lifted = FloatingPixelSession::create(m_layers[m_activeLayer], source->pixels,
-                                               source->coverage, source->sourceOrigin, session ? session->sampling() : sampling);
+                                               source->coverage, source->sourceOrigin, session ? session->sampling() : sampling, source->clippingMode);
     if (!lifted) return false;
     if (session && session->hasCustomRotationPivot()) {
         const QPointF pivot = lifted->m_inverse.map(session->rotationPivot());
@@ -905,7 +948,7 @@ bool Document::visitFloatingTiles(const FloatingPixelSession &session, const QRe
     // Destination-independent keys: property changes reuse samples; new source,
     // mask or transform values cannot alias an old tile. No images are retained
     // by keys, and session/history copies share only their immutable inputs.
-    stream << quint8(0) << session.m_source.cacheKey() << session.m_coverage.cacheKey() << qint32(session.m_sampling) << session.m_transform;
+    stream << quint8(0) << session.m_source.cacheKey() << session.m_coverage.cacheKey() << qint32(session.m_sampling) << qint32(session.m_clippingMode) << session.m_transform;
     constexpr int tileSize = 256;
     for (int row = area.top()/tileSize; row <= area.bottom()/tileSize; ++row) {
         for (int column = area.left()/tileSize; column <= area.right()/tileSize; ++column) {
@@ -973,7 +1016,7 @@ QImage Document::floatingRaster(const FloatingPixelSession &session, const QRect
         QByteArray key; QDataStream stream(&key, QIODevice::WriteOnly); stream.setVersion(QDataStream::Qt_6_0);
         // This entry contains replacement against a captured base, unlike the
         // destination-independent source tiles. Include every base/pose input.
-        stream << quint8(1) << session.m_source.cacheKey() << session.m_coverage.cacheKey() << qint32(session.m_sampling) << session.m_transform
+        stream << quint8(1) << session.m_source.cacheKey() << session.m_coverage.cacheKey() << qint32(session.m_sampling) << qint32(session.m_clippingMode) << session.m_transform
                << session.m_base.cacheKey() << session.m_baseOffset << session.m_liftOriginal.cacheKey()
                << session.m_liftTransform << footprint;
         auto cached = FloatingRenderCache::shared().find(key);
@@ -1063,11 +1106,13 @@ bool Document::saveNative(const QString &filePath) {
     // Updated readers additionally restore the live source, mask and transform.
     if (session) {
         out << kFloatingMagic << quint32(1) << qint32(sessionLayer) << session->m_suspended;
-        out << session->m_source << session->m_coverage << session->m_base << session->m_baseOffset;
+        out << session->m_source << session->m_unclippedCoverage << session->m_base << session->m_baseOffset;
         out << session->m_transform << session->m_liftOriginal << session->m_liftTransform;
         out << m_selection.mask();
-        if (session->sampling() != FloatingPixelSession::Sampling::Nearest)
+        if (session->sampling() != FloatingPixelSession::Sampling::Nearest || session->clippingMode() == SelectionClippingMode::Pixelated)
             out << kSamplingMagic << quint32(1) << qint32(session->sampling());
+        if (session->clippingMode() == SelectionClippingMode::Pixelated)
+            out << kClippingMagic << quint32(1);
     }
     if (out.status() != QDataStream::Ok || !file.commit()) return false;
     m_filePath = filePath;
@@ -1162,6 +1207,14 @@ bool Document::loadNative(const QString &filePath) {
                     if (!restoredSession->setTransform(transform)) return false;
                 }
             }
+            if (!in.atEnd()) {
+                quint32 clippingMagic = 0, clippingVersion = 0;
+                in >> clippingMagic >> clippingVersion;
+                if (in.status() != QDataStream::Ok || clippingMagic != kClippingMagic || clippingVersion != 1) return false;
+                restoredSession->m_clippingMode = SelectionClippingMode::Pixelated;
+                restoredSession->m_coverage = Selection::clippedMask(restoredSession->m_unclippedCoverage, SelectionClippingMode::Pixelated);
+                restoredSession->m_fullCoverage = false;
+            }
             restoredSelection.setMaskImage(selectionMask);
             if (restoredSelection.mask().isNull()) return false;
         }
@@ -1171,6 +1224,7 @@ bool Document::loadNative(const QString &filePath) {
     m_layers = std::move(layers);
     m_activeLayer = qBound(0, static_cast<int>(active), static_cast<int>(m_layers.size()) - 1);
     m_selection = std::move(restoredSelection);
+    m_selection.setClippingMode(m_selectionClippingMode);
     m_floatingPixelSession = std::move(restoredSession);
     m_history.clear();
     m_filePath = filePath;
@@ -1233,6 +1287,7 @@ bool Document::load(const QString &filePath) {
     m_layers.push_back(layer);
     m_activeLayer = 0;
     m_selection = Selection(m_width, m_height);
+    m_selection.setClippingMode(m_selectionClippingMode);
     m_floatingPixelSession.reset();
     m_history.clear();
     m_filePath = filePath;
@@ -1297,7 +1352,7 @@ bool Document::cropToSelection() {
     if (!m_selection.hasSelection()) return false;
     const QRect bounds = m_selection.boundingRect().intersected(QRect(QPoint(), size()));
     if (bounds.isEmpty()) return false;
-    const QImage mask = m_selection.mask().copy(bounds);
+    const QImage mask = m_selection.clippingMask().copy(bounds);
     if (mask.isNull()) return false;
     Selection cleared(bounds.width(), bounds.height());
     if (cleared.mask().isNull()) return false;
@@ -1359,6 +1414,7 @@ bool Document::cropToSelection() {
     m_width = bounds.width();
     m_height = bounds.height();
     m_selection = std::move(cleared);
+    m_selection.setClippingMode(m_selectionClippingMode);
     crop->captureAfter();
     m_history.push(std::move(crop));
     m_modified = true;

@@ -25,7 +25,7 @@ bool integerTranslation(const QTransform &transform) {
 
 std::unique_ptr<FloatingPixelSession> FloatingPixelSession::create(
     const std::shared_ptr<Layer> &target, const QImage &source,
-    const QImage &coverage, QPoint sourceOrigin, Sampling sampling) {
+    const QImage &coverage, QPoint sourceOrigin, Sampling sampling, SelectionClippingMode clipping) {
     if (!validSampling(sampling) || !target || source.isNull() || coverage.isNull()
         || source.size() != coverage.size()
         || coverage.format() != QImage::Format_Grayscale8 || target->image().isNull())
@@ -33,21 +33,23 @@ std::unique_ptr<FloatingPixelSession> FloatingPixelSession::create(
     bool selected = false;
     for (int y = 0; y < coverage.height() && !selected; ++y)
         for (int x = 0; x < coverage.width(); ++x)
-            if (coverage.constScanLine(y)[x]) { selected = true; break; }
+            if (coverage.constScanLine(y)[x] > (clipping == SelectionClippingMode::Pixelated ? 127 : 0)) { selected = true; break; }
     if (!selected) return nullptr;
 
     auto session = std::unique_ptr<FloatingPixelSession>(new FloatingPixelSession);
     // Deep copies also isolate externally backed images and previously obtained
     // writable bits() pointers, which implicit sharing alone cannot protect against.
     session->m_source = source.convertToFormat(QImage::Format_ARGB32_Premultiplied).copy();
-    session->m_coverage = coverage.copy();
+    session->m_unclippedCoverage = coverage.copy();
+    session->m_coverage = Selection::clippedMask(session->m_unclippedCoverage, clipping);
+    session->m_clippingMode = clipping;
     session->m_base = target->image().copy();
     if (session->m_source.isNull() || session->m_coverage.isNull() || session->m_base.isNull())
         return nullptr;
     session->m_fullCoverage = true;
     for (int y = 0; y < coverage.height() && session->m_fullCoverage; ++y)
         for (int x = 0; x < coverage.width(); ++x)
-            if (coverage.constScanLine(y)[x] != 255) { session->m_fullCoverage = false; break; }
+            if (session->m_coverage.constScanLine(y)[x] != 255) { session->m_fullCoverage = false; break; }
     session->m_sampling = sampling;
     session->m_target = target;
     session->m_baseOffset = target->offset();
@@ -294,6 +296,12 @@ void FloatingPixelSession::filteredPoint(double sxPoint,double syPoint,QRgb &pix
     pixel=(unsigned(a)<<24)|(unsigned(channel(channels[2]))<<16)|(unsigned(channel(channels[1]))<<8)|unsigned(channel(channels[0]));
 }
 
+uchar FloatingPixelSession::clippedCoverage(QPointF local, uchar filtered) const {
+    if (m_clippingMode == SelectionClippingMode::Antialiased) return filtered;
+    if (local.x() < 0 || local.y() < 0 || local.x() >= m_coverage.width() || local.y() >= m_coverage.height()) return 0;
+    return m_coverage.constScanLine(int(local.y()))[int(local.x())] > 127 ? 255 : 0;
+}
+
 QImage FloatingPixelSession::renderBase(const QRect &documentRegion) const {
     if (documentRegion.isEmpty()) return {};
     QImage result(documentRegion.size(), QImage::Format_ARGB32_Premultiplied);
@@ -447,6 +455,7 @@ QImage FloatingPixelSession::sample(const QRect &documentRegion, QImage *pixels)
                 QRgb pixel; uchar coverage;
                 filteredPoint((double(x)+0.5)*a+(double(y)+0.5)*c+tx,
                               (double(x)+0.5)*b+(double(y)+0.5)*d+ty,pixel,coverage,view);
+                coverage = clippedCoverage(m_inverse.map(QPointF(double(x)+0.5, double(y)+0.5)), coverage);
                 mask[x-documentRegion.x()] = coverage;
                 if (out) out[x-documentRegion.x()] = pixel;
             }
@@ -555,7 +564,7 @@ QImage FloatingPixelSession::renderScaled(const QRect &region, QSize outputSize)
                 QRgb sampled; uchar coverage;
                 const QPointF local=m_inverse.map(point)/factor;
                 filteredPoint(local.x(),local.y(),sampled,coverage,view);
-                pixel = replaceCoveredPixel(pixel,sampled,coverage);
+                pixel = replaceCoveredPixel(pixel,sampled,clippedCoverage(m_inverse.map(point), coverage));
             } else if (!originalLiftPose && sourcePoint(point, source))
                 pixel = replaceCoveredPixel(pixel, m_source.pixel(source), m_coverage.constScanLine(source.y())[source.x()]);
             line[x] = pixel;

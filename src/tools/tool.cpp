@@ -13,9 +13,8 @@ void Tool::clipToSelection(QPainter &painter, Document *doc) {
     }
     const Selection &sel = doc->selection();
     if (!sel.hasSelection()) return;
-    QRegion region = sel.region();
-    if (!region.isEmpty())
-        painter.setClipRegion(region, Qt::IntersectClip);
+    QRegion region = sel.region(true);
+    painter.setClipRegion(region, Qt::IntersectClip);
 }
 
 QPointF Tool::imagePoint(const QPointF &documentPoint, Document *doc) {
@@ -54,33 +53,38 @@ bool Tool::selectionAllows(Document *doc, int x, int y) {
     if (!doc) return true;
     const Selection &sel = doc->selection();
     if (!sel.hasSelection()) return true;
-    return sel.isSelected(x, y);
+    return sel.selectionValue(x, y) != 0;
+}
+
+int Tool::imageSelectionCoverage(Document *doc, int x, int y) {
+    if (!doc) return 255;
+    const QPoint offset = doc->activeLayer() ? doc->activeLayer()->offset() : QPoint();
+    return doc->selection().selectionValue(x + offset.x(), y + offset.y());
+}
+
+void Tool::clipImageEdit(Document *doc, const QImage &before, QImage &after, QRect dirty) {
+    if (!doc || !doc->selection().hasSelection()) return;
+    if (dirty.isNull()) dirty = after.rect();
+    dirty = dirty.intersected(after.rect()).intersected(before.rect());
+    // Both buffers are premultiplied storage: interpolate colour and alpha
+    // together so clipping cannot introduce a colour fringe at transparency.
+    for (int y = dirty.top(); !dirty.isEmpty() && y <= dirty.bottom(); ++y) {
+        const auto *base = reinterpret_cast<const QRgb *>(before.constScanLine(y));
+        auto *out = reinterpret_cast<QRgb *>(after.scanLine(y));
+        for (int x = dirty.left(); x <= dirty.right(); ++x) {
+            const int coverage = imageSelectionCoverage(doc, x, y), inverse = 255 - coverage;
+            if (coverage == 255) continue;
+            if (!coverage) { out[x] = base[x]; continue; }
+            out[x] = qRgba((qRed(base[x])*inverse + qRed(out[x])*coverage)/255,
+                           (qGreen(base[x])*inverse + qGreen(out[x])*coverage)/255,
+                           (qBlue(base[x])*inverse + qBlue(out[x])*coverage)/255,
+                           (qAlpha(base[x])*inverse + qAlpha(out[x])*coverage)/255);
+        }
+    }
 }
 
 QImage Tool::maskEditToSelection(Document *doc, const QImage &before, const QImage &after) {
-    if (!doc) return after;
-    const Selection &sel = doc->selection();
-    if (!sel.hasSelection()) return after;
-
-    QImage result = before.convertToFormat(QImage::Format_ARGB32);
-    QImage src = after.convertToFormat(QImage::Format_ARGB32);
-    const int w = result.width(), h = result.height();
-    for (int y = 0; y < h; ++y) {
-        QRgb *dst = reinterpret_cast<QRgb*>(result.scanLine(y));
-        const QRgb *s = reinterpret_cast<const QRgb*>(src.constScanLine(y));
-        for (int x = 0; x < w; ++x) {
-            int cov = sel.selectionValue(x, y);
-            if (cov == 0) continue;
-            if (cov == 255) { dst[x] = s[x]; continue; }
-            // Partial (feathered) coverage: blend before/after per channel.
-            QRgb b = dst[x];
-            int ia = 255 - cov;
-            dst[x] = qRgba(
-                (qRed(s[x]) * cov + qRed(b) * ia) / 255,
-                (qGreen(s[x]) * cov + qGreen(b) * ia) / 255,
-                (qBlue(s[x]) * cov + qBlue(b) * ia) / 255,
-                (qAlpha(s[x]) * cov + qAlpha(b) * ia) / 255);
-        }
-    }
-    return result.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    QImage result = after.convertToFormat(QImage::Format_ARGB32_Premultiplied);
+    clipImageEdit(doc, before.convertToFormat(QImage::Format_ARGB32_Premultiplied), result);
+    return result;
 }

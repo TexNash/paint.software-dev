@@ -1,5 +1,6 @@
 #pragma once
 
+#include "selection.h"
 #include <QImage>
 #include <QRect>
 #include <QTransform>
@@ -17,8 +18,10 @@ public:
     static bool validSampling(Sampling mode) { return mode >= Sampling::Nearest && mode <= Sampling::Bicubic; }
     static std::unique_ptr<FloatingPixelSession> create(
         const std::shared_ptr<Layer> &target, const QImage &source,
-        const QImage &coverage, QPoint sourceOrigin, Sampling sampling = Sampling::Nearest);
+        const QImage &coverage, QPoint sourceOrigin, Sampling sampling = Sampling::Nearest,
+        SelectionClippingMode clipping = SelectionClippingMode::Antialiased);
 
+    SelectionClippingMode clippingMode() const { return m_clippingMode; }
     bool targets(const Layer *layer) const;
     // Return values use QImage copy-on-write. No mutable source references escape.
     QImage sourcePixels() const { return m_source; }
@@ -68,8 +71,11 @@ private:
     static void filteredPoint(double sx,double sy,QRgb &pixel,uchar &coverage,const FilterView &input);
     static QRgb replaceCoveredPixel(QRgb destination, QRgb source, int coverage);
 
+    uchar clippedCoverage(QPointF local, uchar filtered) const;
+    SelectionClippingMode m_clippingMode = SelectionClippingMode::Antialiased;
     std::weak_ptr<Layer> m_target;
     QImage m_source, m_coverage, m_base;
+    QImage m_unclippedCoverage;
     // A context boundary starts a new lift from the edited raster. At the lift's
     // original pose, preserve that raster exactly, including fractional edges.
     QImage m_liftOriginal;

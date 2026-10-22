@@ -30,14 +30,26 @@ QRect coverageBounds(const QImage &mask, QRect area) {
 }
 }
 
-QRegion Selection::region() const {
+QImage Selection::clippedMask(const QImage &mask, SelectionClippingMode mode) {
+    if (mode == SelectionClippingMode::Antialiased) return mask;
+    QImage result = mask.copy();
+    for (int y = 0; y < result.height(); ++y) {
+        uchar *line = result.scanLine(y);
+        for (int x = 0; x < result.width(); ++x) line[x] = line[x] > 127 ? 255 : 0;
+    }
+    return result;
+}
+
+QImage Selection::clippingMask() const { return clippedMask(m_mask, m_clippingMode); }
+
+QRegion Selection::region(bool includePartial) const {
     const QRect bounds = boundingRect();
     QRegion reg;
     for (int y = bounds.top(); !bounds.isEmpty() && y <= bounds.bottom(); ++y) {
         const uchar *line = m_mask.constScanLine(y);
         int start = -1;
         for (int x = bounds.left(); x <= bounds.right(); ++x) {
-            const bool sel = line[x] > 127;
+            const bool sel = line[x] > (includePartial && m_clippingMode == SelectionClippingMode::Antialiased ? 0 : 127);
             if (sel && start == -1) start = x;
             else if (!sel && start != -1) {
                 reg += QRect(start, y, x - start, 1); start = -1;
@@ -244,7 +256,8 @@ bool Selection::isSelected(int x, int y) const {
 quint8 Selection::selectionValue(int x, int y) const {
     if (m_empty) return 255;
     if (x < 0 || x >= m_mask.width() || y < 0 || y >= m_mask.height()) return 0;
-    return m_mask.constScanLine(y)[x];
+    const uchar value = m_mask.constScanLine(y)[x];
+    return m_clippingMode == SelectionClippingMode::Pixelated ? (value > 127 ? 255 : 0) : value;
 }
 
 void Selection::applyToImage(QImage &image) const {
@@ -295,7 +308,7 @@ QImage Selection::maskForImage(const QSize &size, const QPoint &imageOffset) con
     if (m_empty) return maskImage;
 
     QPainter painter(&maskImage);
-    painter.drawImage(-imageOffset, m_mask);
+    painter.drawImage(-imageOffset, clippingMask());
     painter.end();
     return maskImage;
 }

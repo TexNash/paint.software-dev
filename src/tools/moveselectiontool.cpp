@@ -175,6 +175,7 @@ void MoveSelectionTool::drawOverlay(QPainter &painter, const CanvasWidget &canva
 void MoveSelectionTool::cancelSelectionGesture(CanvasWidget &canvas) {
     if (selectionGestureActive() && canvas.document()) {
         canvas.document()->selection() = m_before;
+        canvas.document()->selection().setClippingMode(canvas.document()->selectionClippingMode());
         emit canvas.document()->selectionChanged();
     }
     m_moving = m_resizing = m_rotating = false;

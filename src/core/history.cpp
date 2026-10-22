@@ -43,6 +43,7 @@ void FloatingPixelSessionCommand::apply(const State &state) {
     layer->setRetainsOffCanvasPixels(state.retained);
     m_doc->restoreFloatingPixelSession(state.session ? &*state.session : nullptr, m_layerIndex);
     m_doc->selection() = state.selection;
+    m_doc->selection().setClippingMode(m_doc->selectionClippingMode());
     m_doc->setModified(true);
     emit m_doc->selectionChanged();
     m_doc->notifyContentChanged();
@@ -165,6 +166,7 @@ void DocumentSnapshotCommand::restore(Document *doc, const State &state) {
     doc->restoreFromSnapshot(std::move(copy), state.width, state.height, state.activeLayer,
                              state.session ? &*state.session : nullptr, state.sessionLayer);
     doc->selection() = state.selection;
+    doc->selection().setClippingMode(doc->selectionClippingMode());
     emit doc->selectionChanged();
 }
 
@@ -213,6 +215,7 @@ SelectionChangeCommand::SelectionChangeCommand(Document *doc, const Selection &b
     : m_doc(doc), m_before(before), m_after(after), m_description(std::move(description)) {}
 void SelectionChangeCommand::apply(const Selection &selection) {
     m_doc->selection() = selection;
+    m_doc->selection().setClippingMode(m_doc->selectionClippingMode());
     emit m_doc->selectionChanged();
 }
 void SelectionChangeCommand::undo() { apply(m_before); }

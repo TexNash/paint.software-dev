@@ -289,6 +289,7 @@ void ShapeTool::commit(CanvasWidget &canvas) {
     paintShape(painter, primary, secondary, m_rect);
     painter.end();
 
+    clipImageEdit(doc, m_beforeImage, layer->image());
     doc->pushImageEdit(doc->activeLayerIndex(), m_beforeImage, "Shape");
     m_state = State::Idle;
     m_activeHandle = Handle::None;

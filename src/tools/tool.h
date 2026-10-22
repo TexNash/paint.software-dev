@@ -142,6 +142,8 @@ protected:
     static bool selectionAllows(Document *doc, int x, int y);
     // Masks a freshly produced full-layer image so only selected pixels differ
     // from the original. Used by tools that rebuild the whole image.
+    static void clipImageEdit(Document *doc, const QImage &before, QImage &after, QRect dirty = QRect());
+    static int imageSelectionCoverage(Document *doc, int x, int y);
     static QImage maskEditToSelection(Document *doc, const QImage &before, const QImage &after);
 
     SelectionMode m_selectionMode = SelectionMode::Replace;

@@ -99,6 +99,7 @@ void EraserTool::compositeErase(Document *doc, Layer *layer) {
     painter.setCompositionMode(QPainter::CompositionMode_DestinationOut);
     painter.drawImage(0, 0, m_strokeBuffer);
     painter.end();
+    clipImageEdit(doc, m_beforeImage, result);
     layer->setImage(result);
 }
 

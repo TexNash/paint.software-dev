@@ -14,7 +14,7 @@ public:
 
     int newWidth() const;
     int newHeight() const;
-    int resampleMethod() const;
+    Qt::TransformationMode transformationMode() const;
     int resolution() const;
 
 private slots:

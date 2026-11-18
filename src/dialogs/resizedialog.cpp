@@ -108,7 +108,7 @@ ResizeDialog::ResizeDialog(int currentWidth, int currentHeight, int dpi, QWidget
     m_resampleCombo->addItem(TR("Bicubique"));
     m_resampleCombo->addItem(TR("Bilinéaire"));
     m_resampleCombo->addItem("Fant");
-    m_resampleCombo->addItem(TR("Plus proche voisin"));
+    m_resampleCombo->addItem(TR("Plus proche voisin"), Qt::FastTransformation);
     m_resampleCombo->addItem(TR("Suréchantillonnage"));
     resampleLayout->addWidget(m_resampleCombo);
     layout->addLayout(resampleLayout);
@@ -137,7 +137,10 @@ ResizeDialog::ResizeDialog(int currentWidth, int currentHeight, int dpi, QWidget
 
 int ResizeDialog::newWidth() const { return m_pixelWidthSpin->value(); }
 int ResizeDialog::newHeight() const { return m_pixelHeightSpin->value(); }
-int ResizeDialog::resampleMethod() const { return m_resampleCombo->currentIndex(); }
+Qt::TransformationMode ResizeDialog::transformationMode() const {
+    return m_resampleCombo->currentData() == QVariant(Qt::FastTransformation)
+        ? Qt::FastTransformation : Qt::SmoothTransformation;
+}
 int ResizeDialog::resolution() const { return m_resolutionSpin->value(); }
 
 void ResizeDialog::onModeChanged() {

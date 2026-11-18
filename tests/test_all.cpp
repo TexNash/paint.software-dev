@@ -828,6 +828,66 @@ static void retainedResizeRegression() {
     }
 }
 
+static void nearestNeighborResizeRegression() {
+    SECTION("Nearest Neighbor resize preserves hard colour and alpha edges");
+    ResizeDialog dialog(800, 600);
+    auto *methods = dialog.findChild<QComboBox *>();
+    CHECK(methods, "resize dialog has a resampling control");
+    if (!methods) return;
+
+    const int nearest = methods->findText(TR("Plus proche voisin"));
+    CHECK(nearest >= 0, "resize dialog offers Nearest Neighbor");
+    if (nearest < 0) return;
+    for (int i = 0; i < methods->count(); ++i) {
+        methods->setCurrentIndex(i);
+        CHECK(dialog.transformationMode() == (i == nearest ? Qt::FastTransformation : Qt::SmoothTransformation),
+              "only Nearest Neighbor selects fast resampling");
+    }
+    methods->setCurrentIndex(nearest);
+
+    const QSize target(600, 450);
+    for (const QPoint offset : {QPoint(), QPoint(-40, -20)}) {
+        Document doc(800, 600);
+        const QSize bitmapSize = offset.isNull() ? doc.size() : QSize(880, 640);
+        QImage source(bitmapSize, QImage::Format_ARGB32_Premultiplied);
+        source.fill(Qt::white);
+        {
+            QPainter painter(&source);
+            painter.setCompositionMode(QPainter::CompositionMode_Source);
+            painter.fillRect(101, 101, 203, 103, QColor(255, 1, 53));
+            painter.fillRect(401, 301, 103, 103, Qt::transparent);
+            painter.fillRect(861, 0, 11, 21, Qt::blue);
+        }
+        doc.activeLayer()->setImage(source);
+        doc.activeLayer()->setOffset(offset);
+        const QImage visible = source.copy(QRect(-offset, doc.size()));
+        const QImage expected = visible.scaled(target, Qt::IgnoreAspectRatio, Qt::FastTransformation);
+        CHECK(visible.scaled(target, Qt::IgnoreAspectRatio, Qt::SmoothTransformation) != expected,
+              "test edges distinguish nearest neighbor from smooth resampling");
+
+        doc.resize(target.width(), target.height(), dialog.transformationMode());
+        const QImage result = doc.activeLayer()->image();
+        const QPoint resultOffset = doc.activeLayer()->offset();
+        CHECK(doc.size() == target && result.copy(QRect(-resultOffset, target)) == expected,
+              "resize preserves exact nearest-neighbor colour and alpha in the visible canvas");
+        CHECK(result.format() == QImage::Format_ARGB32_Premultiplied,
+              "nearest-neighbor resize keeps premultiplied layer storage");
+        if (!offset.isNull()) {
+            const QRect retainedStrip(630, 0, 30, 30);
+            const QImage scaledBitmap = source.scaled(660, 480, Qt::IgnoreAspectRatio, Qt::FastTransformation);
+            CHECK(result.rect().contains(retainedStrip) && result.copy(retainedStrip) == scaledBitmap.copy(retainedStrip),
+                  "off-canvas artwork also uses nearest-neighbor resampling");
+        }
+
+        doc.history().undo();
+        CHECK(doc.size() == QSize(800, 600) && doc.activeLayer()->image() == source &&
+              doc.activeLayer()->offset() == offset, "undo restores the original bitmap and geometry");
+        doc.history().redo();
+        CHECK(doc.size() == target && doc.activeLayer()->image() == result &&
+              doc.activeLayer()->offset() == resultOffset, "redo restores the nearest-neighbor resize");
+    }
+}
+
 static void pasteExpansionBoundsRegression() {
     SECTION("Expansion rejects unrepresentable local bitmap extents before mutation");
     for (QPoint origin : {QPoint(INT_MIN,0),QPoint(0,INT_MIN),QPoint(INT_MIN,INT_MIN)}) {
@@ -1170,6 +1230,7 @@ int main(int argc, char **argv) {
     pasteExpansionBoundsRegression();
     retainedOrthogonalRegression();
     retainedResizeRegression();
+    nearestNeighborResizeRegression();
     resizeStampCharacterization();
     ordinaryMoveAuthorityRegression();
     nativeRetentionCompatibility();

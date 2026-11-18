@@ -2428,7 +2428,7 @@ void MainWindow::featherSelection() {
 void MainWindow::resizeImage() {
     ResizeDialog dlg(m_document->width(), m_document->height(), 96, this);
     if (dlg.exec() == QDialog::Accepted) {
-        m_document->resize(dlg.newWidth(), dlg.newHeight());
+        m_document->resize(dlg.newWidth(), dlg.newHeight(), dlg.transformationMode());
         m_sizeLabel->setText(QString("%1 × %2").arg(m_document->width()).arg(m_document->height()));
         m_canvas->updateCanvas();
     }

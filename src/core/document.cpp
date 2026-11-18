@@ -423,7 +423,7 @@ void Document::restoreFloatingPixelSession(const FloatingPixelSession *session, 
     m_floatingSelectionKey = -1;
 }
 
-void Document::resize(int width, int height) {
+void Document::resize(int width, int height, Qt::TransformationMode mode) {
     if (width <= 0 || height <= 0 || (width == m_width && height == m_height)) return;
     if (!finishFloatingPixels(false)) return;
     auto cmd = std::make_unique<DocumentSnapshotCommand>(this, "Resize Image");
@@ -438,7 +438,7 @@ void Document::resize(int width, int height) {
         QImage scaled = layer->image().scaled(
             qMax(1, qRound(layer->width() * scaleX)),
             qMax(1, qRound(layer->height() * scaleY)),
-            Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+            Qt::IgnoreAspectRatio, mode)
             .convertToFormat(QImage::Format_ARGB32_Premultiplied);
         if (origin.isNull() && layer->image().size() == oldSize) {
             layer->setImage(scaled); // Preserve ordinary canvas-sized resampling.
@@ -455,7 +455,7 @@ void Document::resize(int width, int height) {
         // that finite domain exactly as an ordinary layer, while keeping the
         // rounded, document-scaled off-canvas bitmap outside it.
         const QImage visible = layer->image().copy(QRect(-origin, oldSize)).scaled(
-            size(), Qt::IgnoreAspectRatio, Qt::SmoothTransformation)
+            size(), Qt::IgnoreAspectRatio, mode)
             .convertToFormat(QImage::Format_ARGB32_Premultiplied);
         // Source replaces only the new canvas rectangle, not the off-canvas
         // bitmap. SourceOver would blend the same partial-alpha pixels twice.

@@ -26,7 +26,7 @@ public:
     int width() const { return m_width; }
     int height() const { return m_height; }
     QSize size() const { return QSize(m_width, m_height); }
-    void resize(int width, int height);
+    void resize(int width, int height, Qt::TransformationMode mode = Qt::SmoothTransformation);
     void resizeCanvas(int width, int height, int anchorX = 0, int anchorY = 0);
 
     // Layers
